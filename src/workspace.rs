@@ -39,9 +39,6 @@ struct PendingActivation {
 }
 
 #[derive(Clone)]
-pub struct GroupData;
-
-#[derive(Clone)]
 pub struct WorkspaceData {
     manager: ExtWorkspaceManagerV1,
     output: String,
@@ -154,7 +151,7 @@ fn add_output(
     let Ok(group) = client.create_resource::<ExtWorkspaceGroupHandleV1, _, Paw2>(
         display,
         instance.manager.version(),
-        GroupData,
+        (),
     ) else {
         return;
     };
@@ -251,13 +248,13 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for Paw2 {
     }
 }
 
-impl Dispatch<ExtWorkspaceGroupHandleV1, GroupData> for Paw2 {
+impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for Paw2 {
     fn request(
         _state: &mut Self,
         _client: &Client,
         _group: &ExtWorkspaceGroupHandleV1,
         _request: ext_workspace_group_handle_v1::Request,
-        _data: &GroupData,
+        _data: &(),
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {

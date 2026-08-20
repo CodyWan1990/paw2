@@ -38,9 +38,6 @@ pub(crate) struct Capture {
     pub with_damage: bool,
 }
 
-#[derive(Clone)]
-pub struct ManagerData;
-
 pub struct FrameData(Mutex<FrameState>);
 
 struct FrameState {
@@ -76,16 +73,9 @@ impl ScreencopyState {
     }
 
     pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<Capture> {
-        let mut captures = Vec::new();
-        let mut index = 0;
-        while index < self.pending.len() {
-            if self.pending[index].output == *output {
-                captures.push(self.pending.swap_remove(index));
-            } else {
-                index += 1;
-            }
-        }
-        captures
+        self.pending
+            .extract_if(.., |capture| capture.output == *output)
+            .collect()
     }
 
     pub fn fail_output(&mut self, output: &Output) {
@@ -143,7 +133,7 @@ impl GlobalDispatch<ZwlrScreencopyManagerV1, GlobalData> for Paw2 {
         _global_data: &GlobalData,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        data_init.init(resource, ManagerData);
+        data_init.init(resource, ());
     }
 
     fn can_view(client: Client, global_data: &GlobalData) -> bool {
@@ -151,13 +141,13 @@ impl GlobalDispatch<ZwlrScreencopyManagerV1, GlobalData> for Paw2 {
     }
 }
 
-impl Dispatch<ZwlrScreencopyManagerV1, ManagerData> for Paw2 {
+impl Dispatch<ZwlrScreencopyManagerV1, ()> for Paw2 {
     fn request(
         state: &mut Self,
         _client: &Client,
         _manager: &ZwlrScreencopyManagerV1,
         request: zwlr_screencopy_manager_v1::Request,
-        _data: &ManagerData,
+        _data: &(),
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
@@ -213,23 +203,17 @@ impl Paw2 {
             Some((output.clone(), region, format))
         });
 
-        let data = if let Some((output, region, format)) = capture {
-            FrameData(Mutex::new(FrameState {
-                output: Some(output),
-                region,
-                format,
-                overlay_cursor,
-                used: false,
-            }))
-        } else {
-            FrameData(Mutex::new(FrameState {
-                output: None,
-                region: Rectangle::from_size((0, 0).into()),
-                format: Fourcc::Xrgb8888,
-                overlay_cursor,
-                used: false,
-            }))
-        };
+        let (output, region, format) = capture.map_or_else(
+            || (None, Rectangle::default(), Fourcc::Xrgb8888),
+            |(output, region, format)| (Some(output), region, format),
+        );
+        let data = FrameData(Mutex::new(FrameState {
+            output,
+            region,
+            format,
+            overlay_cursor,
+            used: false,
+        }));
         let frame = data_init.init(frame, data);
         let data = frame.data::<FrameData>().unwrap().0.lock().unwrap();
         if data.output.is_some() {

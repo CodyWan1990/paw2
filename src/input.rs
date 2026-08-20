@@ -7,7 +7,8 @@ use smithay::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
-    utils::SERIAL_COUNTER,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 
@@ -15,11 +16,8 @@ use crate::{config::ScrollDirection, state::Paw2};
 
 fn activate_pointer_constraint(
     pointer: &smithay::input::pointer::PointerHandle<Paw2>,
-    location: smithay::utils::Point<f64, smithay::utils::Logical>,
-    under: Option<(
-        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-        smithay::utils::Point<f64, smithay::utils::Logical>,
-    )>,
+    location: Point<f64, Logical>,
+    under: Option<(WlSurface, Point<f64, Logical>)>,
 ) {
     let Some((surface, surface_location)) = under else {
         return;
@@ -130,14 +128,12 @@ impl Paw2 {
                 let mut delta = constrain_pointer(current + event.delta(), &geometries) - current;
                 if let (Some(region), Some((_, surface_location))) = (&confined, &under) {
                     if !region.contains(
-                        (current + smithay::utils::Point::new(delta.x, 0.0) - *surface_location)
-                            .to_i32_round(),
+                        (current + Point::new(delta.x, 0.0) - *surface_location).to_i32_round(),
                     ) {
                         delta.x = 0.0;
                     }
                     if !region.contains(
-                        (current + smithay::utils::Point::new(0.0, delta.y) - *surface_location)
-                            .to_i32_round(),
+                        (current + Point::new(0.0, delta.y) - *surface_location).to_i32_round(),
                     ) {
                         delta.y = 0.0;
                     }
@@ -294,9 +290,9 @@ fn wheel_detents(remainder: &mut f64, amount_v120: f64) -> u32 {
 }
 
 fn constrain_pointer(
-    point: smithay::utils::Point<f64, smithay::utils::Logical>,
-    geometries: &[smithay::utils::Rectangle<i32, smithay::utils::Logical>],
-) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    point: Point<f64, Logical>,
+    geometries: &[Rectangle<i32, Logical>],
+) -> Point<f64, Logical> {
     if geometries
         .iter()
         .any(|geometry| geometry.to_f64().contains(point))
@@ -308,7 +304,7 @@ fn constrain_pointer(
         .map(|geometry| {
             let min = geometry.loc.to_f64();
             let max = (geometry.loc + geometry.size).to_f64();
-            let candidate: smithay::utils::Point<f64, smithay::utils::Logical> = (
+            let candidate: Point<f64, Logical> = (
                 point.x.clamp(min.x, max.x - 1.0),
                 point.y.clamp(min.y, max.y - 1.0),
             )
@@ -325,7 +321,6 @@ fn constrain_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smithay::utils::Rectangle;
 
     #[test]
     fn pointer_stays_inside_output() {

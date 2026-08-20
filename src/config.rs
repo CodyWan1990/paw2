@@ -65,22 +65,17 @@ direct_scanout = true
 # drm_device = "/dev/dri/card1"
 # connector = "DP-1"
 
-[[monitors]]
-connector = "DP-2"
-# focus_at_startup = true
-resolution = [2560, 1440]
-refresh = 120.0
-position = [0, 0]
-transform = "normal"
-vrr = "automatic"
-
-[[monitors]]
-connector = "DP-1"
-resolution = [2560, 1440]
-refresh = 199.999
-position = [2560, 0]
-transform = "normal"
-vrr = "automatic"
+# Monitors are auto-detected and placed left to right. Add a [[monitors]] entry
+# only to pin a connector's mode, position, rotation, or VRR policy; see the
+# README for the full example.
+#[[monitors]]
+#connector = "DP-1"
+#focus_at_startup = true
+#resolution = [2560, 1440]
+#refresh = 120.0
+#position = [0, 0]
+#transform = "normal"
+#vrr = "automatic"
 
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
@@ -316,9 +311,7 @@ impl Config {
     }
 
     pub fn action(&self, modifiers: &ModifiersState, keysym: Keysym) -> Option<Action> {
-        self.bindings
-            .iter()
-            .find_map(|(binding, action)| binding.matches_key(modifiers, keysym).then_some(*action))
+        self.triggered(modifiers, BindingTrigger::Key(keysym))
     }
 
     pub fn wheel_action(
@@ -326,10 +319,12 @@ impl Config {
         modifiers: &ModifiersState,
         direction: ScrollDirection,
     ) -> Option<Action> {
+        self.triggered(modifiers, BindingTrigger::Wheel(direction))
+    }
+
+    fn triggered(&self, modifiers: &ModifiersState, trigger: BindingTrigger) -> Option<Action> {
         self.bindings.iter().find_map(|(binding, action)| {
-            binding
-                .matches_wheel(modifiers, direction)
-                .then_some(*action)
+            (binding.trigger == trigger && binding.matches_modifiers(modifiers)).then_some(*action)
         })
     }
 
@@ -448,14 +443,6 @@ impl Binding {
             && !modifiers.iso_level3_shift
             && !modifiers.iso_level5_shift
     }
-
-    fn matches_key(&self, modifiers: &ModifiersState, keysym: Keysym) -> bool {
-        self.trigger == BindingTrigger::Key(keysym) && self.matches_modifiers(modifiers)
-    }
-
-    fn matches_wheel(&self, modifiers: &ModifiersState, direction: ScrollDirection) -> bool {
-        self.trigger == BindingTrigger::Wheel(direction) && self.matches_modifiers(modifiers)
-    }
 }
 
 #[derive(Deserialize)]
@@ -525,73 +512,46 @@ impl Default for RawAnimations {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Default, Deserialize)]
+#[serde(default)]
 struct RawBindings {
-    focus_left: Vec<String>,
-    focus_right: Vec<String>,
-    focus_up: Vec<String>,
-    focus_down: Vec<String>,
-    swap_left: Vec<String>,
-    swap_right: Vec<String>,
-    swap_up: Vec<String>,
-    swap_down: Vec<String>,
-    consume_or_expel_left: Vec<String>,
-    consume_or_expel_right: Vec<String>,
-    cycle_column_width: Vec<String>,
-    decrease_column_width: Vec<String>,
-    increase_column_width: Vec<String>,
-    close_window: Vec<String>,
-    toggle_fullscreen: Vec<String>,
-    focus_monitor_left: Vec<String>,
-    focus_monitor_right: Vec<String>,
-    focus_monitor_up: Vec<String>,
-    focus_monitor_down: Vec<String>,
-    move_to_monitor_left: Vec<String>,
-    move_to_monitor_right: Vec<String>,
-    move_to_monitor_up: Vec<String>,
-    move_to_monitor_down: Vec<String>,
-    quit: Vec<String>,
+    /// Action name to key list, validated against `DEFAULT_BINDINGS`.
+    #[serde(flatten)]
+    actions: BTreeMap<String, Vec<String>>,
     commands: BTreeMap<String, Vec<String>>,
     workspace: RawWorkspaceBindings,
 }
 
-impl Default for RawBindings {
-    fn default() -> Self {
-        Self {
-            focus_left: keys(&["Super+h", "Super+Left"]),
-            focus_right: keys(&["Super+l", "Super+Right"]),
-            focus_up: keys(&["Super+k", "Super+Up"]),
-            focus_down: keys(&["Super+j", "Super+Down"]),
-            swap_left: keys(&["Super+Shift+h", "Super+Shift+Left"]),
-            swap_right: keys(&["Super+Shift+l", "Super+Shift+Right"]),
-            swap_up: keys(&["Super+Shift+k", "Super+Shift+Up"]),
-            swap_down: keys(&["Super+Shift+j", "Super+Shift+Down"]),
-            consume_or_expel_left: keys(&["Super+bracketleft"]),
-            consume_or_expel_right: keys(&["Super+bracketright"]),
-            cycle_column_width: keys(&["Super+backslash"]),
-            decrease_column_width: Vec::new(),
-            increase_column_width: Vec::new(),
-            close_window: keys(&["Super+q", "Super+BackSpace"]),
-            toggle_fullscreen: keys(&["Super+Shift+f"]),
-            focus_monitor_left: keys(&["Super+comma"]),
-            focus_monitor_right: keys(&["Super+period"]),
-            focus_monitor_up: keys(&["Super+Ctrl+Up"]),
-            focus_monitor_down: keys(&["Super+Ctrl+Down"]),
-            move_to_monitor_left: keys(&["Super+Shift+comma"]),
-            move_to_monitor_right: keys(&["Super+Shift+period"]),
-            move_to_monitor_up: keys(&["Super+Ctrl+Shift+Up"]),
-            move_to_monitor_down: keys(&["Super+Ctrl+Shift+Down"]),
-            quit: keys(&["Super+Shift+Escape"]),
-            commands: BTreeMap::new(),
-            workspace: RawWorkspaceBindings::default(),
-        }
-    }
-}
-
-fn keys(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).into()).collect()
-}
+/// Every directly bindable action: its config key and its out-of-the-box keys,
+/// space separated. An action the config does not mention keeps the keys listed
+/// here, so a config written before that action existed still gets it.
+#[rustfmt::skip]
+const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
+    ("focus_left",             Action::FocusLeft,            "Super+h Super+Left"),
+    ("focus_right",            Action::FocusRight,           "Super+l Super+Right"),
+    ("focus_up",               Action::FocusUp,              "Super+k Super+Up"),
+    ("focus_down",             Action::FocusDown,            "Super+j Super+Down"),
+    ("swap_left",              Action::SwapLeft,             "Super+Shift+h Super+Shift+Left"),
+    ("swap_right",             Action::SwapRight,            "Super+Shift+l Super+Shift+Right"),
+    ("swap_up",                Action::SwapUp,               "Super+Shift+k Super+Shift+Up"),
+    ("swap_down",              Action::SwapDown,             "Super+Shift+j Super+Shift+Down"),
+    ("consume_or_expel_left",  Action::ConsumeOrExpelLeft,   "Super+bracketleft"),
+    ("consume_or_expel_right", Action::ConsumeOrExpelRight,  "Super+bracketright"),
+    ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
+    ("decrease_column_width",  Action::DecreaseColumnWidth,  ""),
+    ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
+    ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
+    ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
+    ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
+    ("focus_monitor_right",    Action::FocusMonitorRight,    "Super+period"),
+    ("focus_monitor_up",       Action::FocusMonitorUp,       "Super+Ctrl+Up"),
+    ("focus_monitor_down",     Action::FocusMonitorDown,     "Super+Ctrl+Down"),
+    ("move_to_monitor_left",   Action::MoveToMonitorLeft,    "Super+Shift+comma"),
+    ("move_to_monitor_right",  Action::MoveToMonitorRight,   "Super+Shift+period"),
+    ("move_to_monitor_up",     Action::MoveToMonitorUp,      "Super+Ctrl+Shift+Up"),
+    ("move_to_monitor_down",   Action::MoveToMonitorDown,    "Super+Ctrl+Shift+Down"),
+    ("quit",                   Action::Quit,                 "Super+Shift+Escape"),
+];
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -833,46 +793,30 @@ fn parse(source: &str) -> Result<Config, String> {
     if workspace.switch.len() != 9 || workspace.r#move.len() != 9 {
         return Err("bindings.workspace switch and move must each contain exactly 9 lists".into());
     }
+    if let Some(unknown) = raw
+        .bindings
+        .actions
+        .keys()
+        .find(|name| !DEFAULT_BINDINGS.iter().any(|(known, _, _)| known == name))
+    {
+        return Err(format!("unknown binding action `{unknown}`"));
+    }
+    for (name, action, defaults) in DEFAULT_BINDINGS {
+        match raw.bindings.actions.get(*name) {
+            Some(values) => {
+                for value in values {
+                    add_binding(&mut bindings, value, *action)?;
+                }
+            }
+            None => {
+                for value in defaults.split_whitespace() {
+                    add_binding(&mut bindings, value, *action)?;
+                }
+            }
+        }
+    }
+
     let mut configured = vec![
-        (raw.bindings.focus_left, Action::FocusLeft),
-        (raw.bindings.focus_right, Action::FocusRight),
-        (raw.bindings.focus_up, Action::FocusUp),
-        (raw.bindings.focus_down, Action::FocusDown),
-        (raw.bindings.swap_left, Action::SwapLeft),
-        (raw.bindings.swap_right, Action::SwapRight),
-        (raw.bindings.swap_up, Action::SwapUp),
-        (raw.bindings.swap_down, Action::SwapDown),
-        (
-            raw.bindings.consume_or_expel_left,
-            Action::ConsumeOrExpelLeft,
-        ),
-        (
-            raw.bindings.consume_or_expel_right,
-            Action::ConsumeOrExpelRight,
-        ),
-        (raw.bindings.cycle_column_width, Action::CycleColumnWidth),
-        (
-            raw.bindings.decrease_column_width,
-            Action::DecreaseColumnWidth,
-        ),
-        (
-            raw.bindings.increase_column_width,
-            Action::IncreaseColumnWidth,
-        ),
-        (raw.bindings.close_window, Action::CloseWindow),
-        (raw.bindings.toggle_fullscreen, Action::ToggleFullscreen),
-        (raw.bindings.focus_monitor_left, Action::FocusMonitorLeft),
-        (raw.bindings.focus_monitor_right, Action::FocusMonitorRight),
-        (raw.bindings.focus_monitor_up, Action::FocusMonitorUp),
-        (raw.bindings.focus_monitor_down, Action::FocusMonitorDown),
-        (raw.bindings.move_to_monitor_left, Action::MoveToMonitorLeft),
-        (
-            raw.bindings.move_to_monitor_right,
-            Action::MoveToMonitorRight,
-        ),
-        (raw.bindings.move_to_monitor_up, Action::MoveToMonitorUp),
-        (raw.bindings.move_to_monitor_down, Action::MoveToMonitorDown),
-        (raw.bindings.quit, Action::Quit),
         (workspace.previous, Action::PreviousWorkspace),
         (workspace.next, Action::NextWorkspace),
         (workspace.move_previous, Action::MoveToPreviousWorkspace),
@@ -991,6 +935,27 @@ fn invalid_data(path: &Path, message: impl std::fmt::Display) -> io::Error {
     )
 }
 
+/// Appended to `DEFAULT_CONFIG` by the tests that need configured monitors.
+#[cfg(test)]
+const MONITORS: &str = r#"
+[[monitors]]
+connector = "DP-2"
+# focus_at_startup = true
+resolution = [2560, 1440]
+refresh = 120.0
+position = [0, 0]
+transform = "normal"
+vrr = "automatic"
+
+[[monitors]]
+connector = "DP-1"
+resolution = [2560, 1440]
+refresh = 199.999
+position = [2560, 0]
+transform = "normal"
+vrr = "automatic"
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,13 +992,19 @@ mod tests {
         assert!(config.animations.active());
         assert!(config.backend.direct_scanout);
         assert_eq!(config.animations.duration, Duration::from_millis(150));
-        assert_eq!(config.monitors.len(), 2);
-        assert_eq!(config.monitors[0].connector, "DP-2");
-        assert!(!config.monitors[0].focus_at_startup);
+        // The shipped config configures no monitors; they are auto-detected.
+        assert!(config.monitors.is_empty());
         assert_eq!(config.startup_monitor(), None);
-        assert_eq!(config.monitors[0].vrr, VrrPolicy::Automatic);
-        assert_eq!(config.monitors[1].transform, Transform::Normal);
         assert!(config.autostart.is_empty());
+
+        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let monitored = parse(&with_monitors).unwrap();
+        assert_eq!(monitored.monitors.len(), 2);
+        assert_eq!(monitored.monitors[0].connector, "DP-2");
+        assert!(!monitored.monitors[0].focus_at_startup);
+        assert_eq!(monitored.startup_monitor(), None);
+        assert_eq!(monitored.monitors[0].vrr, VrrPolicy::Automatic);
+        assert_eq!(monitored.monitors[1].transform, Transform::Normal);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -1158,6 +1129,13 @@ mod tests {
                 .contains("more than one action")
         );
 
+        let unknown_action = DEFAULT_CONFIG.replace("focus_left = ", "focus_lft = ");
+        assert!(
+            parse(&unknown_action)
+                .unwrap_err()
+                .contains("unknown binding action")
+        );
+
         let invalid_binding = DEFAULT_CONFIG.replace("Super+h", "Hyper+h");
         assert!(
             parse(&invalid_binding)
@@ -1211,23 +1189,30 @@ mod tests {
                 .contains("unknown key")
         );
 
-        let invalid_transform =
-            DEFAULT_CONFIG.replacen("transform = \"normal\"", "transform = \"sideways\"", 1);
+        let invalid_transform = format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replacen("transform = \"normal\"", "transform = \"sideways\"", 1)
+        );
         assert!(
             parse(&invalid_transform)
                 .unwrap_err()
                 .contains("unknown monitor transform")
         );
 
-        let duplicate = DEFAULT_CONFIG.replace("connector = \"DP-1\"", "connector = \"DP-2\"");
+        let duplicate = format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replace("connector = \"DP-1\"", "connector = \"DP-2\"")
+        );
         assert!(
             parse(&duplicate)
                 .unwrap_err()
                 .contains("duplicate monitor connector")
         );
 
-        let startup_monitor =
-            DEFAULT_CONFIG.replace("# focus_at_startup = true", "focus_at_startup = true");
+        let startup_monitor = format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replace("# focus_at_startup = true", "focus_at_startup = true")
+        );
         assert_eq!(
             parse(&startup_monitor).unwrap().startup_monitor(),
             Some("DP-2")
@@ -1245,24 +1230,22 @@ mod tests {
         // A config predating every optional section still parses to the defaults.
         let legacy = without_section(DEFAULT_CONFIG, "[appearance]");
         let legacy = without_section(&legacy, "[animations]");
-        let legacy = without_section(&legacy, "[backend]");
-        let legacy = without_section(&legacy, "[[monitors]]");
-        let legacy = without_section(&legacy, "[[monitors]]")
+        let legacy = without_section(&legacy, "[backend]")
             .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
             .replace("toggle_fullscreen = [\"Super+Shift+f\"]\n", "")
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
-        let config = parse(&legacy).unwrap();
-        assert_eq!(config.bindings.len(), 54);
-        assert_eq!(config.appearance.gaps, 15);
-        assert_eq!(config.appearance.corner_radius, 8);
-        assert!(config.appearance.blur);
-        assert!(config.animations.enabled);
-        assert!(config.backend.direct_scanout);
-        assert_eq!(config.animations.duration, Duration::from_millis(150));
-        assert!(config.monitors.is_empty());
+        let legacy = parse(&legacy).unwrap();
+        assert_eq!(legacy.bindings.len(), 54);
+        // Whole-struct comparison: the built-in defaults and the values written
+        // into DEFAULT_CONFIG must not drift apart.
+        assert_eq!(legacy.appearance, config.appearance);
+        assert_eq!(legacy.animations, config.animations);
+        assert_eq!(legacy.input, config.input);
+        assert_eq!(legacy.backend, config.backend);
+        assert!(legacy.monitors.is_empty());
         assert_eq!(
-            config.action(
+            legacy.action(
                 &ModifiersState {
                     logo: true,
                     ..Default::default()
@@ -1305,11 +1288,12 @@ swap_right = ["Super+Shift+l"]
         assert!(VrrPolicy::Automatic.enabled(true));
         assert!(VrrPolicy::Always.enabled(false));
 
+        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
         let config =
-            parse(&DEFAULT_CONFIG.replace("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
+            parse(&with_monitors.replace("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
         assert_eq!(config.monitors[0].vrr, VrrPolicy::Never);
 
-        let config = parse(&DEFAULT_CONFIG.replace("vrr = \"automatic\"\n", "")).unwrap();
+        let config = parse(&with_monitors.replace("vrr = \"automatic\"\n", "")).unwrap();
         assert!(
             config
                 .monitors
@@ -1414,15 +1398,16 @@ swap_right = ["Super+Shift+l"]
         let root = env::temp_dir().join(format!("paw2-reload-test-{}-{nonce}", std::process::id()));
         let path = root.join("config.toml");
         fs::create_dir_all(&root).unwrap();
-        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
+        fs::write(&path, &with_monitors).unwrap();
 
         let mut watcher = ConfigWatcher {
             path: path.clone(),
-            source: DEFAULT_CONFIG.into(),
+            source: with_monitors.clone(),
         };
         assert!(watcher.reload().unwrap().is_none());
 
-        let changed = DEFAULT_CONFIG
+        let changed = with_monitors
             .replace("column_width = 0.6", "column_width = 0.7")
             .replace("resolution = [2560, 1440]", "resolution = [1920, 1080]")
             .replace(
@@ -1435,7 +1420,7 @@ swap_right = ["Super+Shift+l"]
             );
         fs::write(&path, changed).unwrap();
         let updated = watcher.reload().unwrap().unwrap();
-        let mut active = parse(DEFAULT_CONFIG).unwrap();
+        let mut active = parse(&with_monitors).unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.layout.column_width, 0.7);
         assert_eq!(active.monitors[0].resolution, Some([2560, 1440]));
@@ -1448,21 +1433,21 @@ swap_right = ["Super+Shift+l"]
         );
 
         let updated = parse(
-            &DEFAULT_CONFIG.replace("middle_click_paste = true", "middle_click_paste = false"),
+            &with_monitors.replace("middle_click_paste = true", "middle_click_paste = false"),
         )
         .unwrap();
         assert!(active.apply_runtime(updated));
         assert!(active.input.middle_click_paste);
 
         let updated = parse(
-            &DEFAULT_CONFIG.replace("focus_follows_mouse = false", "focus_follows_mouse = true"),
+            &with_monitors.replace("focus_follows_mouse = false", "focus_follows_mouse = true"),
         )
         .unwrap();
         assert!(!active.apply_runtime(updated));
         assert!(active.input.focus_follows_mouse);
 
         let updated = parse(&format!(
-            "{DEFAULT_CONFIG}\n[theme]\ncursor_theme = \"Breeze\"\n"
+            "{with_monitors}\n[theme]\ncursor_theme = \"Breeze\"\n"
         ))
         .unwrap();
         assert!(active.apply_runtime(updated));
@@ -1472,7 +1457,7 @@ swap_right = ["Super+Shift+l"]
         assert!(watcher.reload().is_err());
         assert!(watcher.reload().unwrap().is_none());
 
-        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        fs::write(&path, &with_monitors).unwrap();
         assert!(watcher.reload().unwrap().is_some());
         fs::remove_dir_all(root).unwrap();
     }

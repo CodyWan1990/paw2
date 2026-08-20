@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use smithay::{
     backend::renderer::element::{Id, RenderElementStates, default_primary_scanout_output_compare},
@@ -85,25 +82,18 @@ impl Workspace {
         self.focused = Some(self.windows.len() - 1);
     }
 
-    fn add_column(&mut self, windows: Vec<Window>, focused: usize, width: Option<f64>) {
-        self.windows.extend(windows.iter().cloned());
-        self.columns.push(Column {
-            windows,
-            focused,
-            width,
-        });
-        self.focused = self
-            .columns
-            .last()
-            .and_then(|column| column.windows.get(column.focused))
-            .and_then(|window| self.window_index(window));
-    }
-
     fn add_group(&mut self, group: WindowGroup) {
         if group.floating {
             self.add(group.windows[0].clone(), true);
         } else {
-            self.add_column(group.windows, group.focused, group.width);
+            let focused = group.windows.get(group.focused).cloned();
+            self.windows.extend(group.windows.iter().cloned());
+            self.columns.push(Column {
+                windows: group.windows,
+                focused: group.focused,
+                width: group.width,
+            });
+            self.focused = focused.and_then(|window| self.window_index(&window));
         }
         if self.fullscreen.is_none() {
             self.fullscreen = group.fullscreen;
@@ -282,16 +272,13 @@ impl Workspace {
         swap_column_window(column, delta)
     }
 
-    fn set_floating(&mut self, window: &Window, floating: bool) {
-        if floating {
-            self.remove_from_column(window);
-        } else if !self
+    /// A window the layout does not tile belongs to no column. That membership
+    /// is the only record of floating state; nothing tracks it separately.
+    fn is_floating(&self, window: &Window) -> bool {
+        !self
             .columns
             .iter()
             .any(|column| column.windows.contains(window))
-        {
-            self.columns.push(Column::new(window.clone()));
-        }
     }
 
     fn consume_or_expel(&mut self, delta: i32) -> bool {
@@ -362,10 +349,6 @@ impl Scroller {
         self.output = output;
     }
 
-    fn add(&mut self, window: Window, floating: bool) {
-        self.active_mut().add(window, floating);
-    }
-
     fn remove_where(&mut self, predicate: impl Fn(&Window) -> bool) -> Option<Window> {
         for workspace in &mut self.workspaces {
             if let Some(window) = workspace.remove_where(&predicate) {
@@ -382,10 +365,6 @@ impl Scroller {
             self.space.unmap_elem(window);
         }
         Some(group)
-    }
-
-    fn add_group(&mut self, group: WindowGroup) {
-        self.active_mut().add_group(group);
     }
 
     fn active(&self) -> &Workspace {
@@ -425,7 +404,6 @@ pub struct Scrollers {
     monitors: Vec<Scroller>,
     focused_output: Option<String>,
     parked: [Workspace; WORKSPACE_COUNT],
-    floating: HashSet<usize>,
     animations: HashMap<usize, WindowAnimation>,
 }
 
@@ -571,26 +549,41 @@ impl Scrollers {
         Some(monitor.active_mut())
     }
 
+    /// Every workspace holding windows, mapped or parked.
+    fn workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.monitors
+            .iter()
+            .flat_map(|monitor| &monitor.workspaces)
+            .chain(&self.parked)
+    }
+
+    fn is_floating(&self, window: &Window) -> bool {
+        self.workspaces()
+            .find(|workspace| workspace.windows.contains(window))
+            .is_some_and(|workspace| workspace.is_floating(window))
+    }
+
+    /// Moves the window into or out of the column layout. Reports whether that
+    /// changed anything, so callers only relayout when it did.
     fn set_floating(&mut self, window: &Window, floating: bool) -> bool {
-        let changed = if floating {
-            self.floating.insert(window.id())
-        } else {
-            self.floating.remove(&window.id())
+        let Some(workspace) = self
+            .monitors
+            .iter_mut()
+            .flat_map(|monitor| &mut monitor.workspaces)
+            .chain(&mut self.parked)
+            .find(|workspace| workspace.windows.contains(window))
+        else {
+            return false;
         };
-        if changed {
-            for workspace in self
-                .monitors
-                .iter_mut()
-                .flat_map(|monitor| &mut monitor.workspaces)
-                .chain(&mut self.parked)
-            {
-                if workspace.windows.contains(window) {
-                    workspace.set_floating(window, floating);
-                    break;
-                }
-            }
+        if workspace.is_floating(window) == floating {
+            return false;
         }
-        changed
+        if floating {
+            workspace.remove_from_column(window);
+        } else {
+            workspace.columns.push(Column::new(window.clone()));
+        }
+        true
     }
 }
 
@@ -750,13 +743,10 @@ impl Paw2 {
     fn add_managed_window(&mut self, window: Window, fullscreen: bool, floating: bool) {
         let pointer = self.seat.get_pointer().unwrap().current_location();
         self.focus_output_at(pointer);
-        if floating {
-            self.scroller.floating.insert(window.id());
-        }
         if let Some(output) = self.scroller.focused_output.clone()
             && let Some(monitor) = self.scroller.monitor_mut(&output)
         {
-            monitor.add(window.clone(), floating);
+            monitor.active_mut().add(window.clone(), floating);
             if fullscreen {
                 monitor.active_mut().fullscreen = Some(window.clone());
             }
@@ -860,7 +850,6 @@ impl Paw2 {
     }
 
     fn forget_window(&mut self, window: &Window) {
-        self.scroller.floating.remove(&window.id());
         self.scroller.animations.remove(&window.id());
         self.relayout(true);
         self.sync_focus();
@@ -899,7 +888,7 @@ impl Paw2 {
             }
             return;
         };
-        if !self.scroller.floating.contains(&window.id()) {
+        if !self.scroller.is_floating(&window) {
             self.relayout(false);
             return;
         }
@@ -971,7 +960,7 @@ impl Paw2 {
             .focus_window(window);
         self.scroller.focused_output = Some(self.scroller.monitors[monitor_index].output.name());
         self.relayout(reveal_and_raise);
-        if reveal_and_raise && self.scroller.floating.contains(&window.id()) {
+        if reveal_and_raise && self.scroller.is_floating(window) {
             self.scroller.monitors[monitor_index]
                 .space
                 .raise_element(window, false);
@@ -1026,6 +1015,9 @@ impl Paw2 {
         let target_workspace = self.scroller.monitors[target_monitor].active_workspace;
 
         if (source_monitor, source_workspace) != (target_monitor, target_workspace) {
+            // Read before the move: leaving the column is what floating means.
+            let floating = self.scroller.monitors[source_monitor].workspaces[source_workspace]
+                .is_floating(&window);
             let source = &mut self.scroller.monitors[source_monitor];
             let workspace = &mut source.workspaces[source_workspace];
             let window = workspace.windows.remove(source_window);
@@ -1036,7 +1028,6 @@ impl Paw2 {
             source.space.unmap_elem(&window);
 
             let target = &mut self.scroller.monitors[target_monitor];
-            let floating = self.scroller.floating.contains(&window.id());
             target.workspaces[target_workspace].add(window.clone(), floating);
         }
 
@@ -1301,7 +1292,7 @@ impl Paw2 {
                 group.fullscreen = None;
             }
             let target_scroller = self.scroller.monitor_mut(&target)?;
-            target_scroller.add_group(group);
+            target_scroller.active_mut().add_group(group);
             if let Some(window) = fullscreen {
                 if target_has_fullscreen {
                     self.set_window_fullscreen(&window, None);
@@ -1765,7 +1756,6 @@ impl Paw2 {
                 Some((monitor.output.name(), output, work_area(output, zone)))
             })
             .collect::<Vec<_>>();
-        let floating = &self.scroller.floating;
         let animations = &mut self.scroller.animations;
         let monitors = &mut self.scroller.monitors;
         let now = self.start_time.elapsed();
@@ -1814,6 +1804,22 @@ impl Paw2 {
                 reveal_focus,
             );
             let offset = workspace.offset;
+            // Sizes the window, then glides it from wherever it currently sits.
+            let mut place =
+                |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
+                    configure_window(window, rectangle, client_sized);
+                    let current = space.element_location(window);
+                    let position = start_motion(
+                        animations,
+                        window.id(),
+                        current,
+                        rectangle.loc,
+                        now,
+                        duration,
+                    );
+                    space.map_element(window.clone(), position, false);
+                };
+
             let mut column_x = geometry.loc.x + gap - offset;
             for (column, width) in workspace.columns.iter().zip(widths) {
                 let rows = stacked_rows(geometry.loc.y, geometry.size.h, column.windows.len(), gap);
@@ -1827,24 +1833,14 @@ impl Paw2 {
                             (width - gap, row.size.h).into(),
                         )
                     };
-                    configure_window(window, rectangle, false);
-                    let current = space.element_location(window);
-                    let position = start_motion(
-                        animations,
-                        window.id(),
-                        current,
-                        rectangle.loc,
-                        now,
-                        duration,
-                    );
-                    space.map_element(window.clone(), position, false);
+                    place(window, rectangle, false);
                 }
                 column_x += width;
             }
             for window in workspace
                 .windows
                 .iter()
-                .filter(|window| floating.contains(&window.id()))
+                .filter(|window| workspace.is_floating(window))
             {
                 let fullscreen = workspace.fullscreen.as_ref() == Some(window);
                 let rectangle = if fullscreen {
@@ -1852,17 +1848,7 @@ impl Paw2 {
                 } else {
                     centered_rectangle(geometry, floating_size(window))
                 };
-                configure_window(window, rectangle, !fullscreen);
-                let current = space.element_location(window);
-                let position = start_motion(
-                    animations,
-                    window.id(),
-                    current,
-                    rectangle.loc,
-                    now,
-                    duration,
-                );
-                space.map_element(window.clone(), position, false);
+                place(window, rectangle, !fullscreen);
             }
         }
     }

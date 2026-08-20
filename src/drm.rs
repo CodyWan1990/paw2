@@ -397,31 +397,20 @@ fn update_vrr(output: &mut ActiveOutput, fullscreen: bool) {
 impl DirectBackend {
     fn rescan(&mut self, state: &mut Paw2) -> Result<(), Box<dyn std::error::Error>> {
         let scan = self.scanner.scan_connectors(self.manager.device())?;
-        let disconnected = scan
-            .disconnected
-            .iter()
-            .filter_map(|(connector, _)| {
-                self.outputs
-                    .iter()
-                    .any(|output| output.connector == connector.handle())
-                    .then_some(connector.handle())
-            })
-            .collect::<Vec<_>>();
-        for connector in disconnected {
-            self.disconnect(state, connector, false);
-        }
-        let changed = scan
-            .changed
-            .iter()
-            .filter_map(|(connector, _)| {
-                self.outputs
-                    .iter()
-                    .any(|output| output.connector == connector.handle())
-                    .then_some(connector.handle())
-            })
-            .collect::<Vec<_>>();
-        for connector in changed {
-            self.disconnect(state, connector, true);
+        // A changed connector keeps its layout; a disconnected one hands it over.
+        for (connectors, preserve_layout) in [(&scan.disconnected, false), (&scan.changed, true)] {
+            let known = connectors
+                .iter()
+                .filter_map(|(connector, _)| {
+                    self.outputs
+                        .iter()
+                        .any(|output| output.connector == connector.handle())
+                        .then_some(connector.handle())
+                })
+                .collect::<Vec<_>>();
+            for connector in known {
+                self.disconnect(state, connector, preserve_layout);
+            }
         }
 
         let legacy = state.config.backend.connector.as_deref();
@@ -477,14 +466,7 @@ impl DirectBackend {
             .cloned();
         let drm_mode = select_mode(&connector, config.as_ref())?;
         let mode = Mode::from(drm_mode);
-        let preferred = connector
-            .modes()
-            .iter()
-            .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| connector.modes().first())
-            .copied()
-            .map(Mode::from)
-            .unwrap_or(mode);
+        let preferred = preferred_mode(&connector).map_or(mode, Mode::from);
         let transform = config
             .as_ref()
             .map_or(Transform::Normal, |value| value.transform);
@@ -675,12 +657,8 @@ impl DirectBackend {
             active.repaint_scheduled = true;
             let delay = frame_duration(&active.output).mul_f64(0.6);
             let crtc = active.crtc;
-            self.schedule_repaint(crtc, delay);
+            schedule_repaint(&self.handle, crtc, delay);
         }
-    }
-
-    fn schedule_repaint(&self, crtc: crtc::Handle, delay: Duration) {
-        schedule_repaint(&self.handle, crtc, delay);
     }
 
     fn capture_output(&mut self, state: &mut Paw2, output: &Output) {
@@ -860,17 +838,22 @@ fn connector_name(connector: &connector::Info) -> String {
     )
 }
 
-fn select_mode(
-    connector: &connector::Info,
-    config: Option<&MonitorConfig>,
-) -> Result<DrmMode, io::Error> {
-    let name = connector_name(connector);
-    let preferred = connector
+/// The connector's preferred mode, falling back to its first advertised one.
+fn preferred_mode(connector: &connector::Info) -> Option<DrmMode> {
+    connector
         .modes()
         .iter()
         .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
         .or_else(|| connector.modes().first())
         .copied()
+}
+
+fn select_mode(
+    connector: &connector::Info,
+    config: Option<&MonitorConfig>,
+) -> Result<DrmMode, io::Error> {
+    let name = connector_name(connector);
+    let preferred = preferred_mode(connector)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} has no modes")))?;
     let Some(config) = config else {
         return Ok(preferred);

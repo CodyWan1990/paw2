@@ -97,43 +97,20 @@ impl CompositorHandler for Paw2 {
             let Some(dmabuf) = dmabuf else {
                 return;
             };
-            if let Some(acquire_point) = acquire_point
-                && let Ok((blocker, source)) = acquire_point.generate_blocker()
-            {
-                let Some(client) = surface.client() else {
-                    return;
-                };
-                if state
-                    .loop_handle
-                    .insert_source(source, move |_, _, state| {
-                        let display_handle = state.display_handle.clone();
-                        state
-                            .client_compositor_state(&client)
-                            .blocker_cleared(state, &display_handle);
-                        Ok(())
-                    })
-                    .is_ok()
-                {
-                    add_blocker(surface, blocker);
-                    return;
-                }
-            }
-            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
-                return;
-            };
             let Some(client) = surface.client() else {
                 return;
             };
-            if state
-                .loop_handle
-                .insert_source(source, move |_, _, state| {
-                    let display_handle = state.display_handle.clone();
-                    state
-                        .client_compositor_state(&client)
-                        .blocker_cleared(state, &display_handle);
-                    Ok(())
-                })
-                .is_ok()
+            // An explicit acquire point is preferred; the buffer's implicit fence
+            // is the fallback when there is none or its source cannot be added.
+            if let Some(acquire_point) = acquire_point
+                && let Ok((blocker, source)) = acquire_point.generate_blocker()
+                && unblock_on(state, client.clone(), source)
+            {
+                add_blocker(surface, blocker);
+                return;
+            }
+            if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ)
+                && unblock_on(state, client, source)
             {
                 add_blocker(surface, blocker);
             }
@@ -212,6 +189,24 @@ impl CompositorHandler for Paw2 {
         }
         crate::drm::redraw(self);
     }
+}
+
+/// Clears the client's commit blocker once `source` fires. Reports whether the
+/// source was accepted, since an unusable source must not leave a blocker behind.
+fn unblock_on<S, E>(state: &mut Paw2, client: Client, source: S) -> bool
+where
+    S: smithay::reexports::calloop::EventSource<Ret = Result<(), E>> + 'static,
+{
+    state
+        .loop_handle
+        .insert_source(source, move |_, _, state| {
+            let display_handle = state.display_handle.clone();
+            state
+                .client_compositor_state(&client)
+                .blocker_cleared(state, &display_handle);
+            Ok(())
+        })
+        .is_ok()
 }
 
 impl BufferHandler for Paw2 {
