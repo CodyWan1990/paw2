@@ -7,7 +7,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, VrrSupport,
             compositor::{FrameError, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
@@ -45,13 +45,18 @@ use smithay::{
         wayland_server::backend::GlobalId,
     },
     utils::{DeviceFd, IsAlive, Logical, Monotonic, Point, Rectangle, Scale, Time, Transform},
-    wayland::{compositor, dmabuf::DmabufFeedbackBuilder, presentation::Refresh},
+    wayland::{
+        compositor,
+        dmabuf::DmabufFeedbackBuilder,
+        drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+        presentation::Refresh,
+    },
 };
 use smithay_drm_extras::{display_info, drm_scanner::DrmScanner};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::MonitorConfig,
+    config::{MonitorConfig, VrrPolicy},
     render::{Effects, PawRenderElements, clear_color},
     state::Paw2,
 };
@@ -71,6 +76,10 @@ struct ActiveOutput {
     frame_pending: bool,
     repaint_scheduled: bool,
     direct_scanout_active: bool,
+    vrr_policy: VrrPolicy,
+    vrr_support: VrrSupport,
+    vrr_requested: Option<bool>,
+    vrr_active: bool,
 }
 
 pub struct DirectBackend {
@@ -100,6 +109,13 @@ pub fn init(
     )?;
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let (device, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
+    if supports_syncobj_eventfd(&fd) {
+        state.drm_syncobj_state = Some(DrmSyncobjState::new::<Paw2>(
+            &state.display_handle,
+            fd.clone(),
+        ));
+        info!("enabled linux-drm-syncobj explicit synchronization");
+    }
     let gbm = GbmDevice::new(fd)?;
     let display = unsafe { EGLDisplay::new(gbm.clone())? };
     let context = EGLContext::new_with_priority(&display, ContextPriority::High)?;
@@ -218,6 +234,7 @@ pub fn init(
                             Ok(Some(mut feedback)) => present_feedback(
                                 &mut feedback,
                                 &output.output,
+                                output.vrr_active,
                                 metadata.as_ref(),
                                 state,
                             ),
@@ -310,6 +327,7 @@ fn frame_duration(output: &Output) -> Duration {
 fn present_feedback(
     feedback: &mut OutputPresentationFeedback,
     output: &Output,
+    vrr_active: bool,
     metadata: Option<&DrmEventMetadata>,
     state: &Paw2,
 ) {
@@ -329,7 +347,45 @@ fn present_feedback(
         flags |=
             wp_presentation_feedback::Kind::HwClock | wp_presentation_feedback::Kind::HwCompletion;
     }
-    feedback.presented(timestamp, Refresh::fixed(frame_duration), sequence, flags);
+    let refresh = if vrr_active {
+        Refresh::variable(frame_duration)
+    } else {
+        Refresh::fixed(frame_duration)
+    };
+    feedback.presented(timestamp, refresh, sequence, flags);
+}
+
+fn update_vrr(output: &mut ActiveOutput, fullscreen: bool) {
+    if output.vrr_support == VrrSupport::NotSupported {
+        output.vrr_requested = Some(false);
+        output.vrr_active = false;
+        return;
+    }
+    let requested = output.vrr_policy.enabled(fullscreen);
+    if output.vrr_requested == Some(requested) {
+        return;
+    }
+    output.vrr_requested = Some(requested);
+
+    let result = output
+        .kms
+        .with_compositor(|compositor| compositor.use_vrr(requested));
+    output.vrr_active = output
+        .kms
+        .with_compositor(|compositor| compositor.vrr_enabled());
+    match result {
+        Ok(()) => info!(
+            output = %output.output.name(),
+            vrr = output.vrr_active,
+            "VRR state changed"
+        ),
+        Err(error) => warn!(
+            output = %output.output.name(),
+            requested,
+            ?error,
+            "failed to change VRR state"
+        ),
+    }
 }
 
 impl DirectBackend {
@@ -470,6 +526,15 @@ impl DirectBackend {
             &mut self.renderer,
             &empty,
         )?;
+        let vrr_policy = config
+            .as_ref()
+            .map_or(VrrPolicy::Automatic, |value| value.vrr);
+        let vrr_support = kms
+            .with_compositor(|compositor| compositor.vrr_supported(connector.handle()))
+            .unwrap_or_else(|error| {
+                warn!(connector = %name, ?error, "failed to query VRR support");
+                VrrSupport::NotSupported
+            });
         let global = output.create_global::<Paw2>(&state.display_handle);
         state.output_added(&output, position);
         self.outputs.push(ActiveOutput {
@@ -481,8 +546,12 @@ impl DirectBackend {
             frame_pending: false,
             repaint_scheduled: false,
             direct_scanout_active: false,
+            vrr_policy,
+            vrr_support,
+            vrr_requested: None,
+            vrr_active: false,
         });
-        info!(connector = %name, size = ?mode.size, refresh = mode.refresh, ?position, ?transform, "enabled output");
+        info!(connector = %name, size = ?mode.size, refresh = mode.refresh, ?position, ?transform, ?vrr_policy, ?vrr_support, "enabled output");
         Ok(())
     }
 
@@ -532,8 +601,11 @@ impl DirectBackend {
         }
         let output = self.outputs[index].output.clone();
         self.capture_output(state, &output);
+        let fullscreen = state.fullscreen_window(&output).is_some();
+        update_vrr(&mut self.outputs[index], fullscreen);
+        let frame_target = state.clock.now() + frame_duration(&output);
+        state.pre_repaint(&output, frame_target);
         let active = &mut self.outputs[index];
-        let fullscreen = state.fullscreen_window(&active.output).is_some();
         let direct_scanout = state.config.backend.direct_scanout;
         let mut elements =
             match self

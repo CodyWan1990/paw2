@@ -14,6 +14,7 @@ as the shell layer.
 - Horizontal scrolling columns with vertically stacked windows
 - Centered client-sized launcher and dialog windows
 - Dedicated fullscreen path with scanout-friendly rendering and presentation timing
+- Automatic per-monitor VRR for fullscreen games
 - Nine independent workspaces per monitor with Waybar integration
 - Configurable gaps and focused-window ring
 - Client-controlled transparency and background blur protocols
@@ -99,6 +100,7 @@ resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
 transform = "normal"
+vrr = "automatic"
 
 [[monitors]]
 connector = "DP-1"
@@ -196,8 +198,15 @@ scaling, or unsupported buffers fall back to composition. Set
 display corruption. Games that retain a smaller buffer are scaled to the
 largest centered area without changing their aspect ratio. Paw2 also exposes
 presentation timing, relative pointer, pointer constraints, and idle-inhibit
-protocols used by native Wayland games. Paw2 starts XWayland automatically and
-exports `DISPLAY`, so Steam can be launched normally with `steam`.
+protocols used by native Wayland games. It also supports explicit DRM syncobj
+fences, FIFO barriers, commit timing, and content-type hints. Paw2 starts
+XWayland automatically and exports `DISPLAY`, so Steam can be launched normally
+with `steam`.
+
+VRR is configured per `[[monitors]]` entry. `automatic` enables it while a
+fullscreen window controls the output, `always` leaves it enabled, and `never`
+disables it. Unconfigured monitors default to `automatic`. Unsupported monitors
+remain synchronized normally. Changing this setting requires restarting Paw2.
 
 Screen sharing is available in the standalone session through the standard
 desktop portal. Paw2 restricts its screencopy protocol to the installed
@@ -228,7 +237,7 @@ The wallpaper makes application transparency and background blur visible.
 
 ## Roadmap
 
-- VRR and tearing control
+- Tearing control once Smithay's async page-flip support is stable
 - Hardware-safe fullscreen direct scanout
 - Quickshell integration
 - Distribution packages

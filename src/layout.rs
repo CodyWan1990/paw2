@@ -15,11 +15,13 @@ use smithay::{
     output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
-        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size},
+    utils::{Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Size, Time},
     wayland::{
-        compositor::with_states,
+        commit_timing::CommitTimerBarrierStateUserData,
+        compositor::{CompositorHandler, with_states},
+        fifo::FifoBarrierCachedState,
         shell::wlr_layer::{KeyboardInteractivity, Layer},
         shell::xdg::{
             SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData, dialog::ToplevelDialogHint,
@@ -1382,19 +1384,88 @@ impl Paw2 {
         Some((geometry, self.config.appearance.window_opacity() * fade))
     }
 
-    pub fn send_frames(&self, output: &Output) {
+    pub fn pre_repaint(&mut self, output: &Output, frame_target: Time<Monotonic>) {
+        let clients = {
+            let mut clients = Vec::<Client>::new();
+            let mut signal =
+                |surface: &WlSurface, states: &smithay::wayland::compositor::SurfaceData| {
+                    let Some(commit_timer) =
+                        states.data_map.get::<CommitTimerBarrierStateUserData>()
+                    else {
+                        return;
+                    };
+                    commit_timer.lock().unwrap().signal_until(frame_target);
+                    if let Some(client) = surface.client()
+                        && !clients.iter().any(|known| known.id() == client.id())
+                    {
+                        clients.push(client);
+                    }
+                };
+            if let Some(space) = self.space_for_output(output) {
+                for window in space.elements() {
+                    window.with_surfaces(&mut signal);
+                }
+            }
+            let layers = layer_map_for_output(output);
+            for layer in layers.layers() {
+                layer.with_surfaces(&mut signal);
+            }
+            clients
+        };
+
+        let display_handle = self.display_handle.clone();
+        for client in clients {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &display_handle);
+        }
+    }
+
+    pub fn send_frames(&mut self, output: &Output) {
         let time = self.start_time.elapsed();
-        if let Some(space) = self.space_for_output(output) {
-            for window in space.elements() {
-                window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
+        let clients = {
+            let mut clients = Vec::<Client>::new();
+            let mut signal =
+                |surface: &WlSurface, states: &smithay::wayland::compositor::SurfaceData| {
+                    if surface_primary_scanout_output(surface, states)
+                        .as_ref()
+                        .is_none_or(|primary| primary == output)
+                        && let Some(barrier) = states
+                            .cached_state
+                            .get::<FifoBarrierCachedState>()
+                            .current()
+                            .barrier
+                            .take()
+                    {
+                        barrier.signal();
+                        if let Some(client) = surface.client()
+                            && !clients.iter().any(|known| known.id() == client.id())
+                        {
+                            clients.push(client);
+                        }
+                    }
+                };
+            if let Some(space) = self.space_for_output(output) {
+                for window in space.elements() {
+                    window.with_surfaces(&mut signal);
+                    window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                }
+            }
+            let layers = layer_map_for_output(output);
+            for layer in layers.layers() {
+                layer.with_surfaces(&mut signal);
+                layer.send_frame(output, time, Some(Duration::ZERO), |_, _| {
                     Some(output.clone())
                 });
             }
-        }
-        for layer in layer_map_for_output(output).layers() {
-            layer.send_frame(output, time, Some(Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
+            clients
+        };
+
+        let display_handle = self.display_handle.clone();
+        for client in clients {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &display_handle);
         }
     }
 

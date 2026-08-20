@@ -30,6 +30,7 @@ use smithay::{
             with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
+        drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
         idle_inhibit::IdleInhibitHandler,
         output::OutputHandler,
         pointer_constraints::{
@@ -74,8 +75,8 @@ impl CompositorHandler for Paw2 {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
-            let dmabuf = with_states(surface, |states| {
-                states
+            let (dmabuf, acquire_point) = with_states(surface, |states| {
+                let dmabuf = states
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .pending()
@@ -84,11 +85,39 @@ impl CompositorHandler for Paw2 {
                     .and_then(|assignment| match assignment {
                         BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
                         _ => None,
-                    })
+                    });
+                let acquire_point = states
+                    .cached_state
+                    .get::<DrmSyncobjCachedState>()
+                    .pending()
+                    .acquire_point
+                    .clone();
+                (dmabuf, acquire_point)
             });
             let Some(dmabuf) = dmabuf else {
                 return;
             };
+            if let Some(acquire_point) = acquire_point
+                && let Ok((blocker, source)) = acquire_point.generate_blocker()
+            {
+                let Some(client) = surface.client() else {
+                    return;
+                };
+                if state
+                    .loop_handle
+                    .insert_source(source, move |_, _, state| {
+                        let display_handle = state.display_handle.clone();
+                        state
+                            .client_compositor_state(&client)
+                            .blocker_cleared(state, &display_handle);
+                        Ok(())
+                    })
+                    .is_ok()
+                {
+                    add_blocker(surface, blocker);
+                    return;
+                }
+            }
             let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
                 return;
             };
@@ -215,6 +244,12 @@ impl DmabufHandler for Paw2 {
 impl ShmHandler for Paw2 {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
+    }
+}
+
+impl DrmSyncobjHandler for Paw2 {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
     }
 }
 

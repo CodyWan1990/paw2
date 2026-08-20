@@ -60,6 +60,7 @@ resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
 transform = "normal"
+vrr = "automatic"
 
 [[monitors]]
 connector = "DP-1"
@@ -67,6 +68,7 @@ resolution = [2560, 1440]
 refresh = 199.999
 position = [2560, 0]
 transform = "normal"
+vrr = "automatic"
 
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
@@ -254,6 +256,26 @@ pub struct MonitorConfig {
     pub refresh: Option<f64>,
     pub position: Option<[i32; 2]>,
     pub transform: Transform,
+    pub vrr: VrrPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VrrPolicy {
+    Never,
+    #[default]
+    Automatic,
+    Always,
+}
+
+impl VrrPolicy {
+    pub fn enabled(self, fullscreen: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Automatic => fullscreen,
+            Self::Always => true,
+        }
+    }
 }
 
 impl Config {
@@ -526,6 +548,8 @@ struct RawMonitor {
     position: Option<[i32; 2]>,
     #[serde(default = "default_transform")]
     transform: String,
+    #[serde(default)]
+    vrr: VrrPolicy,
 }
 
 #[derive(Default, Deserialize)]
@@ -689,6 +713,7 @@ fn parse(source: &str) -> Result<Config, String> {
             refresh: monitor.refresh,
             position: monitor.position,
             transform: parse_transform(&monitor.transform)?,
+            vrr: monitor.vrr,
         });
     }
 
@@ -883,6 +908,7 @@ mod tests {
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         assert_eq!(config.monitors.len(), 2);
         assert_eq!(config.monitors[0].connector, "DP-2");
+        assert_eq!(config.monitors[0].vrr, VrrPolicy::Automatic);
         assert_eq!(config.monitors[1].transform, Transform::Normal);
         assert!(config.autostart.is_empty());
         assert_eq!(
@@ -1036,6 +1062,26 @@ swap_right = ["Super+Shift+l"]
             parse(&invalid_workspaces)
                 .unwrap_err()
                 .contains("exactly 9")
+        );
+    }
+
+    #[test]
+    fn vrr_policy_matches_fullscreen_state() {
+        assert!(!VrrPolicy::Never.enabled(true));
+        assert!(!VrrPolicy::Automatic.enabled(false));
+        assert!(VrrPolicy::Automatic.enabled(true));
+        assert!(VrrPolicy::Always.enabled(false));
+
+        let config =
+            parse(&DEFAULT_CONFIG.replace("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
+        assert_eq!(config.monitors[0].vrr, VrrPolicy::Never);
+
+        let config = parse(&DEFAULT_CONFIG.replace("vrr = \"automatic\"\n", "")).unwrap();
+        assert!(
+            config
+                .monitors
+                .iter()
+                .all(|monitor| monitor.vrr == VrrPolicy::Automatic)
         );
     }
 

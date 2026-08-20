@@ -75,6 +75,9 @@ pub fn init(
             }
             WinitEvent::Input(event) => state.process_input(event),
             WinitEvent::Redraw => {
+                let frame_duration = std::time::Duration::from_secs_f64(1.0 / 60.0);
+                let frame_target = state.clock.now() + frame_duration;
+                state.pre_repaint(&output, frame_target);
                 let damage = Rectangle::from_size(backend.window_size());
                 let fullscreen = state.fullscreen_window(&output).is_some();
                 let mut feedback = {
@@ -95,7 +98,7 @@ pub fn init(
                 sequence += 1;
                 feedback.presented(
                     state.clock.now(),
-                    Refresh::fixed(std::time::Duration::from_secs_f64(1.0 / 60.0)),
+                    Refresh::fixed(frame_duration),
                     sequence,
                     wp_presentation_feedback::Kind::Vsync,
                 );

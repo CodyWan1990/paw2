@@ -17,8 +17,12 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         background_effect::BackgroundEffectState,
+        commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState},
+        content_type::ContentTypeState,
         dmabuf::DmabufState,
+        drm_syncobj::DrmSyncobjState,
+        fifo::FifoManagerState,
         idle_inhibit::IdleInhibitManagerState,
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
@@ -59,6 +63,10 @@ pub struct Paw2 {
     pub _output_manager_state: OutputManagerState,
     pub _idle_inhibit_state: IdleInhibitManagerState,
     pub _presentation_state: PresentationState,
+    pub _fifo_manager_state: FifoManagerState,
+    pub _commit_timing_manager_state: CommitTimingManagerState,
+    pub _content_type_state: ContentTypeState,
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
@@ -95,6 +103,9 @@ impl Paw2 {
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&display_handle);
         let presentation_state =
             PresentationState::new::<Self>(&display_handle, Monotonic::ID as u32);
+        let fifo_manager_state = FifoManagerState::new::<Self>(&display_handle);
+        let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&display_handle);
+        let content_type_state = ContentTypeState::new::<Self>(&display_handle);
         RelativePointerManagerState::new::<Self>(&display_handle);
         PointerConstraintsState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -133,6 +144,10 @@ impl Paw2 {
             _output_manager_state: output_manager_state,
             _idle_inhibit_state: idle_inhibit_state,
             _presentation_state: presentation_state,
+            _fifo_manager_state: fifo_manager_state,
+            _commit_timing_manager_state: commit_timing_manager_state,
+            _content_type_state: content_type_state,
+            drm_syncobj_state: None,
             seat_state,
             data_device_state,
             primary_selection_state,
