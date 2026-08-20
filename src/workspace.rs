@@ -233,13 +233,12 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for Paw2 {
                         state.workspace_state.pending.push(request);
                         continue;
                     }
-                    if let Some(index) = requested
-                        .iter()
-                        .position(|item| item.output == request.output)
+                    match requested
+                        .iter_mut()
+                        .find(|item| item.output == request.output)
                     {
-                        requested[index] = request;
-                    } else {
-                        requested.push(request);
+                        Some(existing) => *existing = request,
+                        None => requested.push(request),
                     }
                 }
                 for request in requested {

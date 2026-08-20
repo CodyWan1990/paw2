@@ -28,17 +28,15 @@ use state::Paw2;
 enum Mode {
     Direct,
     Nested(Vec<OsString>),
-    Help,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
-    let mode = parse_args(std::env::args_os().skip(1))?;
-    if mode == Mode::Help {
+    let Some(mode) = parse_args(std::env::args_os().skip(1))? else {
         print_usage();
         return Ok(());
-    }
+    };
     let (config, mut config_watcher) = config::load()?;
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
@@ -69,7 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &mode {
         Mode::Direct => drm::init(&mut event_loop, &mut state)?,
         Mode::Nested(_) => backend::init(&mut event_loop, &mut state)?,
-        Mode::Help => unreachable!(),
     }
 
     // SAFETY: Paw2 is single-threaded and sets the child environment before
@@ -149,11 +146,11 @@ pub(crate) fn spawn<T: AsRef<OsStr>>(command: &[T]) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<Mode> {
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Mode>> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
-        None => Ok(Mode::Direct),
-        Some(value) if value == "--nested" => Ok(Mode::Nested(args.collect())),
+        None => Ok(Some(Mode::Direct)),
+        Some(value) if value == "--nested" => Ok(Some(Mode::Nested(args.collect()))),
         Some(value) if value == "--help" || value == "-h" => {
             if args.next().is_some() {
                 Err(io::Error::new(
@@ -161,7 +158,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<Mode> {
                     "--help takes no arguments",
                 ))
             } else {
-                Ok(Mode::Help)
+                Ok(None)
             }
         }
         Some(value) => Err(io::Error::new(
@@ -187,12 +184,12 @@ mod tests {
 
     #[test]
     fn parses_cli() {
-        assert_eq!(parse_args([]).unwrap(), Mode::Direct);
+        assert_eq!(parse_args([]).unwrap(), Some(Mode::Direct));
         assert_eq!(
             parse_args(["--nested".into(), "kitty".into()]).unwrap(),
-            Mode::Nested(vec!["kitty".into()])
+            Some(Mode::Nested(vec!["kitty".into()]))
         );
-        assert_eq!(parse_args(["--help".into()]).unwrap(), Mode::Help);
+        assert_eq!(parse_args(["--help".into()]).unwrap(), None);
         assert!(parse_args(["kitty".into()]).is_err());
     }
 }

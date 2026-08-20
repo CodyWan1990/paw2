@@ -4,7 +4,9 @@ use smithay::{
     desktop::PopupManager,
     input::{Seat, SeatState},
     reexports::{
-        calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
+        calloop::{
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
+        },
         wayland_server::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -43,6 +45,7 @@ pub struct Paw2 {
     pub clock: Clock<Monotonic>,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
@@ -75,7 +78,11 @@ pub struct Paw2 {
 }
 
 impl Paw2 {
-    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>, config: Config) -> Self {
+    pub fn new(
+        event_loop: &mut EventLoop<'static, Self>,
+        display: Display<Self>,
+        config: Config,
+    ) -> Self {
         let display_handle = display.handle();
         let clock = Clock::<Monotonic>::new();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
@@ -112,6 +119,7 @@ impl Paw2 {
             clock,
             socket_name,
             display_handle,
+            loop_handle: event_loop.handle(),
             loop_signal: event_loop.get_signal(),
             popups: PopupManager::default(),
             seat,
@@ -145,7 +153,7 @@ impl Paw2 {
     }
 
     pub fn enable_background_effects(&mut self) {
-        if self._background_effect_state.is_none() && self.config.appearance.blur_radius > 0 {
+        if self._background_effect_state.is_none() && self.config.appearance.blur_enabled() {
             self._background_effect_state =
                 Some(BackgroundEffectState::new::<Self>(&self.display_handle));
         }

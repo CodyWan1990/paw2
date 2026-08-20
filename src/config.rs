@@ -4,6 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -27,14 +28,29 @@ center_focused_column = false
 gaps = 15
 focus_ring_width = 1
 focus_ring_color = "#0b3d91"
-# Smooth backdrop blur radius in logical pixels; zero disables it.
+# Rounded window corners in logical pixels; zero disables them.
+corner_radius = 8
+# Smooth backdrop blur behind translucent windows.
+blur = true
 blur_radius = 8
+# Compositor-set window opacity. Applies to windows only, never to layer
+# surfaces such as bars and wallpapers, and never to the cursor.
+transparency = true
+opacity = 0.95
+
+[animations]
+enabled = true
+duration_ms = 150
+# Multiplier for watching animations in slow motion; 3.0 runs them 3x slower.
+slowdown = 1.0
 
 [input]
 # Expose Wayland primary selection for middle-click paste.
 middle_click_paste = true
 
 [backend]
+# Automatically scan out compatible fullscreen buffers on the DRM primary plane.
+direct_scanout = true
 # drm_device = "/dev/dri/card1"
 # connector = "DP-1"
 
@@ -138,9 +154,11 @@ pub enum Action {
     Quit,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LayoutConfig {
     pub column_width: f64,
+    #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
     pub center_focused_column: bool,
 }
@@ -150,18 +168,59 @@ pub struct AppearanceConfig {
     pub gaps: i32,
     pub focus_ring_width: i32,
     pub focus_ring_color: [f32; 4],
+    pub corner_radius: i32,
+    pub blur: bool,
     pub blur_radius: i32,
+    pub transparency: bool,
+    pub opacity: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl AppearanceConfig {
+    /// Blur needs both the switch and a non-zero radius to be worth compiling.
+    pub fn blur_enabled(&self) -> bool {
+        self.blur && self.blur_radius > 0
+    }
+
+    /// Window opacity actually in effect; exactly 1.0 while transparency is off.
+    pub fn window_opacity(&self) -> f32 {
+        if self.transparency { self.opacity } else { 1.0 }
+    }
+}
+
+/// Position and fade timing. `slowdown` is folded into `duration` at parse time
+/// so only one value reaches the renderer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimationConfig {
+    pub enabled: bool,
+    pub duration: Duration,
+}
+
+impl AnimationConfig {
+    /// Animations need both the switch and a non-zero duration to be visible.
+    pub fn active(&self) -> bool {
+        self.enabled && !self.duration.is_zero()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct InputConfig {
     pub middle_click_paste: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            middle_click_paste: true,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Config {
     pub layout: LayoutConfig,
     pub appearance: AppearanceConfig,
+    pub animations: AnimationConfig,
     pub input: InputConfig,
     pub backend: BackendConfig,
     pub monitors: Vec<MonitorConfig>,
@@ -170,10 +229,22 @@ pub struct Config {
     bindings: Vec<(Binding, Action)>,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct BackendConfig {
+    pub direct_scanout: bool,
     pub drm_device: Option<PathBuf>,
     pub connector: Option<String>,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            direct_scanout: true,
+            drm_device: None,
+            connector: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +270,7 @@ impl Config {
             || self.input != updated.input;
         self.layout = updated.layout;
         self.appearance = updated.appearance;
+        self.animations = updated.animations;
         self.binding_commands = updated.binding_commands;
         self.bindings = updated.bindings;
         restart_required
@@ -291,27 +363,20 @@ impl Binding {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    layout: RawLayout,
+    layout: LayoutConfig,
     #[serde(default)]
     appearance: RawAppearance,
     #[serde(default)]
-    input: RawInput,
+    input: InputConfig,
     #[serde(default)]
-    backend: RawBackend,
+    backend: BackendConfig,
     #[serde(default)]
     monitors: Vec<RawMonitor>,
     #[serde(default)]
     autostart: RawAutostart,
+    #[serde(default)]
+    animations: RawAnimations,
     bindings: RawBindings,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLayout {
-    column_width: f64,
-    #[serde(default = "default_preset_column_widths")]
-    preset_column_widths: Vec<f64>,
-    center_focused_column: bool,
 }
 
 #[derive(Deserialize)]
@@ -320,21 +385,11 @@ struct RawAppearance {
     gaps: u16,
     focus_ring_width: u16,
     focus_ring_color: String,
+    corner_radius: u16,
+    blur: bool,
     blur_radius: u16,
-}
-
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawInput {
-    middle_click_paste: bool,
-}
-
-impl Default for RawInput {
-    fn default() -> Self {
-        Self {
-            middle_click_paste: true,
-        }
-    }
+    transparency: bool,
+    opacity: f64,
 }
 
 impl Default for RawAppearance {
@@ -343,58 +398,95 @@ impl Default for RawAppearance {
             gaps: 15,
             focus_ring_width: 1,
             focus_ring_color: "#0b3d91".into(),
+            corner_radius: 8,
+            blur: true,
             blur_radius: 8,
+            transparency: true,
+            opacity: 0.95,
         }
     }
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+struct RawAnimations {
+    enabled: bool,
+    duration_ms: u16,
+    slowdown: f64,
+}
+
+impl Default for RawAnimations {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration_ms: 150,
+            slowdown: 1.0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct RawBindings {
     focus_left: Vec<String>,
     focus_right: Vec<String>,
-    #[serde(default = "default_focus_up")]
     focus_up: Vec<String>,
-    #[serde(default = "default_focus_down")]
     focus_down: Vec<String>,
     swap_left: Vec<String>,
     swap_right: Vec<String>,
-    #[serde(default = "default_swap_up")]
     swap_up: Vec<String>,
-    #[serde(default = "default_swap_down")]
     swap_down: Vec<String>,
-    #[serde(default = "default_consume_or_expel_left")]
     consume_or_expel_left: Vec<String>,
-    #[serde(default = "default_consume_or_expel_right")]
     consume_or_expel_right: Vec<String>,
-    #[serde(default = "default_cycle_column_width")]
     cycle_column_width: Vec<String>,
-    #[serde(default = "default_close_window")]
     close_window: Vec<String>,
-    #[serde(default = "default_toggle_fullscreen")]
     toggle_fullscreen: Vec<String>,
-    #[serde(default = "default_focus_monitor_left")]
     focus_monitor_left: Vec<String>,
-    #[serde(default = "default_focus_monitor_right")]
     focus_monitor_right: Vec<String>,
-    #[serde(default = "default_focus_monitor_up")]
     focus_monitor_up: Vec<String>,
-    #[serde(default = "default_focus_monitor_down")]
     focus_monitor_down: Vec<String>,
-    #[serde(default = "default_move_to_monitor_left")]
     move_to_monitor_left: Vec<String>,
-    #[serde(default = "default_move_to_monitor_right")]
     move_to_monitor_right: Vec<String>,
-    #[serde(default = "default_move_to_monitor_up")]
     move_to_monitor_up: Vec<String>,
-    #[serde(default = "default_move_to_monitor_down")]
     move_to_monitor_down: Vec<String>,
-    #[serde(default = "default_quit")]
     quit: Vec<String>,
-    #[serde(default)]
     commands: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
     workspace: RawWorkspaceBindings,
+}
+
+impl Default for RawBindings {
+    fn default() -> Self {
+        Self {
+            focus_left: keys(&["Super+h", "Super+Left"]),
+            focus_right: keys(&["Super+l", "Super+Right"]),
+            focus_up: keys(&["Super+k", "Super+Up"]),
+            focus_down: keys(&["Super+j", "Super+Down"]),
+            swap_left: keys(&["Super+Shift+h", "Super+Shift+Left"]),
+            swap_right: keys(&["Super+Shift+l", "Super+Shift+Right"]),
+            swap_up: keys(&["Super+Shift+k", "Super+Shift+Up"]),
+            swap_down: keys(&["Super+Shift+j", "Super+Shift+Down"]),
+            consume_or_expel_left: keys(&["Super+bracketleft"]),
+            consume_or_expel_right: keys(&["Super+bracketright"]),
+            cycle_column_width: keys(&["Super+backslash"]),
+            close_window: keys(&["Super+q", "Super+BackSpace"]),
+            toggle_fullscreen: keys(&["Super+f"]),
+            focus_monitor_left: keys(&["Super+Ctrl+Left"]),
+            focus_monitor_right: keys(&["Super+Ctrl+Right"]),
+            focus_monitor_up: keys(&["Super+Ctrl+Up"]),
+            focus_monitor_down: keys(&["Super+Ctrl+Down"]),
+            move_to_monitor_left: keys(&["Super+Ctrl+Shift+Left"]),
+            move_to_monitor_right: keys(&["Super+Ctrl+Shift+Right"]),
+            move_to_monitor_up: keys(&["Super+Ctrl+Shift+Up"]),
+            move_to_monitor_down: keys(&["Super+Ctrl+Shift+Down"]),
+            quit: keys(&["Super+Shift+Escape"]),
+            commands: BTreeMap::new(),
+            workspace: RawWorkspaceBindings::default(),
+        }
+    }
+}
+
+fn keys(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).into()).collect()
 }
 
 #[derive(Deserialize)]
@@ -425,13 +517,6 @@ impl Default for RawWorkspaceBindings {
     }
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBackend {
-    drm_device: Option<PathBuf>,
-    connector: Option<String>,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMonitor {
@@ -450,74 +535,10 @@ struct RawAutostart {
     commands: Vec<Vec<String>>,
 }
 
-fn default_close_window() -> Vec<String> {
-    vec!["Super+q".into(), "Super+BackSpace".into()]
-}
-
 fn default_preset_column_widths() -> Vec<f64> {
     vec![0.33333, 0.5, 0.66667]
 }
 
-fn default_focus_up() -> Vec<String> {
-    vec!["Super+k".into(), "Super+Up".into()]
-}
-
-fn default_focus_down() -> Vec<String> {
-    vec!["Super+j".into(), "Super+Down".into()]
-}
-
-fn default_swap_up() -> Vec<String> {
-    vec!["Super+Shift+k".into(), "Super+Shift+Up".into()]
-}
-
-fn default_swap_down() -> Vec<String> {
-    vec!["Super+Shift+j".into(), "Super+Shift+Down".into()]
-}
-
-fn default_consume_or_expel_left() -> Vec<String> {
-    vec!["Super+bracketleft".into()]
-}
-
-fn default_consume_or_expel_right() -> Vec<String> {
-    vec!["Super+bracketright".into()]
-}
-
-fn default_cycle_column_width() -> Vec<String> {
-    vec!["Super+backslash".into()]
-}
-
-fn default_toggle_fullscreen() -> Vec<String> {
-    vec!["Super+f".into()]
-}
-
-fn default_quit() -> Vec<String> {
-    vec!["Super+Shift+Escape".into()]
-}
-
-fn default_focus_monitor_left() -> Vec<String> {
-    vec!["Super+Ctrl+Left".into()]
-}
-fn default_focus_monitor_right() -> Vec<String> {
-    vec!["Super+Ctrl+Right".into()]
-}
-fn default_focus_monitor_up() -> Vec<String> {
-    vec!["Super+Ctrl+Up".into()]
-}
-fn default_focus_monitor_down() -> Vec<String> {
-    vec!["Super+Ctrl+Down".into()]
-}
-fn default_move_to_monitor_left() -> Vec<String> {
-    vec!["Super+Ctrl+Shift+Left".into()]
-}
-fn default_move_to_monitor_right() -> Vec<String> {
-    vec!["Super+Ctrl+Shift+Right".into()]
-}
-fn default_move_to_monitor_up() -> Vec<String> {
-    vec!["Super+Ctrl+Shift+Up".into()]
-}
-fn default_move_to_monitor_down() -> Vec<String> {
-    vec!["Super+Ctrl+Shift+Down".into()]
-}
 fn default_transform() -> String {
     "normal".into()
 }
@@ -592,6 +613,18 @@ fn parse(source: &str) -> Result<Config, String> {
     }
     if raw.appearance.blur_radius > 64 {
         return Err("appearance.blur_radius must be at most 64".into());
+    }
+    if raw.appearance.corner_radius > 64 {
+        return Err("appearance.corner_radius must be at most 64".into());
+    }
+    if !raw.appearance.opacity.is_finite() || !(0.1..=1.0).contains(&raw.appearance.opacity) {
+        return Err("appearance.opacity must be between 0.1 and 1.0".into());
+    }
+    if raw.animations.duration_ms > 5000 {
+        return Err("animations.duration_ms must be at most 5000".into());
+    }
+    if !raw.animations.slowdown.is_finite() || !(0.1..=100.0).contains(&raw.animations.slowdown) {
+        return Err("animations.slowdown must be between 0.1 and 100.0".into());
     }
     let focus_ring_color = parse_color(&raw.appearance.focus_ring_color)?;
     if let Some(path) = &raw.backend.drm_device
@@ -734,24 +767,25 @@ fn parse(source: &str) -> Result<Config, String> {
     }
 
     Ok(Config {
-        layout: LayoutConfig {
-            column_width: raw.layout.column_width,
-            preset_column_widths: raw.layout.preset_column_widths,
-            center_focused_column: raw.layout.center_focused_column,
-        },
+        layout: raw.layout,
         appearance: AppearanceConfig {
             gaps: raw.appearance.gaps.into(),
             focus_ring_width: raw.appearance.focus_ring_width.into(),
             focus_ring_color,
+            corner_radius: raw.appearance.corner_radius.into(),
+            blur: raw.appearance.blur,
             blur_radius: raw.appearance.blur_radius.into(),
+            transparency: raw.appearance.transparency,
+            opacity: raw.appearance.opacity as f32,
         },
-        input: InputConfig {
-            middle_click_paste: raw.input.middle_click_paste,
+        animations: AnimationConfig {
+            enabled: raw.animations.enabled,
+            duration: Duration::from_secs_f64(
+                f64::from(raw.animations.duration_ms) / 1000.0 * raw.animations.slowdown,
+            ),
         },
-        backend: BackendConfig {
-            drm_device: raw.backend.drm_device,
-            connector: raw.backend.connector,
-        },
+        input: raw.input,
+        backend: raw.backend,
         monitors,
         autostart: raw.autostart.commands,
         binding_commands,
@@ -817,6 +851,16 @@ fn invalid_data(path: &Path, message: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
 
+    /// Drops one TOML section, header and all, up to the next section header.
+    fn without_section(source: &str, header: &str) -> String {
+        let start = source.find(header).expect("section not found");
+        let body = start + header.len();
+        let end = source[body..]
+            .find("\n[")
+            .map_or(source.len(), |offset| body + offset + 1);
+        format!("{}{}", &source[..start], &source[end..])
+    }
+
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
@@ -831,6 +875,12 @@ mod tests {
             [11.0 / 255.0, 61.0 / 255.0, 145.0 / 255.0, 1.0]
         );
         assert_eq!(config.appearance.blur_radius, 8);
+        assert_eq!(config.appearance.corner_radius, 8);
+        assert!(config.appearance.blur_enabled());
+        assert_eq!(config.appearance.window_opacity(), 0.95);
+        assert!(config.animations.active());
+        assert!(config.backend.direct_scanout);
+        assert_eq!(config.animations.duration, Duration::from_millis(150));
         assert_eq!(config.monitors.len(), 2);
         assert_eq!(config.monitors[0].connector, "DP-2");
         assert_eq!(config.monitors[1].transform, Transform::Normal);
@@ -870,6 +920,48 @@ mod tests {
         let invalid_ring = DEFAULT_CONFIG.replace("focus_ring_width = 1", "focus_ring_width = 16");
         assert!(parse(&invalid_ring).unwrap_err().contains("cannot exceed"));
 
+        let invalid_corner = DEFAULT_CONFIG.replace("corner_radius = 8", "corner_radius = 65");
+        assert!(
+            parse(&invalid_corner)
+                .unwrap_err()
+                .contains("corner_radius")
+        );
+
+        let invalid_opacity = DEFAULT_CONFIG.replace("opacity = 0.95", "opacity = 1.5");
+        assert!(parse(&invalid_opacity).unwrap_err().contains("opacity"));
+
+        let invalid_duration = DEFAULT_CONFIG.replace("duration_ms = 150", "duration_ms = 5001");
+        assert!(
+            parse(&invalid_duration)
+                .unwrap_err()
+                .contains("duration_ms")
+        );
+
+        let invalid_slowdown = DEFAULT_CONFIG.replace("slowdown = 1.0", "slowdown = 0.0");
+        assert!(parse(&invalid_slowdown).unwrap_err().contains("slowdown"));
+
+        // slowdown scales duration; the renderer only ever sees the product.
+        let slowed = DEFAULT_CONFIG.replace("slowdown = 1.0", "slowdown = 3.0");
+        assert_eq!(
+            parse(&slowed).unwrap().animations.duration,
+            Duration::from_millis(450)
+        );
+
+        // Both switches independently disable their effect.
+        let no_blur = DEFAULT_CONFIG.replace("blur = true", "blur = false");
+        assert!(!parse(&no_blur).unwrap().appearance.blur_enabled());
+        let opaque = DEFAULT_CONFIG.replace("transparency = true", "transparency = false");
+        assert_eq!(parse(&opaque).unwrap().appearance.window_opacity(), 1.0);
+        let no_scanout =
+            parse(&DEFAULT_CONFIG.replace("direct_scanout = true", "direct_scanout = false"))
+                .unwrap();
+        assert!(!no_scanout.backend.direct_scanout);
+        let mut active = parse(DEFAULT_CONFIG).unwrap();
+        assert!(active.apply_runtime(no_scanout));
+        assert!(active.backend.direct_scanout);
+        let no_animation = DEFAULT_CONFIG.replace("enabled = true", "enabled = false");
+        assert!(!parse(&no_animation).unwrap().animations.active());
+
         let ambiguous = DEFAULT_CONFIG.replace(
             "focus_right = [\"Super+l\", \"Super+Right\"]",
             "focus_right = [\"Super+h\"]",
@@ -902,16 +994,23 @@ mod tests {
                 .contains("duplicate monitor connector")
         );
 
-        let legacy = DEFAULT_CONFIG
-            .replace("[appearance]\n# Logical pixels between windows and output edges.\ngaps = 15\nfocus_ring_width = 1\nfocus_ring_color = \"#0b3d91\"\n# Smooth backdrop blur radius in logical pixels; zero disables it.\nblur_radius = 8\n\n", "")
-            .replace("[[monitors]]\nconnector = \"DP-2\"\nresolution = [2560, 1440]\nrefresh = 120.0\nposition = [0, 0]\ntransform = \"normal\"\n\n[[monitors]]\nconnector = \"DP-1\"\nresolution = [2560, 1440]\nrefresh = 199.999\nposition = [2560, 0]\ntransform = \"normal\"\n\n", "")
-            .replace("[backend]\n# drm_device = \"/dev/dri/card1\"\n# connector = \"DP-1\"\n\n", "")
+        // A config predating every optional section still parses to the defaults.
+        let legacy = without_section(DEFAULT_CONFIG, "[appearance]");
+        let legacy = without_section(&legacy, "[animations]");
+        let legacy = without_section(&legacy, "[backend]");
+        let legacy = without_section(&legacy, "[[monitors]]");
+        let legacy = without_section(&legacy, "[[monitors]]")
             .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
             .replace("toggle_fullscreen = [\"Super+f\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let config = parse(&legacy).unwrap();
         assert_eq!(config.bindings.len(), 54);
         assert_eq!(config.appearance.gaps, 15);
+        assert_eq!(config.appearance.corner_radius, 8);
+        assert!(config.appearance.blur);
+        assert!(config.animations.enabled);
+        assert!(config.backend.direct_scanout);
+        assert_eq!(config.animations.duration, Duration::from_millis(150));
         assert!(config.monitors.is_empty());
 
         let pre_workspace_config = r#"

@@ -8,7 +8,7 @@ use smithay::{
         },
         drm::{
             DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode,
-            compositor::{FrameError, FrameFlags},
+            compositor::{FrameError, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
@@ -34,7 +34,7 @@ use smithay::{
     output::{Mode, Output, PhysicalProperties},
     reexports::{
         calloop::{
-            EventLoop,
+            EventLoop, LoopHandle,
             timer::{TimeoutAction, Timer},
         },
         drm::control::{Mode as DrmMode, ModeTypeFlags, connector, crtc},
@@ -48,7 +48,7 @@ use smithay::{
     wayland::{compositor, dmabuf::DmabufFeedbackBuilder, presentation::Refresh},
 };
 use smithay_drm_extras::{display_info, drm_scanner::DrmScanner};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::MonitorConfig,
@@ -70,9 +70,11 @@ struct ActiveOutput {
     kms: KmsOutput,
     frame_pending: bool,
     repaint_scheduled: bool,
+    direct_scanout_active: bool,
 }
 
 pub struct DirectBackend {
+    handle: LoopHandle<'static, Paw2>,
     _session: LibSeatSession,
     node: DrmNode,
     manager: OutputManager,
@@ -84,7 +86,7 @@ pub struct DirectBackend {
 }
 
 pub fn init(
-    event_loop: &mut EventLoop<Paw2>,
+    event_loop: &mut EventLoop<'static, Paw2>,
     state: &mut Paw2,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut session, session_notifier) = LibSeatSession::new()?;
@@ -133,6 +135,7 @@ pub fn init(
     );
 
     let mut backend = DirectBackend {
+        handle: event_loop.handle(),
         _session: session.clone(),
         node,
         manager,
@@ -223,32 +226,13 @@ pub fn init(
                         }
                         output.frame_pending = false;
                         output.repaint_scheduled = true;
-                        let duration = output
-                            .output
-                            .current_mode()
-                            .map(|mode| Duration::from_secs_f64(1_000.0 / mode.refresh as f64))
-                            .unwrap_or(Duration::from_millis(16));
-                        repaint = Some((crtc, duration.mul_f64(0.6)));
+                        repaint = Some((crtc, frame_duration(&output.output).mul_f64(0.6)));
                     }
                 }
                 DrmEvent::Error(error) => warn!(?error, "DRM event error"),
             });
             if let Some((crtc, delay)) = repaint {
-                render_handle
-                    .insert_source(Timer::from_duration(delay), move |_, _, state| {
-                        with_backend(state, |backend, state| {
-                            if let Some(output) = backend
-                                .outputs
-                                .iter_mut()
-                                .find(|output| output.crtc == crtc)
-                            {
-                                output.repaint_scheduled = false;
-                            }
-                            backend.render_output(state, crtc)
-                        });
-                        TimeoutAction::Drop
-                    })
-                    .expect("failed to schedule DRM repaint");
+                schedule_repaint(&render_handle, crtc, delay);
             }
         })?;
 
@@ -286,6 +270,24 @@ fn select_device(session: &LibSeatSession, configured: Option<PathBuf>) -> io::R
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DRM device found for this seat"))
 }
 
+fn schedule_repaint(handle: &LoopHandle<'static, Paw2>, crtc: crtc::Handle, delay: Duration) {
+    handle
+        .insert_source(Timer::from_duration(delay), move |_, _, state| {
+            with_backend(state, |backend, state| {
+                if let Some(output) = backend
+                    .outputs
+                    .iter_mut()
+                    .find(|output| output.crtc == crtc)
+                {
+                    output.repaint_scheduled = false;
+                }
+                backend.render_output(state, crtc)
+            });
+            TimeoutAction::Drop
+        })
+        .expect("failed to schedule DRM repaint");
+}
+
 fn with_backend(state: &mut Paw2, f: impl FnOnce(&mut DirectBackend, &mut Paw2)) {
     if let Some(mut backend) = state.direct.take() {
         f(&mut backend, state);
@@ -297,16 +299,21 @@ pub fn redraw(state: &mut Paw2) {
     with_backend(state, |backend, state| backend.render(state));
 }
 
+/// One refresh interval; `refresh` is in mHz.
+fn frame_duration(output: &Output) -> Duration {
+    output
+        .current_mode()
+        .map(|mode| Duration::from_secs_f64(1_000.0 / mode.refresh as f64))
+        .unwrap_or(Duration::from_millis(16))
+}
+
 fn present_feedback(
     feedback: &mut OutputPresentationFeedback,
     output: &Output,
     metadata: Option<&DrmEventMetadata>,
     state: &Paw2,
 ) {
-    let frame_duration = output
-        .current_mode()
-        .map(|mode| Duration::from_secs_f64(1_000.0 / mode.refresh as f64))
-        .unwrap_or(Duration::from_millis(16));
+    let frame_duration = frame_duration(output);
     let timestamp: Time<Monotonic> = metadata
         .and_then(|metadata| match metadata.time {
             DrmEventTime::Monotonic(time) if !time.is_zero() => Some(time.into()),
@@ -473,6 +480,7 @@ impl DirectBackend {
             kms,
             frame_pending: false,
             repaint_scheduled: false,
+            direct_scanout_active: false,
         });
         info!(connector = %name, size = ?mode.size, refresh = mode.refresh, ?position, ?transform, "enabled output");
         Ok(())
@@ -526,6 +534,7 @@ impl DirectBackend {
         self.capture_output(state, &output);
         let active = &mut self.outputs[index];
         let fullscreen = state.fullscreen_window(&active.output).is_some();
+        let direct_scanout = state.config.backend.direct_scanout;
         let mut elements =
             match self
                 .effects
@@ -548,14 +557,27 @@ impl DirectBackend {
             &mut self.renderer,
             &elements,
             clear_color(fullscreen),
-            frame_flags(fullscreen),
+            frame_flags(fullscreen, direct_scanout),
         ) {
             Ok(frame) if !frame.is_empty => {
+                let scanout_active =
+                    matches!(&frame.primary_element, PrimaryPlaneElement::Element(_));
+                if frame.needs_sync()
+                    && let PrimaryPlaneElement::Swapchain(element) = &frame.primary_element
+                {
+                    // KMS cannot wait on this render fence, so finish it before
+                    // submitting the buffer.
+                    while element.sync.wait().is_err() {}
+                }
                 let feedback = state.take_presentation_feedback(&active.output, &frame.states);
                 if let Err(error) = active.kms.queue_frame(feedback) {
                     warn!(?error, "failed to queue DRM frame");
                 } else {
                     active.frame_pending = true;
+                    if active.direct_scanout_active != scanout_active {
+                        active.direct_scanout_active = scanout_active;
+                        debug!(output = %active.output.name(), direct_scanout = scanout_active, "DRM presentation path changed");
+                    }
                 }
             }
             Ok(_)
@@ -566,6 +588,20 @@ impl DirectBackend {
         }
         state.send_frames(&active.output);
         state.finish_frame();
+
+        // A frame that produced no damage queues nothing, so the vblank chain
+        // stops. Mid-animation that would strand a window short of its target.
+        let active = &mut self.outputs[index];
+        if state.animations_active() && !active.frame_pending && !active.repaint_scheduled {
+            active.repaint_scheduled = true;
+            let delay = frame_duration(&active.output).mul_f64(0.6);
+            let crtc = active.crtc;
+            self.schedule_repaint(crtc, delay);
+        }
+    }
+
+    fn schedule_repaint(&self, crtc: crtc::Handle, delay: Duration) {
+        schedule_repaint(&self.handle, crtc, delay);
     }
 
     fn capture_output(&mut self, state: &mut Paw2, output: &Output) {
@@ -709,9 +745,11 @@ impl DirectBackend {
     }
 }
 
-fn frame_flags(fullscreen: bool) -> FrameFlags {
-    if fullscreen {
+fn frame_flags(fullscreen: bool, direct_scanout: bool) -> FrameFlags {
+    if !direct_scanout {
         FrameFlags::empty()
+    } else if fullscreen {
+        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
     } else {
         FrameFlags::DEFAULT
     }
@@ -794,9 +832,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fullscreen_is_composited() {
-        assert_eq!(frame_flags(true), FrameFlags::empty());
-        assert_eq!(frame_flags(false), FrameFlags::DEFAULT);
+    fn selects_safe_scanout_flags() {
+        assert_eq!(
+            frame_flags(true, true),
+            FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+        );
+        assert_eq!(frame_flags(false, true), FrameFlags::DEFAULT);
+        assert_eq!(frame_flags(true, false), FrameFlags::empty());
+        assert_eq!(frame_flags(false, false), FrameFlags::empty());
     }
 
     #[test]

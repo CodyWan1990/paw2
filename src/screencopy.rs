@@ -51,7 +51,7 @@ struct FrameState {
     used: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ExecutableId {
     device: u64,
     inode: u64,
@@ -105,18 +105,13 @@ fn trusted_executables() -> Vec<ExecutableId> {
             std::env::split_paths(&path).map(|directory| directory.join("xdg-desktop-portal-wlr")),
         );
     }
-    candidates
-        .into_iter()
-        .filter_map(|path| executable_id(&path))
-        .fold(Vec::new(), |mut ids, id| {
-            if !ids
-                .iter()
-                .any(|item| item.device == id.device && item.inode == id.inode)
-            {
-                ids.push(id);
-            }
-            ids
-        })
+    let mut ids = Vec::new();
+    for id in candidates.iter().filter_map(|path| executable_id(path)) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 fn executable_id(path: &Path) -> Option<ExecutableId> {
@@ -128,18 +123,13 @@ fn executable_id(path: &Path) -> Option<ExecutableId> {
 }
 
 fn trusted_client(client: &Client, display: &DisplayHandle, trusted: &[ExecutableId]) -> bool {
-    let credentials = client.get_credentials(display).ok();
-    let executable = credentials
-        .and_then(|credentials| fs::metadata(format!("/proc/{}/exe", credentials.pid)).ok())
-        .map(|metadata| ExecutableId {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        });
-    executable.is_some_and(|executable| {
-        trusted
-            .iter()
-            .any(|item| item.device == executable.device && item.inode == executable.inode)
-    })
+    client
+        .get_credentials(display)
+        .ok()
+        .and_then(|credentials| {
+            executable_id(&PathBuf::from(format!("/proc/{}/exe", credentials.pid)))
+        })
+        .is_some_and(|executable| trusted.contains(&executable))
 }
 
 type GlobalData = (DisplayHandle, Arc<Vec<ExecutableId>>);

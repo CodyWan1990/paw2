@@ -13,19 +13,23 @@ use smithay::{
         pointer::{Focus, PointerHandle},
     },
     output::Output,
-    reexports::wayland_server::{
-        Client, Resource,
-        protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
+    reexports::{
+        calloop::Interest,
+        wayland_server::{
+            Client, Resource,
+            protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
+        },
     },
     utils::{Logical, Point, Rectangle, Serial},
     wayland::{
         background_effect::ExtBackgroundEffectHandler,
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, get_parent,
-            is_sync_subsurface, with_states,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface,
+            with_states,
         },
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         idle_inhibit::IdleInhibitHandler,
         output::OutputHandler,
         pointer_constraints::{
@@ -46,7 +50,6 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
             dialog::{ToplevelDialogHint, XdgDialogHandler},
         },
         shm::{ShmHandler, ShmState},
@@ -69,6 +72,45 @@ impl CompositorHandler for Paw2 {
         }
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
+            let dmabuf = with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .pending()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
+                        _ => None,
+                    })
+            });
+            let Some(dmabuf) = dmabuf else {
+                return;
+            };
+            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
+                return;
+            };
+            let Some(client) = surface.client() else {
+                return;
+            };
+            if state
+                .loop_handle
+                .insert_source(source, move |_, _, state| {
+                    let display_handle = state.display_handle.clone();
+                    state
+                        .client_compositor_state(&client)
+                        .blocker_cleared(state, &display_handle);
+                    Ok(())
+                })
+                .is_ok()
+            {
+                add_blocker(surface, blocker);
+            }
+        });
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
@@ -86,19 +128,9 @@ impl CompositorHandler for Paw2 {
 
         if let Some(window) = self.window_for_surface(surface)
             && let Some(toplevel) = window.toplevel()
+            && !toplevel.is_initial_configure_sent()
         {
-            let configured = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            });
-            if !configured {
-                toplevel.send_configure();
-            }
+            toplevel.send_configure();
         }
 
         self.popups.commit(surface);
@@ -200,8 +232,8 @@ impl Paw2 {
                 continue;
             };
             let window_location = self
-                .window_geometry_for_element(&output, &root_id)
-                .map(|geometry| output_geometry.loc + geometry.loc);
+                .window_render_state(&output, &root_id)
+                .map(|(geometry, _)| output_geometry.loc + geometry.loc);
             let layer_location = || {
                 let layers = layer_map_for_output(&output);
                 let layer = layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;

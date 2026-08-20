@@ -89,6 +89,7 @@ blur_radius = 8
 middle_click_paste = true
 
 [backend]
+direct_scanout = true
 # drm_device = "/dev/dri/card1"
 # connector = "DP-1"
 
@@ -188,13 +189,15 @@ switch to its destination workspace.
 Native Wayland and X11 applications can request fullscreen, or you can toggle
 the focused window with `Super+f`. Fullscreen uses the complete
 monitor, hides bars, wallpapers, gaps, rings, and blur, but keeps intentional
-overlay-layer surfaces visible. Fullscreen is currently composed to avoid DRM
-plane corruption on affected hardware. Games that retain a smaller buffer are
-scaled to the largest centered area without changing their aspect ratio. Paw2
-also exposes presentation timing, relative pointer, pointer constraints, and
-idle-inhibit protocols used by native Wayland games. Paw2 starts XWayland
-automatically and exports `DISPLAY`, so Steam can be launched normally with
-`steam`.
+overlay-layer surfaces visible. Compatible fullscreen buffers are automatically
+scanned out on the DRM primary plane; overlays, a visible software cursor,
+scaling, or unsupported buffers fall back to composition. Set
+`backend.direct_scanout = false` and restart Paw2 if direct scanout causes
+display corruption. Games that retain a smaller buffer are scaled to the
+largest centered area without changing their aspect ratio. Paw2 also exposes
+presentation timing, relative pointer, pointer constraints, and idle-inhibit
+protocols used by native Wayland games. Paw2 starts XWayland automatically and
+exports `DISPLAY`, so Steam can be launched normally with `steam`.
 
 Screen sharing is available in the standalone session through the standard
 desktop portal. Paw2 restricts its screencopy protocol to the installed
