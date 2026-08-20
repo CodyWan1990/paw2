@@ -11,7 +11,7 @@ use smithay::{
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 
-use crate::state::Paw2;
+use crate::{config::ScrollDirection, state::Paw2};
 
 fn activate_pointer_constraint(
     pointer: &smithay::input::pointer::PointerHandle<Paw2>,
@@ -162,6 +162,12 @@ impl Paw2 {
                     },
                 );
                 pointer.frame(self);
+                if self.config.input.focus_follows_mouse
+                    && !pointer.is_grabbed()
+                    && let Some(window) = self.window_under(location)
+                {
+                    self.focus_window_on_hover(&window);
+                }
                 activate_pointer_constraint(&pointer, location, new_under);
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -188,6 +194,12 @@ impl Paw2 {
                     },
                 );
                 pointer.frame(self);
+                if self.config.input.focus_follows_mouse
+                    && !pointer.is_grabbed()
+                    && let Some(window) = self.window_under(location)
+                {
+                    self.focus_window_on_hover(&window);
+                }
                 activate_pointer_constraint(&pointer, location, under);
             }
             InputEvent::PointerButton { event, .. } => {
@@ -222,6 +234,30 @@ impl Paw2 {
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
+                if source == AxisSource::Wheel
+                    && let Some(amount) = event.amount_v120(Axis::Vertical)
+                    && amount != 0.0
+                {
+                    let direction = if amount < 0.0 {
+                        ScrollDirection::Up
+                    } else {
+                        ScrollDirection::Down
+                    };
+                    let modifiers = self.seat.get_keyboard().unwrap().modifier_state();
+                    if let Some(action) = self.config.wheel_action(&modifiers, direction) {
+                        if self.pending_wheel_action != Some(action) {
+                            self.wheel_v120_remainder = 0.0;
+                            self.pending_wheel_action = Some(action);
+                        }
+                        let detents = wheel_detents(&mut self.wheel_v120_remainder, amount);
+                        for _ in 0..detents {
+                            self.run_action(action);
+                        }
+                        return;
+                    }
+                    self.wheel_v120_remainder = 0.0;
+                    self.pending_wheel_action = None;
+                }
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
 
                 for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -245,6 +281,16 @@ impl Paw2 {
             _ => {}
         }
     }
+}
+
+fn wheel_detents(remainder: &mut f64, amount_v120: f64) -> u32 {
+    if *remainder != 0.0 && remainder.signum() != amount_v120.signum() {
+        *remainder = 0.0;
+    }
+    *remainder += amount_v120;
+    let detents = (remainder.abs() / 120.0).floor() as u32;
+    *remainder -= remainder.signum() * f64::from(detents) * 120.0;
+    detents
 }
 
 fn constrain_pointer(
@@ -295,5 +341,19 @@ mod tests {
             constrain_pointer((110.0, 30.0).into(), &geometries),
             (110.0, 30.0).into()
         );
+    }
+
+    #[test]
+    fn wheel_input_accumulates_complete_detents() {
+        let mut remainder = 0.0;
+        assert_eq!(wheel_detents(&mut remainder, 40.0), 0);
+        assert_eq!(wheel_detents(&mut remainder, 80.0), 1);
+        assert_eq!(remainder, 0.0);
+        assert_eq!(wheel_detents(&mut remainder, -240.0), 2);
+        assert_eq!(remainder, 0.0);
+
+        assert_eq!(wheel_detents(&mut remainder, 60.0), 0);
+        assert_eq!(wheel_detents(&mut remainder, -120.0), 1);
+        assert_eq!(remainder, 0.0);
     }
 }

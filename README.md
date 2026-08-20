@@ -87,6 +87,7 @@ focus_ring_color = "#0b3d91"
 blur_radius = 8
 
 [input]
+focus_follows_mouse = false
 middle_click_paste = true
 
 [theme]
@@ -104,6 +105,7 @@ direct_scanout = true
 
 [[monitors]]
 connector = "DP-2"
+focus_at_startup = true
 resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
@@ -136,13 +138,13 @@ consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
 close_window = ["Super+q", "Super+BackSpace"]
-toggle_fullscreen = ["Super+f"]
-focus_monitor_left = ["Super+Ctrl+Left"]
-focus_monitor_right = ["Super+Ctrl+Right"]
+toggle_fullscreen = ["Super+Shift+f"]
+focus_monitor_left = ["Super+comma"]
+focus_monitor_right = ["Super+period"]
 focus_monitor_up = ["Super+Ctrl+Up"]
 focus_monitor_down = ["Super+Ctrl+Down"]
-move_to_monitor_left = ["Super+Ctrl+Shift+Left"]
-move_to_monitor_right = ["Super+Ctrl+Shift+Right"]
+move_to_monitor_left = ["Super+Shift+comma"]
+move_to_monitor_right = ["Super+Shift+period"]
 move_to_monitor_up = ["Super+Ctrl+Shift+Up"]
 move_to_monitor_down = ["Super+Ctrl+Shift+Down"]
 quit = ["Super+Shift+Escape"]
@@ -182,18 +184,32 @@ protocol-aware clients may request a specific blur region. Monitor fields are
 optional; unlisted displays use their preferred mode and are placed to the
 right. Supported transforms are `normal`, `90`, `180`, `270`,
 `flipped`, and their rotated variants. Empty binding lists disable an action.
-Bindings, commands, layout, and appearance settings update within about half a
-second after saving the file. Invalid saves leave the last working settings
-active. Backend, monitor, autostart, and `middle_click_paste` changes take effect
-after restarting Paw2. Theme settings are optional and also take effect after a
-restart. Paw2 synchronizes configured cursor, icon, GTK, and font values through
-GSettings, and exports the GTK and Qt settings to launched applications. Shared
-Qt icon and font settings require the Qt GTK platform-theme plugin supplied by
-your distribution. Disabling middle-click paste hides Wayland and X11 primary
-selection; it does not consume ordinary middle-button clicks. Autostart and
-binding commands are executable-and-argument arrays; use an explicit shell
-entry such as `["sh", "-c", "command"]` only when shell syntax is needed.
-Autostart entries run once in order when the compositor starts.
+Binding strings also accept `WheelScrollUp` and `WheelScrollDown`, so optional
+mouse-wheel shortcuts can sit beside keyboard shortcuts. For example:
+
+```toml
+[bindings]
+focus_left = ["Super+h", "Super+Left", "Super+WheelScrollUp"]
+focus_right = ["Super+l", "Super+Right", "Super+WheelScrollDown"]
+decrease_column_width = ["Ctrl+Alt+WheelScrollDown"]
+increase_column_width = ["Ctrl+Alt+WheelScrollUp"]
+```
+
+Wheel shortcuts run once per physical detent and consume matching mouse-wheel
+events; touchpad and unmatched scrolling continue to applications.
+Bindings, commands, layout, appearance, and `focus_follows_mouse` update within
+about half a second after saving the file. Invalid saves leave the last working
+settings active. Focus follows mouse never scrolls the workspace viewport or
+raises floating windows. Backend, monitor, autostart, and `middle_click_paste`
+changes take effect after restarting Paw2. Theme settings are optional and also
+take effect after a restart. Paw2 synchronizes configured cursor, icon, GTK, and
+font values through GSettings, and exports the GTK and Qt settings to launched
+applications. Shared Qt icon and font settings require the Qt GTK platform-theme
+plugin supplied by your distribution. Disabling middle-click paste hides Wayland
+and X11 primary selection; it does not consume ordinary middle-button clicks.
+Autostart and binding commands are executable-and-argument arrays; use an
+explicit shell entry such as `["sh", "-c", "command"]` only when shell syntax is
+needed. Autostart entries run once in order when the compositor starts.
 
 Paw2 exposes the standard `ext-workspace-v1` protocol. Add `"ext/workspaces"`
 to a Waybar module list to display and click workspaces. Workspaces are local to
@@ -201,7 +217,7 @@ each monitor; previous/next bindings wrap around, and moving a window does not
 switch to its destination workspace.
 
 Native Wayland and X11 applications can request fullscreen, or you can toggle
-the focused window with `Super+f`. Fullscreen uses the complete
+the focused window with `Super+Shift+f`. Fullscreen uses the complete
 monitor, hides bars, wallpapers, gaps, rings, and blur, but keeps intentional
 overlay-layer surfaces visible. Compatible fullscreen buffers are automatically
 scanned out on the DRM primary plane; overlays, a visible software cursor,

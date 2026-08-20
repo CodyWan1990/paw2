@@ -311,10 +311,30 @@ impl Workspace {
         cycle_column_width(column, default, presets);
         true
     }
+
+    fn adjust_column_width(&mut self, default: f64, delta: f64) -> bool {
+        let Some(column) = self
+            .focused_column()
+            .and_then(|index| self.columns.get_mut(index))
+        else {
+            return false;
+        };
+        let current = column.width.unwrap_or(default);
+        let adjusted = adjusted_column_width(current, delta);
+        if adjusted == current {
+            return false;
+        }
+        column.width = Some(adjusted);
+        true
+    }
 }
 
 fn column_insertion_index(focused: Option<usize>, column_count: usize) -> usize {
     focused.map_or(column_count, |index| index + 1)
+}
+
+fn adjusted_column_width(current: f64, delta: f64) -> f64 {
+    (current + delta).clamp(0.1, 1.0)
 }
 
 struct Scroller {
@@ -575,6 +595,30 @@ impl Scrollers {
 }
 
 impl Paw2 {
+    pub fn apply_startup_monitor(&mut self) {
+        let Some(name) = self.config.startup_monitor().map(str::to_owned) else {
+            return;
+        };
+        let Some((_, geometry)) = self
+            .output_geometries()
+            .into_iter()
+            .find(|(output, _)| output == &name)
+        else {
+            tracing::warn!(
+                monitor = name,
+                "startup monitor is unavailable; keeping fallback focus"
+            );
+            return;
+        };
+        self.scroller.set_focused_output(&name);
+        self.seat
+            .get_pointer()
+            .unwrap()
+            .set_location(geometry.loc.to_f64() + geometry.size.to_f64() / 2.0);
+        self.sync_focus();
+        tracing::info!(monitor = name, "focused startup monitor");
+    }
+
     pub fn output_added(&mut self, output: &Output, position: Point<i32, Logical>) {
         let name = output.name();
         if let Some(monitor) = self.scroller.monitor_mut(&name) {
@@ -895,6 +939,14 @@ impl Paw2 {
     }
 
     pub fn focus_window(&mut self, window: &Window) {
+        self.focus_window_with_behavior(window, true);
+    }
+
+    pub fn focus_window_on_hover(&mut self, window: &Window) {
+        self.focus_window_with_behavior(window, false);
+    }
+
+    fn focus_window_with_behavior(&mut self, window: &Window, reveal_and_raise: bool) {
         let Some(monitor_index) = self
             .scroller
             .monitors
@@ -903,12 +955,23 @@ impl Paw2 {
         else {
             return;
         };
+        let monitor = &self.scroller.monitors[monitor_index];
+        let already_focused = self.scroller.focused_output.as_deref()
+            == Some(monitor.output.name().as_str())
+            && monitor
+                .active()
+                .focused
+                .and_then(|index| monitor.active().windows.get(index))
+                == Some(window);
+        if already_focused && !reveal_and_raise {
+            return;
+        }
         self.scroller.monitors[monitor_index]
             .active_mut()
             .focus_window(window);
         self.scroller.focused_output = Some(self.scroller.monitors[monitor_index].output.name());
-        self.relayout(true);
-        if self.scroller.floating.contains(&window.id()) {
+        self.relayout(reveal_and_raise);
+        if reveal_and_raise && self.scroller.floating.contains(&window.id()) {
             self.scroller.monitors[monitor_index]
                 .space
                 .raise_element(window, false);
@@ -1084,6 +1147,14 @@ impl Paw2 {
                 self.scroller
                     .active_workspace()
                     .is_some_and(|workspace| workspace.cycle_column_width(default, presets))
+            }
+            Action::DecreaseColumnWidth => {
+                let default = self.config.layout.column_width;
+                self.layout_action(|workspace| workspace.adjust_column_width(default, -0.05))
+            }
+            Action::IncreaseColumnWidth => {
+                let default = self.config.layout.column_width;
+                self.layout_action(|workspace| workspace.adjust_column_width(default, 0.05))
             }
             Action::CloseWindow => {
                 if let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
@@ -2263,6 +2334,9 @@ mod tests {
         assert_eq!(column_insertion_index(Some(0), 3), 1);
         assert_eq!(column_insertion_index(Some(2), 3), 3);
         assert_eq!(column_insertion_index(None, 3), 3);
+        assert_eq!(adjusted_column_width(0.5, 0.05), 0.55);
+        assert_eq!(adjusted_column_width(0.1, -0.05), 0.1);
+        assert_eq!(adjusted_column_width(1.0, 0.05), 1.0);
         assert_eq!(neighbor(0, 3, -1), None);
         assert_eq!(workspace_neighbor(0, -1), 8);
         assert_eq!(workspace_neighbor(8, 1), 0);

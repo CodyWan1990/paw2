@@ -41,7 +41,10 @@ use smithay::{
 };
 
 use crate::{
-    config::Config, layout::Scrollers, screencopy::ScreencopyState, workspace::WorkspaceState,
+    config::{Action, Config},
+    layout::Scrollers,
+    screencopy::ScreencopyState,
+    workspace::WorkspaceState,
 };
 
 pub struct Paw2 {
@@ -81,6 +84,8 @@ pub struct Paw2 {
     pub config: Config,
     pub scroller: Scrollers,
     pub suppressed_keys: Vec<smithay::input::keyboard::Keysym>,
+    pub wheel_v120_remainder: f64,
+    pub pending_wheel_action: Option<Action>,
     pub workspace_state: WorkspaceState,
     pub screencopy_state: ScreencopyState,
 }
@@ -162,6 +167,8 @@ impl Paw2 {
             config,
             scroller: Scrollers::default(),
             suppressed_keys: Vec::new(),
+            wheel_v120_remainder: 0.0,
+            pending_wheel_action: None,
             workspace_state,
             screencopy_state,
         }

@@ -45,6 +45,8 @@ duration_ms = 150
 slowdown = 1.0
 
 [input]
+# Focus windows as the pointer enters them without moving the workspace viewport.
+focus_follows_mouse = false
 # Expose Wayland primary selection for middle-click paste.
 middle_click_paste = true
 
@@ -65,6 +67,7 @@ direct_scanout = true
 
 [[monitors]]
 connector = "DP-2"
+# focus_at_startup = true
 resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
@@ -99,13 +102,13 @@ consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
 close_window = ["Super+q", "Super+BackSpace"]
-toggle_fullscreen = ["Super+f"]
-focus_monitor_left = ["Super+Ctrl+Left"]
-focus_monitor_right = ["Super+Ctrl+Right"]
+toggle_fullscreen = ["Super+Shift+f"]
+focus_monitor_left = ["Super+comma"]
+focus_monitor_right = ["Super+period"]
 focus_monitor_up = ["Super+Ctrl+Up"]
 focus_monitor_down = ["Super+Ctrl+Down"]
-move_to_monitor_left = ["Super+Ctrl+Shift+Left"]
-move_to_monitor_right = ["Super+Ctrl+Shift+Right"]
+move_to_monitor_left = ["Super+Shift+comma"]
+move_to_monitor_right = ["Super+Shift+period"]
 move_to_monitor_up = ["Super+Ctrl+Shift+Up"]
 move_to_monitor_down = ["Super+Ctrl+Shift+Down"]
 quit = ["Super+Shift+Escape"]
@@ -145,6 +148,8 @@ pub enum Action {
     ConsumeOrExpelLeft,
     ConsumeOrExpelRight,
     CycleColumnWidth,
+    DecreaseColumnWidth,
+    IncreaseColumnWidth,
     CloseWindow,
     ToggleFullscreen,
     FocusMonitorLeft,
@@ -216,12 +221,14 @@ impl AnimationConfig {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputConfig {
+    pub focus_follows_mouse: bool,
     pub middle_click_paste: bool,
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
+            focus_follows_mouse: false,
             middle_click_paste: true,
         }
     }
@@ -273,6 +280,7 @@ impl Default for BackendConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitorConfig {
     pub connector: String,
+    pub focus_at_startup: bool,
     pub resolution: Option<[u16; 2]>,
     pub refresh: Option<f64>,
     pub position: Option<[i32; 2]>,
@@ -300,21 +308,41 @@ impl VrrPolicy {
 }
 
 impl Config {
+    pub fn startup_monitor(&self) -> Option<&str> {
+        self.monitors
+            .iter()
+            .find(|monitor| monitor.focus_at_startup)
+            .map(|monitor| monitor.connector.as_str())
+    }
+
     pub fn action(&self, modifiers: &ModifiersState, keysym: Keysym) -> Option<Action> {
         self.bindings
             .iter()
-            .find_map(|(binding, action)| binding.matches(modifiers, keysym).then_some(*action))
+            .find_map(|(binding, action)| binding.matches_key(modifiers, keysym).then_some(*action))
+    }
+
+    pub fn wheel_action(
+        &self,
+        modifiers: &ModifiersState,
+        direction: ScrollDirection,
+    ) -> Option<Action> {
+        self.bindings.iter().find_map(|(binding, action)| {
+            binding
+                .matches_wheel(modifiers, direction)
+                .then_some(*action)
+        })
     }
 
     pub fn apply_runtime(&mut self, updated: Self) -> bool {
         let restart_required = self.backend != updated.backend
             || self.monitors != updated.monitors
             || self.autostart != updated.autostart
-            || self.input != updated.input
+            || self.input.middle_click_paste != updated.input.middle_click_paste
             || self.theme != updated.theme;
         self.layout = updated.layout;
         self.appearance = updated.appearance;
         self.animations = updated.animations;
+        self.input.focus_follows_mouse = updated.input.focus_follows_mouse;
         self.binding_commands = updated.binding_commands;
         self.bindings = updated.bindings;
         restart_required
@@ -347,19 +375,29 @@ struct Binding {
     alt: bool,
     shift: bool,
     logo: bool,
-    keysym: Keysym,
+    trigger: BindingTrigger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingTrigger {
+    Key(Keysym),
+    Wheel(ScrollDirection),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Up,
+    Down,
 }
 
 impl Binding {
     fn parse(value: &str) -> Result<Self, String> {
         let mut parts = value.split('+').peekable();
-        let mut binding = Self {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            logo: false,
-            keysym: Keysym::NoSymbol,
-        };
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut logo = false;
+        let mut trigger = None;
 
         while let Some(part) = parts.next() {
             if part.is_empty() {
@@ -367,18 +405,25 @@ impl Binding {
             }
 
             if parts.peek().is_none() {
-                binding.keysym = xkb::keysym_from_name(part, xkb::KEYSYM_CASE_INSENSITIVE);
-                if binding.keysym.raw() == keysyms::KEY_NoSymbol {
-                    return Err(format!("unknown key `{part}` in binding `{value}`"));
-                }
+                trigger = Some(match part.to_ascii_lowercase().as_str() {
+                    "wheelscrollup" => BindingTrigger::Wheel(ScrollDirection::Up),
+                    "wheelscrolldown" => BindingTrigger::Wheel(ScrollDirection::Down),
+                    _ => {
+                        let keysym = xkb::keysym_from_name(part, xkb::KEYSYM_CASE_INSENSITIVE);
+                        if keysym.raw() == keysyms::KEY_NoSymbol {
+                            return Err(format!("unknown key `{part}` in binding `{value}`"));
+                        }
+                        BindingTrigger::Key(keysym)
+                    }
+                });
                 break;
             }
 
             let modifier = match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => &mut binding.ctrl,
-                "alt" => &mut binding.alt,
-                "shift" => &mut binding.shift,
-                "super" | "logo" => &mut binding.logo,
+                "ctrl" | "control" => &mut ctrl,
+                "alt" => &mut alt,
+                "shift" => &mut shift,
+                "super" | "logo" => &mut logo,
                 _ => return Err(format!("unknown modifier `{part}` in binding `{value}`")),
             };
             if std::mem::replace(modifier, true) {
@@ -386,21 +431,30 @@ impl Binding {
             }
         }
 
-        if binding.keysym.raw() == keysyms::KEY_NoSymbol {
-            return Err(format!("binding `{value}` has no key"));
-        }
-
-        Ok(binding)
+        Ok(Self {
+            ctrl,
+            alt,
+            shift,
+            logo,
+            trigger: trigger.ok_or_else(|| format!("binding `{value}` has no trigger"))?,
+        })
     }
 
-    fn matches(&self, modifiers: &ModifiersState, keysym: Keysym) -> bool {
-        self.keysym == keysym
-            && self.ctrl == modifiers.ctrl
+    fn matches_modifiers(&self, modifiers: &ModifiersState) -> bool {
+        self.ctrl == modifiers.ctrl
             && self.alt == modifiers.alt
             && self.shift == modifiers.shift
             && self.logo == modifiers.logo
             && !modifiers.iso_level3_shift
             && !modifiers.iso_level5_shift
+    }
+
+    fn matches_key(&self, modifiers: &ModifiersState, keysym: Keysym) -> bool {
+        self.trigger == BindingTrigger::Key(keysym) && self.matches_modifiers(modifiers)
+    }
+
+    fn matches_wheel(&self, modifiers: &ModifiersState, direction: ScrollDirection) -> bool {
+        self.trigger == BindingTrigger::Wheel(direction) && self.matches_modifiers(modifiers)
     }
 }
 
@@ -485,6 +539,8 @@ struct RawBindings {
     consume_or_expel_left: Vec<String>,
     consume_or_expel_right: Vec<String>,
     cycle_column_width: Vec<String>,
+    decrease_column_width: Vec<String>,
+    increase_column_width: Vec<String>,
     close_window: Vec<String>,
     toggle_fullscreen: Vec<String>,
     focus_monitor_left: Vec<String>,
@@ -514,14 +570,16 @@ impl Default for RawBindings {
             consume_or_expel_left: keys(&["Super+bracketleft"]),
             consume_or_expel_right: keys(&["Super+bracketright"]),
             cycle_column_width: keys(&["Super+backslash"]),
+            decrease_column_width: Vec::new(),
+            increase_column_width: Vec::new(),
             close_window: keys(&["Super+q", "Super+BackSpace"]),
-            toggle_fullscreen: keys(&["Super+f"]),
-            focus_monitor_left: keys(&["Super+Ctrl+Left"]),
-            focus_monitor_right: keys(&["Super+Ctrl+Right"]),
+            toggle_fullscreen: keys(&["Super+Shift+f"]),
+            focus_monitor_left: keys(&["Super+comma"]),
+            focus_monitor_right: keys(&["Super+period"]),
             focus_monitor_up: keys(&["Super+Ctrl+Up"]),
             focus_monitor_down: keys(&["Super+Ctrl+Down"]),
-            move_to_monitor_left: keys(&["Super+Ctrl+Shift+Left"]),
-            move_to_monitor_right: keys(&["Super+Ctrl+Shift+Right"]),
+            move_to_monitor_left: keys(&["Super+Shift+comma"]),
+            move_to_monitor_right: keys(&["Super+Shift+period"]),
             move_to_monitor_up: keys(&["Super+Ctrl+Shift+Up"]),
             move_to_monitor_down: keys(&["Super+Ctrl+Shift+Down"]),
             quit: keys(&["Super+Shift+Escape"]),
@@ -567,6 +625,8 @@ impl Default for RawWorkspaceBindings {
 #[serde(deny_unknown_fields)]
 struct RawMonitor {
     connector: String,
+    #[serde(default)]
+    focus_at_startup: bool,
     resolution: Option<[u16; 2]>,
     refresh: Option<f64>,
     position: Option<[i32; 2]>,
@@ -731,6 +791,13 @@ fn parse(source: &str) -> Result<Config, String> {
                 monitor.connector
             ));
         }
+        if monitor.focus_at_startup
+            && monitors
+                .iter()
+                .any(|item: &MonitorConfig| item.focus_at_startup)
+        {
+            return Err("only one monitor can set focus_at_startup = true".into());
+        }
         if monitor
             .resolution
             .is_some_and(|[width, height]| width == 0 || height == 0)
@@ -751,6 +818,7 @@ fn parse(source: &str) -> Result<Config, String> {
         }
         monitors.push(MonitorConfig {
             connector: monitor.connector,
+            focus_at_startup: monitor.focus_at_startup,
             resolution: monitor.resolution,
             refresh: monitor.refresh,
             position: monitor.position,
@@ -783,6 +851,14 @@ fn parse(source: &str) -> Result<Config, String> {
             Action::ConsumeOrExpelRight,
         ),
         (raw.bindings.cycle_column_width, Action::CycleColumnWidth),
+        (
+            raw.bindings.decrease_column_width,
+            Action::DecreaseColumnWidth,
+        ),
+        (
+            raw.bindings.increase_column_width,
+            Action::IncreaseColumnWidth,
+        ),
         (raw.bindings.close_window, Action::CloseWindow),
         (raw.bindings.toggle_fullscreen, Action::ToggleFullscreen),
         (raw.bindings.focus_monitor_left, Action::FocusMonitorLeft),
@@ -933,6 +1009,7 @@ mod tests {
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.bindings.len(), 54);
+        assert!(!config.input.focus_follows_mouse);
         assert!(config.input.middle_click_paste);
         assert_eq!(config.theme, ThemeConfig::default());
         assert_eq!(config.layout.column_width, 0.6);
@@ -952,6 +1029,8 @@ mod tests {
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         assert_eq!(config.monitors.len(), 2);
         assert_eq!(config.monitors[0].connector, "DP-2");
+        assert!(!config.monitors[0].focus_at_startup);
+        assert_eq!(config.startup_monitor(), None);
         assert_eq!(config.monitors[0].vrr, VrrPolicy::Automatic);
         assert_eq!(config.monitors[1].transform, Transform::Normal);
         assert!(config.autostart.is_empty());
@@ -965,6 +1044,26 @@ mod tests {
                 xkb::keysym_from_name("k", xkb::KEYSYM_CASE_INSENSITIVE),
             ),
             Some(Action::SwapUp)
+        );
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("comma", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::FocusMonitorLeft)
+        );
+        assert_eq!(
+            config.wheel_action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                ScrollDirection::Up,
+            ),
+            None
         );
 
         let invalid_width = DEFAULT_CONFIG.replace("column_width = 0.6", "column_width = 2.0");
@@ -1066,6 +1165,52 @@ mod tests {
                 .contains("unknown modifier")
         );
 
+        let wheel_bindings = DEFAULT_CONFIG
+            .replace(
+                "focus_left = [\"Super+h\", \"Super+Left\"]",
+                "focus_left = [\"Super+h\", \"Super+Left\", \"Super+WheelScrollUp\"]",
+            )
+            .replace(
+                "cycle_column_width = [\"Super+backslash\"]",
+                "cycle_column_width = [\"Super+backslash\"]\ndecrease_column_width = [\"Ctrl+Alt+WheelScrollDown\"]\nincrease_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
+            );
+        let config = parse(&wheel_bindings).unwrap();
+        assert_eq!(
+            config.wheel_action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                ScrollDirection::Up,
+            ),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            config.wheel_action(
+                &ModifiersState {
+                    ctrl: true,
+                    alt: true,
+                    ..Default::default()
+                },
+                ScrollDirection::Down,
+            ),
+            Some(Action::DecreaseColumnWidth)
+        );
+        let duplicate_wheel = wheel_bindings.replace(
+            "increase_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
+            "increase_column_width = [\"Ctrl+Alt+WheelScrollDown\"]",
+        );
+        assert!(
+            parse(&duplicate_wheel)
+                .unwrap_err()
+                .contains("more than one action")
+        );
+        assert!(
+            parse(&wheel_bindings.replace("WheelScrollUp", "WheelScrollSideways"))
+                .unwrap_err()
+                .contains("unknown key")
+        );
+
         let invalid_transform =
             DEFAULT_CONFIG.replacen("transform = \"normal\"", "transform = \"sideways\"", 1);
         assert!(
@@ -1081,6 +1226,22 @@ mod tests {
                 .contains("duplicate monitor connector")
         );
 
+        let startup_monitor =
+            DEFAULT_CONFIG.replace("# focus_at_startup = true", "focus_at_startup = true");
+        assert_eq!(
+            parse(&startup_monitor).unwrap().startup_monitor(),
+            Some("DP-2")
+        );
+        let duplicate_startup = startup_monitor.replace(
+            "connector = \"DP-1\"\nresolution",
+            "connector = \"DP-1\"\nfocus_at_startup = true\nresolution",
+        );
+        assert!(
+            parse(&duplicate_startup)
+                .unwrap_err()
+                .contains("only one monitor")
+        );
+
         // A config predating every optional section still parses to the defaults.
         let legacy = without_section(DEFAULT_CONFIG, "[appearance]");
         let legacy = without_section(&legacy, "[animations]");
@@ -1088,7 +1249,8 @@ mod tests {
         let legacy = without_section(&legacy, "[[monitors]]");
         let legacy = without_section(&legacy, "[[monitors]]")
             .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
-            .replace("toggle_fullscreen = [\"Super+f\"]\n", "")
+            .replace("toggle_fullscreen = [\"Super+Shift+f\"]\n", "")
+            .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let config = parse(&legacy).unwrap();
         assert_eq!(config.bindings.len(), 54);
@@ -1099,6 +1261,16 @@ mod tests {
         assert!(config.backend.direct_scanout);
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         assert!(config.monitors.is_empty());
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("comma", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::FocusMonitorLeft)
+        );
 
         let pre_workspace_config = r#"
 [layout]
@@ -1281,6 +1453,13 @@ swap_right = ["Super+Shift+l"]
         .unwrap();
         assert!(active.apply_runtime(updated));
         assert!(active.input.middle_click_paste);
+
+        let updated = parse(
+            &DEFAULT_CONFIG.replace("focus_follows_mouse = false", "focus_follows_mouse = true"),
+        )
+        .unwrap();
+        assert!(!active.apply_runtime(updated));
+        assert!(active.input.focus_follows_mouse);
 
         let updated = parse(&format!(
             "{DEFAULT_CONFIG}\n[theme]\ncursor_theme = \"Breeze\"\n"

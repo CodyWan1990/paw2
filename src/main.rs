@@ -70,6 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Direct => drm::init(&mut event_loop, &mut state)?,
         Mode::Nested(_) => backend::init(&mut event_loop, &mut state)?,
     }
+    if mode == Mode::Direct {
+        state.apply_startup_monitor();
+    }
 
     // SAFETY: Paw2 is single-threaded and sets the child environment before
     // spawning a client or entering the event loop.
