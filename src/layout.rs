@@ -78,7 +78,8 @@ struct Workspace {
 impl Workspace {
     fn add(&mut self, window: Window, floating: bool) {
         if !floating {
-            self.columns.push(Column::new(window.clone()));
+            let index = column_insertion_index(self.focused_column(), self.columns.len());
+            self.columns.insert(index, Column::new(window.clone()));
         }
         self.windows.push(window);
         self.focused = Some(self.windows.len() - 1);
@@ -310,6 +311,10 @@ impl Workspace {
         cycle_column_width(column, default, presets);
         true
     }
+}
+
+fn column_insertion_index(focused: Option<usize>, column_count: usize) -> usize {
+    focused.map_or(column_count, |index| index + 1)
 }
 
 struct Scroller {
@@ -2255,6 +2260,9 @@ mod tests {
 
     #[test]
     fn navigation_viewport_and_monitor_direction() {
+        assert_eq!(column_insertion_index(Some(0), 3), 1);
+        assert_eq!(column_insertion_index(Some(2), 3), 3);
+        assert_eq!(column_insertion_index(None, 3), 3);
         assert_eq!(neighbor(0, 3, -1), None);
         assert_eq!(workspace_neighbor(0, -1), 8);
         assert_eq!(workspace_neighbor(8, 1), 0);

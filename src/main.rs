@@ -2,6 +2,7 @@
 
 mod backend;
 mod config;
+mod cursor;
 mod drm;
 mod handlers;
 mod input;
@@ -38,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let (config, mut config_watcher) = config::load()?;
+    apply_theme(&config.theme);
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
     let mut state = Paw2::new(&mut event_loop, display, config);
@@ -53,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("reloaded configuration");
                     if restart_required {
                         tracing::warn!(
-                            "backend, monitor, autostart, and input protocol changes require restarting Paw2"
+                            "backend, monitor, autostart, input protocol, and theme changes require restarting Paw2"
                         );
                     }
                 }
@@ -121,6 +123,17 @@ fn import_activation_environment() {
     if std::env::var_os("DISPLAY").is_some() {
         variables.push("DISPLAY");
     }
+    for name in [
+        "XCURSOR_THEME",
+        "XCURSOR_SIZE",
+        "GTK_THEME",
+        "QT_STYLE_OVERRIDE",
+        "QT_QPA_PLATFORMTHEME",
+    ] {
+        if std::env::var_os(name).is_some() {
+            variables.push(name);
+        }
+    }
     let status = std::process::Command::new("dbus-update-activation-environment")
         .args(variables)
         .status();
@@ -129,6 +142,72 @@ fn import_activation_environment() {
         Ok(status) => tracing::warn!(%status, "could not import portal activation environment"),
         Err(error) => tracing::warn!(?error, "could not run dbus-update-activation-environment"),
     }
+}
+
+fn apply_theme(theme: &config::ThemeConfig) {
+    // SAFETY: startup is single-threaded and no clients have been spawned yet.
+    unsafe {
+        for (name, value) in theme_environment(theme) {
+            std::env::set_var(name, value);
+        }
+    }
+
+    for (key, value) in theme_gsettings(theme) {
+        match std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", key, &value])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "could not run gsettings; desktop theme was not synchronized"
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
+    let mut variables = Vec::new();
+    if let Some(value) = &theme.cursor_theme {
+        variables.push(("XCURSOR_THEME", value.clone()));
+    }
+    if let Some(value) = theme.cursor_size {
+        variables.push(("XCURSOR_SIZE", value.to_string()));
+    }
+    if let Some(value) = &theme.gtk_theme {
+        variables.push(("GTK_THEME", value.clone()));
+    }
+    if let Some(value) = &theme.qt_style {
+        variables.push(("QT_STYLE_OVERRIDE", value.clone()));
+    }
+    if theme.icon_theme.is_some() || theme.font.is_some() {
+        variables.push(("QT_QPA_PLATFORMTHEME", "gtk3".into()));
+    }
+    variables
+}
+
+fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
+    let mut settings = Vec::new();
+    if let Some(value) = &theme.cursor_theme {
+        settings.push(("cursor-theme", value.clone()));
+    }
+    if let Some(value) = theme.cursor_size {
+        settings.push(("cursor-size", value.to_string()));
+    }
+    if let Some(value) = &theme.icon_theme {
+        settings.push(("icon-theme", value.clone()));
+    }
+    if let Some(value) = &theme.gtk_theme {
+        settings.push(("gtk-theme", value.clone()));
+    }
+    if let Some(value) = &theme.font {
+        settings.push(("font-name", value.clone()));
+    }
+    settings
 }
 
 pub(crate) fn spawn<T: AsRef<OsStr>>(command: &[T]) -> io::Result<()> {
@@ -191,5 +270,28 @@ mod tests {
         );
         assert_eq!(parse_args(["--help".into()]).unwrap(), None);
         assert!(parse_args(["kitty".into()]).is_err());
+    }
+
+    #[test]
+    fn maps_theme_to_desktop_interfaces() {
+        let theme = config::ThemeConfig {
+            cursor_theme: Some("Cursor".into()),
+            cursor_size: Some(32),
+            icon_theme: Some("Icons".into()),
+            gtk_theme: Some("Gtk".into()),
+            qt_style: Some("Qt".into()),
+            font: Some("Sans 11".into()),
+        };
+        assert_eq!(
+            theme_environment(&theme),
+            [
+                ("XCURSOR_THEME", "Cursor".into()),
+                ("XCURSOR_SIZE", "32".into()),
+                ("GTK_THEME", "Gtk".into()),
+                ("QT_STYLE_OVERRIDE", "Qt".into()),
+                ("QT_QPA_PLATFORMTHEME", "gtk3".into()),
+            ]
+        );
+        assert_eq!(theme_gsettings(&theme).len(), 5);
     }
 }

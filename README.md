@@ -11,7 +11,7 @@ as the shell layer.
 - One automatically selected GPU with multiple configured or automatic displays
 - Wayland application rendering through XDG shell and linux-dmabuf
 - Rootless XWayland support for Steam and X11 games
-- Horizontal scrolling columns with vertically stacked windows
+- Horizontal scrolling columns with vertically stacked windows; new windows open beside focus
 - Centered client-sized launcher and dialog windows
 - Dedicated fullscreen path with scanout-friendly rendering and presentation timing
 - Automatic per-monitor VRR for fullscreen games
@@ -88,6 +88,14 @@ blur_radius = 8
 
 [input]
 middle_click_paste = true
+
+[theme]
+cursor_theme = "Oxygen_Zion"
+cursor_size = 24
+icon_theme = "Papirus-Dark"
+gtk_theme = "Breeze"
+qt_style = "Breeze"
+font = "Monofur Nerd Font Propo 12"
 
 [backend]
 direct_scanout = true
@@ -177,7 +185,11 @@ right. Supported transforms are `normal`, `90`, `180`, `270`,
 Bindings, commands, layout, and appearance settings update within about half a
 second after saving the file. Invalid saves leave the last working settings
 active. Backend, monitor, autostart, and `middle_click_paste` changes take effect
-after restarting Paw2. Disabling middle-click paste hides Wayland and X11 primary
+after restarting Paw2. Theme settings are optional and also take effect after a
+restart. Paw2 synchronizes configured cursor, icon, GTK, and font values through
+GSettings, and exports the GTK and Qt settings to launched applications. Shared
+Qt icon and font settings require the Qt GTK platform-theme plugin supplied by
+your distribution. Disabling middle-click paste hides Wayland and X11 primary
 selection; it does not consume ordinary middle-button clicks. Autostart and
 binding commands are executable-and-argument arrays; use an explicit shell
 entry such as `["sh", "-c", "command"]` only when shell syntax is needed.

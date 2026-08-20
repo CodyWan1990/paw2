@@ -7,6 +7,7 @@ use smithay::{
             Bind, BlitFrame, Frame, FrameContext, Offscreen, Renderer, Texture, TextureFilter,
             element::{
                 AsRenderElements, Element, Id, Kind, RenderElement,
+                memory::MemoryRenderBufferRenderElement,
                 solid::SolidColorRenderElement,
                 surface::WaylandSurfaceRenderElement,
                 utils::{CropRenderElement, RelocateRenderElement, RescaleRenderElement},
@@ -238,6 +239,7 @@ smithay::backend::renderer::element::render_elements! {
     Blur=BlurElement,
     Ring=PixelShaderElement,
     Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Fullscreen=FullscreenElement,
     Solid=SolidColorRenderElement,
 }

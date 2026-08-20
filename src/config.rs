@@ -48,6 +48,15 @@ slowdown = 1.0
 # Expose Wayland primary selection for middle-click paste.
 middle_click_paste = true
 
+# Desktop theme values are optional. When set, Paw2 applies them at startup.
+#[theme]
+#cursor_theme = "Oxygen_Zion"
+#cursor_size = 24
+#icon_theme = "Papirus-Dark"
+#gtk_theme = "Breeze"
+#qt_style = "Breeze"
+#font = "Monofur Nerd Font Propo 12"
+
 [backend]
 # Automatically scan out compatible fullscreen buffers on the DRM primary plane.
 direct_scanout = true
@@ -224,11 +233,23 @@ pub struct Config {
     pub appearance: AppearanceConfig,
     pub animations: AnimationConfig,
     pub input: InputConfig,
+    pub theme: ThemeConfig,
     pub backend: BackendConfig,
     pub monitors: Vec<MonitorConfig>,
     pub autostart: Vec<Vec<String>>,
     pub binding_commands: Vec<Vec<String>>,
     bindings: Vec<(Binding, Action)>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeConfig {
+    pub cursor_theme: Option<String>,
+    pub cursor_size: Option<u16>,
+    pub icon_theme: Option<String>,
+    pub gtk_theme: Option<String>,
+    pub qt_style: Option<String>,
+    pub font: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -289,7 +310,8 @@ impl Config {
         let restart_required = self.backend != updated.backend
             || self.monitors != updated.monitors
             || self.autostart != updated.autostart
-            || self.input != updated.input;
+            || self.input != updated.input
+            || self.theme != updated.theme;
         self.layout = updated.layout;
         self.appearance = updated.appearance;
         self.animations = updated.animations;
@@ -390,6 +412,8 @@ struct RawConfig {
     appearance: RawAppearance,
     #[serde(default)]
     input: InputConfig,
+    #[serde(default)]
+    theme: ThemeConfig,
     #[serde(default)]
     backend: BackendConfig,
     #[serde(default)]
@@ -650,6 +674,24 @@ fn parse(source: &str) -> Result<Config, String> {
     if !raw.animations.slowdown.is_finite() || !(0.1..=100.0).contains(&raw.animations.slowdown) {
         return Err("animations.slowdown must be between 0.1 and 100.0".into());
     }
+    for (name, value) in [
+        ("cursor_theme", &raw.theme.cursor_theme),
+        ("icon_theme", &raw.theme.icon_theme),
+        ("gtk_theme", &raw.theme.gtk_theme),
+        ("qt_style", &raw.theme.qt_style),
+        ("font", &raw.theme.font),
+    ] {
+        if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(format!("theme.{name} cannot be empty"));
+        }
+    }
+    if raw
+        .theme
+        .cursor_size
+        .is_some_and(|size| !(1..=256).contains(&size))
+    {
+        return Err("theme.cursor_size must be between 1 and 256".into());
+    }
     let focus_ring_color = parse_color(&raw.appearance.focus_ring_color)?;
     if let Some(path) = &raw.backend.drm_device
         && !path.is_absolute()
@@ -810,6 +852,7 @@ fn parse(source: &str) -> Result<Config, String> {
             ),
         },
         input: raw.input,
+        theme: raw.theme,
         backend: raw.backend,
         monitors,
         autostart: raw.autostart.commands,
@@ -891,6 +934,7 @@ mod tests {
         let config = parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.bindings.len(), 54);
         assert!(config.input.middle_click_paste);
+        assert_eq!(config.theme, ThemeConfig::default());
         assert_eq!(config.layout.column_width, 0.6);
         assert_eq!(config.layout.preset_column_widths, [0.33333, 0.5, 0.66667]);
         assert_eq!(config.appearance.gaps, 15);
@@ -987,6 +1031,23 @@ mod tests {
         assert!(active.backend.direct_scanout);
         let no_animation = DEFAULT_CONFIG.replace("enabled = true", "enabled = false");
         assert!(!parse(&no_animation).unwrap().animations.active());
+
+        let themed = parse(&format!(
+            "{DEFAULT_CONFIG}\n[theme]\ncursor_theme = \"Oxygen_Zion\"\ncursor_size = 24\nicon_theme = \"Papirus-Dark\"\ngtk_theme = \"Breeze\"\nqt_style = \"Breeze\"\nfont = \"Sans 11\"\n"
+        ))
+        .unwrap();
+        assert_eq!(themed.theme.cursor_size, Some(24));
+        assert_eq!(themed.theme.qt_style.as_deref(), Some("Breeze"));
+        assert!(
+            parse(&format!("{DEFAULT_CONFIG}\n[theme]\ncursor_size = 0\n"))
+                .unwrap_err()
+                .contains("between 1 and 256")
+        );
+        assert!(
+            parse(&format!("{DEFAULT_CONFIG}\n[theme]\nfont = \" \"\n"))
+                .unwrap_err()
+                .contains("cannot be empty")
+        );
 
         let ambiguous = DEFAULT_CONFIG.replace(
             "focus_right = [\"Super+l\", \"Super+Right\"]",
@@ -1220,6 +1281,13 @@ swap_right = ["Super+Shift+l"]
         .unwrap();
         assert!(active.apply_runtime(updated));
         assert!(active.input.middle_click_paste);
+
+        let updated = parse(&format!(
+            "{DEFAULT_CONFIG}\n[theme]\ncursor_theme = \"Breeze\"\n"
+        ))
+        .unwrap();
+        assert!(active.apply_runtime(updated));
+        assert_eq!(active.theme, ThemeConfig::default());
 
         fs::write(&path, "not toml").unwrap();
         assert!(watcher.reload().is_err());

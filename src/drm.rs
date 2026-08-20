@@ -20,6 +20,7 @@ use smithay::{
             damage::OutputDamageTracker,
             element::{
                 AsRenderElements, Kind,
+                memory::MemoryRenderBufferRenderElement,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::WaylandSurfaceRenderElement,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement},
@@ -90,7 +91,8 @@ pub struct DirectBackend {
     scanner: DrmScanner,
     pub renderer: GlesRenderer,
     outputs: Vec<ActiveOutput>,
-    cursor: SolidColorBuffer,
+    cursor: Option<crate::cursor::Cursor>,
+    cursor_fallback: SolidColorBuffer,
     effects: Effects,
 }
 
@@ -150,6 +152,9 @@ pub fn init(
         formats,
     );
 
+    let cursor = crate::cursor::Cursor::load()
+        .map_err(|error| warn!(?error, "could not load cursor theme; using fallback cursor"))
+        .ok();
     let mut backend = DirectBackend {
         handle: event_loop.handle(),
         _session: session.clone(),
@@ -158,7 +163,8 @@ pub fn init(
         scanner: DrmScanner::new(),
         renderer,
         outputs: Vec::new(),
-        cursor: SolidColorBuffer::new((12, 12), [1.0, 1.0, 1.0, 1.0]),
+        cursor,
+        cursor_fallback: SolidColorBuffer::new((12, 12), [1.0, 1.0, 1.0, 1.0]),
         effects,
     };
     backend.rescan(state)?;
@@ -621,6 +627,7 @@ impl DirectBackend {
         Self::add_cursor(
             &mut self.renderer,
             &self.cursor,
+            &self.cursor_fallback,
             state,
             &active.output,
             &mut elements,
@@ -690,6 +697,7 @@ impl DirectBackend {
                     Self::add_cursor(
                         &mut self.renderer,
                         &self.cursor,
+                        &self.cursor_fallback,
                         state,
                         output,
                         &mut elements,
@@ -762,6 +770,7 @@ impl DirectBackend {
 
     fn add_cursor(
         renderer: &mut GlesRenderer,
+        cursor: &Option<crate::cursor::Cursor>,
         fallback: &SolidColorBuffer,
         state: &mut Paw2,
         output: &Output,
@@ -800,6 +809,22 @@ impl DirectBackend {
             );
             elements.splice(0..0, cursor.into_iter().map(PawRenderElements::Cursor));
             return;
+        }
+
+        if let Some(cursor) = cursor {
+            let position = (local - cursor.hotspot.to_f64()).to_physical(scale);
+            if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                position,
+                &cursor.buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            ) {
+                elements.insert(0, PawRenderElements::Memory(element));
+                return;
+            }
         }
 
         let position: Point<i32, smithay::utils::Physical> =
