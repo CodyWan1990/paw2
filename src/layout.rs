@@ -38,25 +38,65 @@ enum Direction {
 }
 
 pub const WORKSPACE_COUNT: usize = 9;
+const MIN_ROW_HEIGHT: i32 = 48;
 
 struct Column<T = Window> {
     windows: Vec<T>,
+    row_weights: Vec<f64>,
     focused: usize,
     width: Option<f64>,
 }
 
 struct WindowGroup {
     windows: Vec<Window>,
+    row_weights: Vec<f64>,
     focused: usize,
     width: Option<f64>,
     fullscreen: Option<Window>,
     floating: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ManualFloating {
+    floating: bool,
+    width: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnEdge {
+    Left,
+    Right,
+}
+
+pub(crate) enum MouseOperation {
+    MoveColumn {
+        window: Window,
+    },
+    MoveWindow {
+        window: Window,
+    },
+    MoveFloating {
+        window: Window,
+        initial_location: Point<i32, Logical>,
+    },
+    ResizeColumn {
+        window: Window,
+        edge: ColumnEdge,
+        initial_width: f64,
+        initial_offset: i32,
+    },
+    ResizeRows {
+        window: Window,
+        boundary: usize,
+        initial_heights: Vec<f64>,
+    },
+}
+
 impl<T> Column<T> {
     fn new(window: T) -> Self {
         Self {
             windows: vec![window],
+            row_weights: vec![1.0],
             focused: 0,
             width: None,
         }
@@ -83,16 +123,25 @@ impl Workspace {
     }
 
     fn add_group(&mut self, group: WindowGroup) {
+        let index = self.columns.len();
+        self.add_group_at(group, index);
+    }
+
+    fn add_group_at(&mut self, group: WindowGroup, column_index: usize) {
         if group.floating {
             self.add(group.windows[0].clone(), true);
         } else {
             let focused = group.windows.get(group.focused).cloned();
             self.windows.extend(group.windows.iter().cloned());
-            self.columns.push(Column {
-                windows: group.windows,
-                focused: group.focused,
-                width: group.width,
-            });
+            self.columns.insert(
+                column_index.min(self.columns.len()),
+                Column {
+                    windows: group.windows,
+                    row_weights: group.row_weights,
+                    focused: group.focused,
+                    width: group.width,
+                },
+            );
             self.focused = focused.and_then(|window| self.window_index(&window));
         }
         if self.fullscreen.is_none() {
@@ -126,26 +175,26 @@ impl Workspace {
         }
     }
 
-    fn remove_from_column(&mut self, window: &Window) {
-        let Some(column_index) = self
+    fn remove_from_column(&mut self, window: &Window) -> Option<Option<f64>> {
+        let column_index = self
             .columns
             .iter()
-            .position(|column| column.windows.contains(window))
-        else {
-            return;
-        };
+            .position(|column| column.windows.contains(window))?;
         let column = &mut self.columns[column_index];
+        let width = column.width;
         let row = column
             .windows
             .iter()
             .position(|item| item == window)
             .unwrap();
         column.windows.remove(row);
+        column.row_weights.remove(row);
         column.focused = focus_after_removal(Some(column.focused), row, column.windows.len())
             .unwrap_or_default();
         if column.windows.is_empty() {
             self.columns.remove(column_index);
         }
+        Some(width)
     }
 
     fn remove_where(&mut self, predicate: impl Fn(&Window) -> bool) -> Option<Window> {
@@ -178,6 +227,7 @@ impl Workspace {
             let (window, fullscreen) = self.take_focused()?;
             return Some(WindowGroup {
                 windows: vec![window.clone()],
+                row_weights: vec![1.0],
                 focused: 0,
                 width: None,
                 fullscreen: fullscreen.then_some(window),
@@ -201,6 +251,7 @@ impl Workspace {
         debug_assert!(column.windows.contains(&focused_window));
         Some(WindowGroup {
             windows: column.windows,
+            row_weights: column.row_weights,
             focused: column.focused,
             width: column.width,
             fullscreen,
@@ -281,6 +332,18 @@ impl Workspace {
             .any(|column| column.windows.contains(window))
     }
 
+    fn tile_at(&mut self, window: Window, index: usize, width: Option<f64>) {
+        self.columns.insert(
+            index.min(self.columns.len()),
+            Column {
+                windows: vec![window],
+                row_weights: vec![1.0],
+                focused: 0,
+                width,
+            },
+        );
+    }
+
     fn consume_or_expel(&mut self, delta: i32) -> bool {
         let Some(column_index) = self.focused_column() else {
             return false;
@@ -320,8 +383,131 @@ fn column_insertion_index(focused: Option<usize>, column_count: usize) -> usize 
     focused.map_or(column_count, |index| index + 1)
 }
 
+fn column_edge(
+    pointer_x: f64,
+    geometry: Rectangle<i32, Logical>,
+    margin: i32,
+) -> Option<(ColumnEdge, f64)> {
+    let left = (pointer_x - f64::from(geometry.loc.x)).abs();
+    let right = (pointer_x - f64::from(geometry.loc.x + geometry.size.w)).abs();
+    if left.min(right) > f64::from(margin) {
+        None
+    } else if left <= right {
+        Some((ColumnEdge::Left, left))
+    } else {
+        Some((ColumnEdge::Right, right))
+    }
+}
+
+fn row_boundary(
+    pointer_y: f64,
+    geometry: Rectangle<i32, Logical>,
+    row: usize,
+    rows: usize,
+    margin: i32,
+) -> Option<(usize, f64)> {
+    let top = (row > 0).then(|| (row - 1, (pointer_y - f64::from(geometry.loc.y)).abs()));
+    let bottom = (row + 1 < rows).then(|| {
+        (
+            row,
+            (pointer_y - f64::from(geometry.loc.y + geometry.size.h)).abs(),
+        )
+    });
+    [top, bottom]
+        .into_iter()
+        .flatten()
+        .filter(|(_, distance)| *distance <= f64::from(margin))
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
 fn adjusted_column_width(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(0.1, 1.0)
+}
+
+fn move_column_to<T>(columns: &mut Vec<Column<T>>, current: usize, insertion: usize) -> bool {
+    let insertion = insertion.saturating_sub(usize::from(insertion > current));
+    if insertion == current {
+        return false;
+    }
+    let column = columns.remove(current);
+    columns.insert(insertion, column);
+    true
+}
+
+fn move_row_to<T>(column: &mut Column<T>, current: usize, insertion: usize) -> bool {
+    let insertion = insertion.saturating_sub(usize::from(insertion > current));
+    if insertion == current {
+        return false;
+    }
+    let window = column.windows.remove(current);
+    let weight = column.row_weights.remove(current);
+    column.windows.insert(insertion, window);
+    column.row_weights.insert(insertion, weight);
+    column.focused = insertion;
+    true
+}
+
+fn expel_row<T>(columns: &mut Vec<Column<T>>, column: usize, row: usize, insertion: usize) {
+    let source = &mut columns[column];
+    let window = source.windows.remove(row);
+    source.row_weights.remove(row);
+    source.focused = row.min(source.windows.len() - 1);
+    let width = source.width;
+    columns.insert(
+        insertion,
+        Column {
+            windows: vec![window],
+            row_weights: vec![1.0],
+            focused: 0,
+            width,
+        },
+    );
+}
+
+fn resized_column(
+    initial_width: f64,
+    initial_offset: i32,
+    edge: ColumnEdge,
+    delta: f64,
+    output_width: i32,
+    gap: i32,
+) -> (f64, i32) {
+    let direction = if edge == ColumnEdge::Left { -1.0 } else { 1.0 };
+    let width = adjusted_column_width(
+        initial_width,
+        direction * delta / f64::from((output_width - gap).max(1)),
+    );
+    let offset = if edge == ColumnEdge::Left {
+        initial_offset + column_width(output_width, width, gap)
+            - column_width(output_width, initial_width, gap)
+    } else {
+        initial_offset
+    };
+    (width, offset)
+}
+
+fn resized_row_weights(
+    initial_heights: &[f64],
+    boundary: usize,
+    delta: f64,
+    requested_minimum: i32,
+) -> Option<Vec<f64>> {
+    if boundary + 1 >= initial_heights.len() {
+        return None;
+    }
+    let available = initial_heights.iter().sum::<f64>();
+    let minimum = f64::from(requested_minimum).min(available / initial_heights.len() as f64);
+    let pair_height = initial_heights[boundary] + initial_heights[boundary + 1];
+    let upper = (initial_heights[boundary] + delta).clamp(minimum, pair_height - minimum);
+    let mut heights = initial_heights.to_vec();
+    heights[boundary] = upper;
+    heights[boundary + 1] = pair_height - upper;
+    Some(
+        heights
+            .into_iter()
+            .map(|height| (height - minimum).max(0.0))
+            .collect(),
+    )
 }
 
 struct Scroller {
@@ -405,6 +591,7 @@ pub struct Scrollers {
     focused_output: Option<String>,
     parked: [Workspace; WORKSPACE_COUNT],
     animations: HashMap<usize, WindowAnimation>,
+    manual_floating: HashMap<usize, ManualFloating>,
 }
 
 /// A window gliding to a new position, and fading in if it was just mapped.
@@ -557,6 +744,12 @@ impl Scrollers {
             .chain(&self.parked)
     }
 
+    fn should_float(&self, window: &Window, automatic: bool) -> bool {
+        self.manual_floating
+            .get(&window.id())
+            .map_or(automatic, |override_| override_.floating)
+    }
+
     fn is_floating(&self, window: &Window) -> bool {
         self.workspaces()
             .find(|workspace| workspace.windows.contains(window))
@@ -588,6 +781,344 @@ impl Scrollers {
 }
 
 impl Paw2 {
+    pub(crate) fn begin_mouse_operation(
+        &self,
+        window: Window,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let monitor = self
+            .scroller
+            .monitors
+            .iter()
+            .find(|monitor| monitor.active().windows.contains(&window))?;
+        let workspace = monitor.active();
+        if workspace.fullscreen.is_some() {
+            return None;
+        }
+        if workspace.is_floating(&window) {
+            return Some(MouseOperation::MoveFloating {
+                initial_location: monitor.space.element_location(&window)?,
+                window,
+            });
+        }
+        let geometry = monitor.space.element_geometry(&window)?;
+        let column = workspace
+            .columns
+            .iter()
+            .find(|column| column.windows.contains(&window))?;
+        let row = column.windows.iter().position(|item| item == &window)?;
+        let column_edge = column_edge(location.x, geometry, 8);
+        let row_edge = row_boundary(location.y, geometry, row, column.windows.len(), 8);
+        if let Some((boundary, row_distance)) = row_edge
+            && column_edge.is_none_or(|(_, column_distance)| row_distance < column_distance)
+        {
+            let initial_heights = column
+                .windows
+                .iter()
+                .map(|window| {
+                    monitor
+                        .space
+                        .element_geometry(window)
+                        .map(|geometry| f64::from(geometry.size.h))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(MouseOperation::ResizeRows {
+                window,
+                boundary,
+                initial_heights,
+            });
+        }
+        if let Some((edge, _)) = column_edge {
+            return Some(MouseOperation::ResizeColumn {
+                window,
+                edge,
+                initial_width: column.width.unwrap_or(self.config.layout.column_width),
+                initial_offset: workspace.offset,
+            });
+        }
+        if column.windows.len() > 1 {
+            Some(MouseOperation::MoveWindow { window })
+        } else {
+            Some(MouseOperation::MoveColumn { window })
+        }
+    }
+
+    pub(crate) fn update_mouse_operation(
+        &mut self,
+        operation: &mut MouseOperation,
+        start: Point<f64, Logical>,
+        location: Point<f64, Logical>,
+    ) {
+        if let MouseOperation::MoveWindow { window } = operation {
+            let window = window.clone();
+            if self.drag_window(&window, location) {
+                *operation = MouseOperation::MoveColumn {
+                    window: window.clone(),
+                };
+                self.drag_column(&window, location);
+            }
+            return;
+        }
+        match operation {
+            MouseOperation::MoveColumn { window } => self.drag_column(window, location),
+            MouseOperation::MoveFloating {
+                window,
+                initial_location,
+            } => self.drag_floating(window, *initial_location, location - start, location),
+            MouseOperation::ResizeColumn {
+                window,
+                edge,
+                initial_width,
+                initial_offset,
+            } => self.drag_column_edge(
+                window,
+                *edge,
+                *initial_width,
+                *initial_offset,
+                location.x - start.x,
+            ),
+            MouseOperation::ResizeRows {
+                window,
+                boundary,
+                initial_heights,
+            } => self.drag_row_boundary(window, *boundary, initial_heights, location.y - start.y),
+            MouseOperation::MoveWindow { .. } => unreachable!(),
+        }
+    }
+
+    fn drag_window(&mut self, window: &Window, location: Point<f64, Logical>) -> bool {
+        let Some(monitor_index) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.active().windows.contains(window))
+        else {
+            return false;
+        };
+        let monitor = &self.scroller.monitors[monitor_index];
+        let workspace = monitor.active();
+        let Some(column_index) = workspace
+            .columns
+            .iter()
+            .position(|column| column.windows.contains(window))
+        else {
+            return false;
+        };
+        let Some(row) = workspace.columns[column_index]
+            .windows
+            .iter()
+            .position(|item| item == window)
+        else {
+            return false;
+        };
+        if workspace.columns[column_index].windows.len() == 1 {
+            return true;
+        }
+        let Some(geometry) = monitor.space.element_geometry(window) else {
+            return false;
+        };
+        let row_insertion =
+            row_insertion_at(&workspace.columns[column_index], &monitor.space, location.y);
+        let workspace = self.scroller.monitors[monitor_index].active_mut();
+        if location.x < f64::from(geometry.loc.x)
+            || location.x >= f64::from(geometry.loc.x + geometry.size.w)
+        {
+            let insertion = column_index + usize::from(location.x >= f64::from(geometry.loc.x));
+            expel_row(&mut workspace.columns, column_index, row, insertion);
+            self.relayout_with_animation(false, false);
+            self.sync_focus();
+            return true;
+        }
+
+        if move_row_to(&mut workspace.columns[column_index], row, row_insertion) {
+            self.relayout_with_animation(false, false);
+            self.sync_focus();
+        }
+        false
+    }
+
+    fn drag_column(&mut self, window: &Window, location: Point<f64, Logical>) {
+        let Some(source) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.active().windows.contains(window))
+        else {
+            return;
+        };
+        let Some(target) = self.scroller.monitors.iter().position(|monitor| {
+            monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.to_f64().contains(location))
+        }) else {
+            return;
+        };
+        if self.scroller.monitors[target].active().fullscreen.is_some() {
+            return;
+        }
+
+        let insertion = column_insertion_at(
+            self.scroller.monitors[target].active(),
+            &self.scroller.monitors[target].space,
+            location.x,
+        );
+        if source == target {
+            let workspace = self.scroller.monitors[source].active_mut();
+            let Some(current) = workspace
+                .columns
+                .iter()
+                .position(|column| column.windows.contains(window))
+            else {
+                return;
+            };
+            if !move_column_to(&mut workspace.columns, current, insertion) {
+                return;
+            }
+        } else {
+            self.scroller.monitors[source]
+                .active_mut()
+                .focus_window(window);
+            let Some(group) = self.scroller.monitors[source].take_focused_group() else {
+                return;
+            };
+            self.scroller.monitors[target]
+                .active_mut()
+                .add_group_at(group, insertion);
+            self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+        }
+        self.relayout_with_animation(false, false);
+        self.sync_focus();
+    }
+
+    fn drag_floating(
+        &mut self,
+        window: &Window,
+        initial_location: Point<i32, Logical>,
+        delta: Point<f64, Logical>,
+        pointer: Point<f64, Logical>,
+    ) {
+        let Some(source) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.active().windows.contains(window))
+        else {
+            return;
+        };
+        let desired = initial_location.to_f64() + delta;
+        let Some(target) = self.scroller.monitors.iter().position(|monitor| {
+            monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.to_f64().contains(pointer))
+        }) else {
+            return;
+        };
+        if source != target {
+            if self.scroller.monitors[target].active().fullscreen.is_some() {
+                return;
+            }
+            let Some(window) =
+                self.scroller.monitors[source].remove_where(|candidate| candidate == window)
+            else {
+                return;
+            };
+            self.scroller.monitors[target]
+                .active_mut()
+                .add(window, true);
+            self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+        }
+        let monitor = &mut self.scroller.monitors[target];
+        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let location = constrain_window(area, floating_size(window), desired.to_i32_round());
+        monitor.space.map_element(window.clone(), location, true);
+        self.scroller.animations.remove(&window.id());
+        self.sync_focus();
+    }
+
+    fn drag_column_edge(
+        &mut self,
+        window: &Window,
+        edge: ColumnEdge,
+        initial_width: f64,
+        initial_offset: i32,
+        delta: f64,
+    ) {
+        let Some(monitor) = self
+            .scroller
+            .monitors
+            .iter_mut()
+            .find(|monitor| monitor.active().windows.contains(window))
+        else {
+            return;
+        };
+        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let requested_width = monitor
+            .active()
+            .columns
+            .iter()
+            .map(|column| {
+                let fraction = column.width.unwrap_or(self.config.layout.column_width);
+                (f64::from(area.size.w) * fraction).round() as i32
+            })
+            .min()
+            .unwrap_or(area.size.w);
+        let gap = effective_gap(self.config.appearance.gaps, requested_width, area.size);
+        let (width, offset) =
+            resized_column(initial_width, initial_offset, edge, delta, area.size.w, gap);
+        let workspace = monitor.active_mut();
+        let Some(column) = workspace
+            .columns
+            .iter_mut()
+            .find(|column| column.windows.contains(window))
+        else {
+            return;
+        };
+        column.width = Some(width);
+        workspace.offset = offset;
+        self.relayout_with_animation(false, false);
+    }
+
+    fn drag_row_boundary(
+        &mut self,
+        window: &Window,
+        boundary: usize,
+        initial_heights: &[f64],
+        delta: f64,
+    ) {
+        let Some(column) = self.scroller.monitors.iter_mut().find_map(|monitor| {
+            monitor
+                .active_mut()
+                .columns
+                .iter_mut()
+                .find(|column| column.windows.contains(window))
+        }) else {
+            return;
+        };
+        if boundary + 1 >= column.windows.len() || initial_heights.len() != column.windows.len() {
+            return;
+        }
+        let Some(weights) = resized_row_weights(initial_heights, boundary, delta, MIN_ROW_HEIGHT)
+        else {
+            return;
+        };
+        column.row_weights = weights;
+        self.relayout_with_animation(false, false);
+    }
+
     pub fn apply_startup_monitor(&mut self) {
         let Some(name) = self.config.startup_monitor().map(str::to_owned) else {
             return;
@@ -764,14 +1295,14 @@ impl Paw2 {
         let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() else {
             return;
         };
-        let floating = wayland_should_float(surface);
+        let floating = self
+            .scroller
+            .should_float(&window, wayland_should_float(surface));
         let changed = self.scroller.set_floating(&window, floating);
 
         if changed {
             self.relayout(true);
             self.sync_focus();
-        } else if floating {
-            self.center_floating_window(&window);
         }
     }
 
@@ -779,29 +1310,13 @@ impl Paw2 {
         let Some(window) = self.window_for_x11_surface(surface).cloned() else {
             return;
         };
-        let floating = x11_should_float(surface);
+        let floating = self
+            .scroller
+            .should_float(&window, x11_should_float(surface));
         let changed = self.scroller.set_floating(&window, floating);
         if changed {
             self.relayout(true);
             self.sync_focus();
-        }
-    }
-
-    fn center_floating_window(&mut self, window: &Window) {
-        for monitor in &mut self.scroller.monitors {
-            if !monitor.active().windows.contains(window) {
-                continue;
-            }
-            let Some(output) = monitor.space.output_geometry(&monitor.output) else {
-                return;
-            };
-            let area = work_area(
-                output,
-                layer_map_for_output(&monitor.output).non_exclusive_zone(),
-            );
-            let rectangle = centered_rectangle(area, window.geometry().size);
-            monitor.space.relocate_element(window, rectangle.loc);
-            return;
         }
     }
 
@@ -851,6 +1366,7 @@ impl Paw2 {
 
     fn forget_window(&mut self, window: &Window) {
         self.scroller.animations.remove(&window.id());
+        self.scroller.manual_floating.remove(&window.id());
         self.relayout(true);
         self.sync_focus();
     }
@@ -1117,6 +1633,68 @@ impl Paw2 {
         }
     }
 
+    fn toggle_floating(&mut self) -> bool {
+        let pointer_x = self.seat.get_pointer().unwrap().current_location().x;
+        let Some(output) = self.scroller.focused_output.clone() else {
+            return false;
+        };
+        let Some(monitor_index) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.output.name() == output)
+        else {
+            return false;
+        };
+        let Some(window) = self.scroller.monitors[monitor_index]
+            .active()
+            .focused
+            .and_then(|index| {
+                self.scroller.monitors[monitor_index]
+                    .active()
+                    .windows
+                    .get(index)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        if self.scroller.monitors[monitor_index]
+            .active()
+            .fullscreen
+            .is_some()
+        {
+            return false;
+        }
+
+        let floating = self.scroller.monitors[monitor_index]
+            .active()
+            .is_floating(&window);
+        let remembered_width = self
+            .scroller
+            .manual_floating
+            .get(&window.id())
+            .and_then(|override_| override_.width);
+        let monitor = &mut self.scroller.monitors[monitor_index];
+        let width = if floating {
+            let index = column_insertion_at(monitor.active(), &monitor.space, pointer_x);
+            monitor
+                .active_mut()
+                .tile_at(window.clone(), index, remembered_width);
+            remembered_width
+        } else {
+            monitor.active_mut().remove_from_column(&window).flatten()
+        };
+        self.scroller.manual_floating.insert(
+            window.id(),
+            ManualFloating {
+                floating: !floating,
+                width,
+            },
+        );
+        true
+    }
+
     pub fn run_action(&mut self, action: Action) {
         let changed = match action {
             Action::FocusLeft => self.layout_action(|workspace| workspace.focus_horizontal(-1)),
@@ -1148,6 +1726,7 @@ impl Paw2 {
                 let default = self.config.layout.column_width;
                 self.layout_action(|workspace| workspace.adjust_column_width(default, 0.05))
             }
+            Action::ToggleFloating => self.toggle_floating(),
             Action::CloseWindow => {
                 if let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
                     let workspace = scroller.active();
@@ -1766,6 +2345,10 @@ impl Paw2 {
     }
 
     pub fn relayout(&mut self, reveal_focus: bool) {
+        self.relayout_with_animation(reveal_focus, true);
+    }
+
+    fn relayout_with_animation(&mut self, reveal_focus: bool, animate: bool) {
         let work_areas = self
             .scroller
             .monitors
@@ -1779,11 +2362,8 @@ impl Paw2 {
         let animations = &mut self.scroller.animations;
         let monitors = &mut self.scroller.monitors;
         let now = self.start_time.elapsed();
-        let duration = self
-            .config
-            .animations
-            .active()
-            .then_some(self.config.animations.duration);
+        let duration =
+            (animate && self.config.animations.active()).then_some(self.config.animations.duration);
         for (name, output_geometry, geometry) in work_areas {
             let Some(monitor) = monitors
                 .iter_mut()
@@ -1820,10 +2400,20 @@ impl Paw2 {
                 &widths,
                 geometry.size.w,
                 gap,
-                self.config.layout.center_focused_column,
+                self.config.layout.center_focused_column && animate,
                 reveal_focus,
             );
             let offset = workspace.offset;
+            let floating_locations = workspace
+                .windows
+                .iter()
+                .filter(|window| workspace.is_floating(window))
+                .filter_map(|window| {
+                    space
+                        .element_location(window)
+                        .map(|location| (window.id(), location))
+                })
+                .collect::<HashMap<_, _>>();
             // Sizes the window, then glides it from wherever it currently sits.
             let mut place =
                 |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
@@ -1842,7 +2432,13 @@ impl Paw2 {
 
             let mut column_x = geometry.loc.x + gap - offset;
             for (column, width) in workspace.columns.iter().zip(widths) {
-                let rows = stacked_rows(geometry.loc.y, geometry.size.h, column.windows.len(), gap);
+                let rows = stacked_rows(
+                    geometry.loc.y,
+                    geometry.size.h,
+                    &column.row_weights,
+                    gap,
+                    MIN_ROW_HEIGHT,
+                );
                 for (window, row) in column.windows.iter().zip(rows) {
                     let fullscreen = workspace.fullscreen.as_ref() == Some(window);
                     let rectangle = if fullscreen {
@@ -1866,7 +2462,14 @@ impl Paw2 {
                 let rectangle = if fullscreen {
                     output_geometry
                 } else {
-                    centered_rectangle(geometry, floating_size(window))
+                    let size = floating_size(window);
+                    Rectangle::new(
+                        floating_locations.get(&window.id()).copied().map_or_else(
+                            || centered_rectangle(geometry, size).loc,
+                            |location| constrain_window(geometry, size, location),
+                        ),
+                        size,
+                    )
                 };
                 place(window, rectangle, !fullscreen);
             }
@@ -2151,6 +2754,58 @@ fn centered_rectangle(
     Rectangle::new(area.loc + (area.size - size) / 2, size)
 }
 
+fn column_insertion_at(workspace: &Workspace, space: &Space<Window>, x: f64) -> usize {
+    let centers = workspace
+        .columns
+        .iter()
+        .map(|column| {
+            space
+                .element_geometry(&column.windows[0])
+                .map(|geometry| geometry.loc.x + geometry.size.w / 2)
+                .unwrap_or(i32::MAX)
+        })
+        .collect::<Vec<_>>();
+    insertion_index(&centers, x)
+}
+
+fn insertion_index(centers: &[i32], x: f64) -> usize {
+    centers
+        .iter()
+        .position(|center| x < f64::from(*center))
+        .unwrap_or(centers.len())
+}
+
+fn row_insertion_at(column: &Column, space: &Space<Window>, y: f64) -> usize {
+    let centers = column
+        .windows
+        .iter()
+        .map(|window| {
+            space
+                .element_geometry(window)
+                .map(|geometry| geometry.loc.y + geometry.size.h / 2)
+                .unwrap_or(i32::MAX)
+        })
+        .collect::<Vec<_>>();
+    insertion_index(&centers, y)
+}
+
+fn constrain_window(
+    area: Rectangle<i32, Logical>,
+    size: Size<i32, Logical>,
+    location: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    let max: Point<i32, Logical> = (
+        area.loc.x + (area.size.w - size.w).max(0),
+        area.loc.y + (area.size.h - size.h).max(0),
+    )
+        .into();
+    (
+        location.x.clamp(area.loc.x, max.x),
+        location.y.clamp(area.loc.y, max.y),
+    )
+        .into()
+}
+
 fn work_area(
     output: Rectangle<i32, Logical>,
     non_exclusive_zone: Rectangle<i32, Logical>,
@@ -2168,6 +2823,7 @@ fn swap_column_window<T>(column: &mut Column<T>, delta: i32) -> bool {
         return false;
     };
     column.windows.swap(column.focused, next);
+    column.row_weights.swap(column.focused, next);
     column.focused = next;
     true
 }
@@ -2177,14 +2833,18 @@ fn consume_or_expel_columns<T>(columns: &mut Vec<Column<T>>, current: usize, del
         let Some(target) = neighbor(current, columns.len(), delta) else {
             return false;
         };
-        let window = columns.remove(current).windows.remove(0);
+        let mut source = columns.remove(current);
+        let window = source.windows.remove(0);
         let target = if target > current { target - 1 } else { target };
+        let weight = average_weight(&columns[target].row_weights);
         columns[target].windows.push(window);
+        columns[target].row_weights.push(weight);
         columns[target].focused = columns[target].windows.len() - 1;
     } else {
         let column = &mut columns[current];
         let row = column.focused;
         let window = column.windows.remove(row);
+        column.row_weights.remove(row);
         column.focused = row.min(column.windows.len() - 1);
         let width = column.width;
         let target = if delta < 0 { current } else { current + 1 };
@@ -2192,12 +2852,17 @@ fn consume_or_expel_columns<T>(columns: &mut Vec<Column<T>>, current: usize, del
             target,
             Column {
                 windows: vec![window],
+                row_weights: vec![1.0],
                 focused: 0,
                 width,
             },
         );
     }
     true
+}
+
+fn average_weight(weights: &[f64]) -> f64 {
+    weights.iter().sum::<f64>() / weights.len().max(1) as f64
 }
 
 fn cycle_column_width<T>(column: &mut Column<T>, default: f64, presets: &[f64]) {
@@ -2295,21 +2960,36 @@ fn column_width(output_width: i32, fraction: f64, gap: i32) -> i32 {
 fn stacked_rows(
     output_y: i32,
     output_height: i32,
-    count: usize,
+    weights: &[f64],
     requested_gap: i32,
+    requested_minimum: i32,
 ) -> Vec<Rectangle<i32, Logical>> {
-    if count == 0 {
+    if weights.is_empty() {
         return Vec::new();
     }
-    let count = count as i32;
+    let count = weights.len() as i32;
     let gap = requested_gap.min(((output_height - count) / (count + 1)).max(0));
     let available = (output_height - gap * (count + 1)).max(count);
-    let height = available / count;
-    let remainder = available % count;
+    let minimum = requested_minimum.min(available / count).max(1);
+    let distributable = available - minimum * count;
+    let total = weights.iter().map(|weight| weight.max(0.0)).sum::<f64>();
+    let equal = total <= 0.0;
+    let total = if equal { count.into() } else { total };
+    let mut cumulative = 0.0;
+    let mut distributed = 0;
     let mut y = output_y + gap;
-    (0..count)
-        .map(|row| {
-            let row_height = height + i32::from(row < remainder);
+    weights
+        .iter()
+        .enumerate()
+        .map(|(row, weight)| {
+            cumulative += if equal { 1.0 } else { weight.max(0.0) };
+            let target = if row + 1 == weights.len() {
+                distributable
+            } else {
+                (f64::from(distributable) * cumulative / total).round() as i32
+            };
+            let row_height = minimum + target - distributed;
+            distributed = target;
             let rectangle = Rectangle::new((0, y).into(), (0, row_height).into());
             y += row_height + gap;
             rectangle
@@ -2343,6 +3023,46 @@ mod tests {
         assert_eq!(adjusted_column_width(0.5, 0.05), 0.55);
         assert_eq!(adjusted_column_width(0.1, -0.05), 0.1);
         assert_eq!(adjusted_column_width(1.0, 0.05), 1.0);
+        let geometry = Rectangle::new((100, 20).into(), (400, 300).into());
+        assert_eq!(
+            column_edge(105.0, geometry, 8),
+            Some((ColumnEdge::Left, 5.0))
+        );
+        assert_eq!(
+            column_edge(495.0, geometry, 8),
+            Some((ColumnEdge::Right, 5.0))
+        );
+        assert_eq!(column_edge(300.0, geometry, 8), None);
+        assert_eq!(row_boundary(22.0, geometry, 1, 3, 8), Some((0, 2.0)));
+        assert_eq!(row_boundary(318.0, geometry, 1, 3, 8), Some((1, 2.0)));
+        assert_eq!(row_boundary(170.0, geometry, 1, 3, 8), None);
+        assert_eq!(insertion_index(&[100, 300, 500], 50.0), 0);
+        assert_eq!(insertion_index(&[100, 300, 500], 350.0), 2);
+        assert_eq!(insertion_index(&[100, 300, 500], 550.0), 3);
+        let mut columns = vec![Column::new(1), Column::new(2), Column::new(3)];
+        assert!(move_column_to(&mut columns, 0, 3));
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.windows[0])
+                .collect::<Vec<_>>(),
+            [2, 3, 1]
+        );
+        assert!(!move_column_to(&mut columns, 2, 3));
+        let (width, offset) = resized_column(0.5, 100, ColumnEdge::Left, 100.0, 1000, 10);
+        assert!(width < 0.5);
+        assert!(offset < 100);
+        let (width, offset) = resized_column(0.5, 100, ColumnEdge::Right, 100.0, 1000, 10);
+        assert!(width > 0.5);
+        assert_eq!(offset, 100);
+        assert_eq!(
+            constrain_window(
+                Rectangle::new((100, 50).into(), (500, 400).into()),
+                (200, 100).into(),
+                (550, 500).into(),
+            ),
+            (400, 350).into()
+        );
         assert_eq!(neighbor(0, 3, -1), None);
         assert_eq!(workspace_neighbor(0, -1), 8);
         assert_eq!(workspace_neighbor(8, 1), 0);
@@ -2386,7 +3106,7 @@ mod tests {
         assert_eq!(visible_windows, [10, 55]);
         assert_eq!(visible_windows[1] + 35, 100 - 10);
         assert_eq!(
-            stacked_rows(50, 100, 2, 10),
+            stacked_rows(50, 100, &[1.0, 1.0], 10, MIN_ROW_HEIGHT),
             [
                 Rectangle::new((0, 60).into(), (0, 35).into()),
                 Rectangle::new((0, 105).into(), (0, 35).into()),
@@ -2411,6 +3131,7 @@ mod tests {
 
         let mut column = Column {
             windows: vec![1, 2, 3],
+            row_weights: vec![1.0; 3],
             focused: 1,
             width: None,
         };
@@ -2450,6 +3171,48 @@ mod tests {
             directional_neighbor("left", Direction::Down, &geometries).as_deref(),
             Some("down")
         );
+    }
+
+    #[test]
+    fn stacked_rows_preserve_weights_and_move_with_windows() {
+        let rows = stacked_rows(0, 300, &[1.0, 2.0], 10, MIN_ROW_HEIGHT);
+        assert_eq!(rows[0].size.h, 106);
+        assert_eq!(rows[1].size.h, 164);
+
+        let weights = resized_row_weights(&[106.0, 164.0], 0, 50.0, MIN_ROW_HEIGHT).unwrap();
+        let rows = stacked_rows(0, 300, &weights, 10, MIN_ROW_HEIGHT);
+        assert_eq!([rows[0].size.h, rows[1].size.h], [156, 114]);
+        let weights = resized_row_weights(&[106.0, 164.0], 0, 1000.0, MIN_ROW_HEIGHT).unwrap();
+        let rows = stacked_rows(0, 300, &weights, 10, MIN_ROW_HEIGHT);
+        assert_eq!([rows[0].size.h, rows[1].size.h], [222, 48]);
+
+        let mut column = Column {
+            windows: vec![1, 2, 3],
+            row_weights: vec![1.0, 2.0, 3.0],
+            focused: 0,
+            width: Some(0.5),
+        };
+        assert!(move_row_to(&mut column, 0, 3));
+        assert_eq!(column.windows, [2, 3, 1]);
+        assert_eq!(column.row_weights, [2.0, 3.0, 1.0]);
+        let mut columns = vec![column];
+        expel_row(&mut columns, 0, 1, 1);
+        assert_eq!(columns[0].windows, [2, 1]);
+        assert_eq!(columns[0].row_weights, [2.0, 1.0]);
+        assert_eq!(columns[1].windows, [3]);
+        assert_eq!(columns[1].width, Some(0.5));
+
+        let mut columns = vec![
+            Column {
+                windows: vec![1, 2],
+                row_weights: vec![2.0, 4.0],
+                focused: 0,
+                width: None,
+            },
+            Column::new(3),
+        ];
+        assert!(consume_or_expel_columns(&mut columns, 1, -1));
+        assert_eq!(columns[0].row_weights, [2.0, 4.0, 3.0]);
     }
 
     #[test]

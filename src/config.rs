@@ -96,6 +96,7 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 focus_monitor_left = ["Super+comma"]
@@ -145,6 +146,7 @@ pub enum Action {
     CycleColumnWidth,
     DecreaseColumnWidth,
     IncreaseColumnWidth,
+    ToggleFloating,
     CloseWindow,
     ToggleFullscreen,
     FocusMonitorLeft,
@@ -540,6 +542,7 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
     ("decrease_column_width",  Action::DecreaseColumnWidth,  ""),
     ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
+    ("toggle_floating",        Action::ToggleFloating,       "Super+Shift+space"),
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
     ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
     ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
@@ -973,7 +976,34 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 54);
+        assert_eq!(config.bindings.len(), 55);
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    shift: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::ToggleFloating)
+        );
+        let disabled = parse(&DEFAULT_CONFIG.replace(
+            "toggle_floating = [\"Super+Shift+space\"]",
+            "toggle_floating = []",
+        ))
+        .unwrap();
+        assert_eq!(
+            disabled.action(
+                &ModifiersState {
+                    shift: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            None
+        );
         assert!(!config.input.focus_follows_mouse);
         assert!(config.input.middle_click_paste);
         assert_eq!(config.theme, ThemeConfig::default());
@@ -1236,7 +1266,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 54);
+        assert_eq!(legacy.bindings.len(), 55);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -1268,7 +1298,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 49);
+        assert_eq!(config.bindings.len(), 50);
 
         let invalid_workspaces = DEFAULT_CONFIG.replace(
             "  [\"Super+7\"], [\"Super+8\"], [\"Super+9\"],\n]",

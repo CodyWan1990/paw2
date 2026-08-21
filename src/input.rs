@@ -5,14 +5,158 @@ use smithay::{
     },
     input::{
         keyboard::FilterResult,
-        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+        pointer::{
+            AxisFrame, ButtonEvent, Focus, GestureHoldBeginEvent, GestureHoldEndEvent,
+            GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
+            GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData,
+            MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
+        },
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 
-use crate::{config::ScrollDirection, state::Paw2};
+use crate::{config::ScrollDirection, layout::MouseOperation, state::Paw2};
+
+const BTN_LEFT: u32 = 0x110;
+
+struct MouseGrab {
+    start_data: GrabStartData<Paw2>,
+    operation: MouseOperation,
+}
+
+impl PointerGrab<Paw2> for MouseGrab {
+    fn motion(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        handle.motion(data, None, event);
+        // Smithay holds the pointer lock here. Rendering would read the cursor
+        // position and deadlock; each backend redraws after input dispatch.
+        data.update_mouse_operation(
+            &mut self.operation,
+            self.start_data.location,
+            event.location,
+        );
+    }
+
+    fn relative_motion(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &RelativeMotionEvent,
+    ) {
+        handle.relative_motion(data, None, event);
+    }
+
+    fn button(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &ButtonEvent,
+    ) {
+        handle.button(data, event);
+        if !handle.current_pressed().contains(&BTN_LEFT) {
+            handle.unset_grab(self, data, event.serial, event.time, true);
+        }
+    }
+
+    fn axis(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        details: AxisFrame,
+    ) {
+        handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut Paw2, handle: &mut PointerInnerHandle<'_, Paw2>) {
+        handle.frame(data);
+    }
+
+    fn gesture_swipe_begin(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GestureSwipeBeginEvent,
+    ) {
+        handle.gesture_swipe_begin(data, event);
+    }
+
+    fn gesture_swipe_update(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GestureSwipeUpdateEvent,
+    ) {
+        handle.gesture_swipe_update(data, event);
+    }
+
+    fn gesture_swipe_end(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GestureSwipeEndEvent,
+    ) {
+        handle.gesture_swipe_end(data, event);
+    }
+
+    fn gesture_pinch_begin(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GesturePinchBeginEvent,
+    ) {
+        handle.gesture_pinch_begin(data, event);
+    }
+
+    fn gesture_pinch_update(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GesturePinchUpdateEvent,
+    ) {
+        handle.gesture_pinch_update(data, event);
+    }
+
+    fn gesture_pinch_end(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GesturePinchEndEvent,
+    ) {
+        handle.gesture_pinch_end(data, event);
+    }
+
+    fn gesture_hold_begin(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GestureHoldBeginEvent,
+    ) {
+        handle.gesture_hold_begin(data, event);
+    }
+
+    fn gesture_hold_end(
+        &mut self,
+        data: &mut Paw2,
+        handle: &mut PointerInnerHandle<'_, Paw2>,
+        event: &GestureHoldEndEvent,
+    ) {
+        handle.gesture_hold_end(data, event);
+    }
+
+    fn start_data(&self) -> &GrabStartData<Paw2> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, _data: &mut Paw2) {}
+}
 
 fn activate_pointer_constraint(
     pointer: &smithay::input::pointer::PointerHandle<Paw2>,
@@ -160,7 +304,9 @@ impl Paw2 {
                 {
                     self.focus_window_on_hover(&window);
                 }
-                activate_pointer_constraint(&pointer, location, new_under);
+                if !pointer.is_grabbed() {
+                    activate_pointer_constraint(&pointer, location, new_under);
+                }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let geometries = self.output_geometries();
@@ -192,20 +338,58 @@ impl Paw2 {
                 {
                     self.focus_window_on_hover(&window);
                 }
-                activate_pointer_constraint(&pointer, location, under);
+                if !pointer.is_grabbed() {
+                    activate_pointer_constraint(&pointer, location, under);
+                }
             }
             InputEvent::PointerButton { event, .. } => {
                 let pointer = self.seat.get_pointer().unwrap();
                 let serial = SERIAL_COUNTER.next_serial();
+                let location = pointer.current_location();
+
+                if event.state() == ButtonState::Pressed
+                    && event.button_code() == BTN_LEFT
+                    && !pointer.is_grabbed()
+                    && self.seat.get_keyboard().unwrap().modifier_state().logo
+                    && let Some(window) = self.window_under(location)
+                {
+                    self.focus_output_at(location);
+                    self.focus_window(&window);
+                    if let Some(operation) = self.begin_mouse_operation(window, location) {
+                        let focus = self.surface_under(location);
+                        pointer.set_grab(
+                            self,
+                            MouseGrab {
+                                start_data: GrabStartData {
+                                    focus,
+                                    button: BTN_LEFT,
+                                    location,
+                                },
+                                operation,
+                            },
+                            serial,
+                            Focus::Clear,
+                        );
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button: event.button_code(),
+                                state: event.state(),
+                                serial,
+                                time: event.time_msec(),
+                            },
+                        );
+                        pointer.frame(self);
+                        return;
+                    }
+                }
 
                 if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                    self.focus_output_at(pointer.current_location());
-                    let window = self.window_under(pointer.current_location());
+                    self.focus_output_at(location);
+                    let window = self.window_under(location);
                     if let Some(window) = window {
                         self.focus_window(&window);
-                    } else if let Some(surface) =
-                        self.keyboard_layer_under(pointer.current_location())
-                    {
+                    } else if let Some(surface) = self.keyboard_layer_under(location) {
                         self.seat
                             .get_keyboard()
                             .unwrap()

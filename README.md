@@ -137,6 +137,7 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 focus_monitor_left = ["Super+comma"]
@@ -175,8 +176,14 @@ move_next = ["Super+Shift+Page_Down"]
 `preset_column_widths` controls the sizes cycled on the focused column; all
 widths must be between `0.1` and `1.0`. A lone window is consumed into the
 neighboring column with `consume_or_expel_left` or `consume_or_expel_right`;
-a window already sharing a column is expelled in that direction. Stacked
-windows divide the available height equally. Appearance sizes are logical
+a window already sharing a column is expelled in that direction. `Super+left-drag`
+reorders windows inside a stack; dragging one sideways expels only that window
+into a new column. Dragging an internal horizontal edge resizes the two adjacent
+rows, with a 48 logical pixel minimum. A tiled window's left or right edge
+resizes its column. Standalone columns and floating windows can be dragged
+between monitors. `toggle_floating` detaches only the focused window from a
+stack and tiles it again at the pointer position.
+Appearance sizes are logical
 pixels; set the ring width or blur radius to `0` to disable that feature. Transparency and blur are
 applied automatically to normal window areas that clients do not declare
 opaque. The smooth multi-pass effect is clipped to the XDG window geometry;
