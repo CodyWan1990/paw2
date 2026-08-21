@@ -107,7 +107,7 @@ pub fn init(
                 state.finish_frame();
                 backend.window().request_redraw();
             }
-            WinitEvent::CloseRequested => state.loop_signal.stop(),
+            WinitEvent::CloseRequested => state.begin_shutdown(),
             _ => {}
         })?;
 

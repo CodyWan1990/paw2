@@ -16,11 +16,13 @@ mod xwayland;
 use std::{
     ffi::{OsStr, OsString},
     io,
+    sync::{Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
 use smithay::reexports::{
-    calloop::{EventLoop, timer::TimeoutAction, timer::Timer},
+    calloop::{EventLoop, LoopSignal, timer::TimeoutAction, timer::Timer},
+    rustix::process::{Pid, Signal, kill_process},
     wayland_server::Display,
 };
 use state::Paw2;
@@ -43,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
     let mut state = Paw2::new(&mut event_loop, display, config);
+    install_signal_handlers(event_loop.get_signal());
 
     event_loop.handle().insert_source(
         Timer::from_duration(Duration::from_millis(500)),
@@ -110,23 +113,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn(command)?;
     }
 
-    event_loop.run(None, &mut state, |state| {
+    let result = event_loop.run(None, &mut state, |state| {
         let _ = state.display_handle.flush_clients();
-    })?;
+    });
+    shutdown(state, event_loop, &mode);
+    result?;
     Ok(())
 }
 
-fn import_activation_environment() {
+/// Hand the machine back the way Paw2 found it.
+///
+/// The order is load-bearing. DRM state can only be restored while the libseat
+/// session is still active, and the session is owned by an event source, so it
+/// is closed by dropping the event loop - which in turn only happens now that
+/// no source callback holds a strong `LoopHandle` back to it.
+fn shutdown(mut state: Paw2, event_loop: EventLoop<'static, Paw2>, mode: &Mode) {
+    state::start_shutdown();
+    if let Some(backend) = state.direct.take() {
+        backend.shutdown();
+    }
+    // Closes the Wayland socket, which is how well-behaved clients learn to exit.
+    drop(state);
+    // Kills XWayland, closes the libinput devices, and closes the libseat session.
+    drop(event_loop);
+    terminate_children();
+    if *mode == Mode::Direct {
+        unset_activation_environment();
+    }
+}
+
+/// The variables Paw2 exports to the systemd user manager and the D-Bus
+/// activation environment.
+///
+/// That environment outlives the session, so exactly this list has to be unset
+/// again on the way out; otherwise the next compositor starts with a
+/// `WAYLAND_DISPLAY` pointing at a dead socket and Paw2's theme overrides.
+fn activation_environment() -> Vec<&'static str> {
     let mut variables = vec![
-        "--systemd",
         "WAYLAND_DISPLAY",
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",
     ];
-    if std::env::var_os("DISPLAY").is_some() {
-        variables.push("DISPLAY");
-    }
     for name in [
+        "DISPLAY",
         "XCURSOR_THEME",
         "XCURSOR_SIZE",
         "GTK_THEME",
@@ -137,6 +166,12 @@ fn import_activation_environment() {
             variables.push(name);
         }
     }
+    variables
+}
+
+fn import_activation_environment() {
+    let mut variables = vec!["--systemd"];
+    variables.extend(activation_environment());
     let status = std::process::Command::new("dbus-update-activation-environment")
         .args(variables)
         .status();
@@ -144,6 +179,22 @@ fn import_activation_environment() {
         Ok(status) if status.success() => {}
         Ok(status) => tracing::warn!(%status, "could not import portal activation environment"),
         Err(error) => tracing::warn!(?error, "could not run dbus-update-activation-environment"),
+    }
+}
+
+/// `dbus-update-activation-environment` has no unset verb, but the systemd user
+/// manager is what a systemd-launched session inherits, so clearing it there is
+/// what keeps the next session clean.
+fn unset_activation_environment() {
+    let mut variables = vec!["--user", "unset-environment"];
+    variables.extend(activation_environment());
+    match std::process::Command::new("systemctl")
+        .args(variables)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "could not clear the session environment"),
+        Err(error) => tracing::warn!(?error, "could not run systemctl to clear the environment"),
     }
 }
 
@@ -213,6 +264,16 @@ fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
     settings
 }
 
+/// Live children, so logging out does not leave them behind holding the login
+/// session open.
+// ponytail: a plain pid list; the reaper clears each entry the moment the child
+// is waited for, so the only window for pid reuse is shutdown itself.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn children() -> MutexGuard<'static, Vec<u32>> {
+    CHILDREN.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 pub(crate) fn spawn<T: AsRef<OsStr>>(command: &[T]) -> io::Result<()> {
     let Some((program, args)) = command.split_first() else {
         return Err(io::Error::new(
@@ -221,11 +282,54 @@ pub(crate) fn spawn<T: AsRef<OsStr>>(command: &[T]) -> io::Result<()> {
         ));
     };
     let mut child = std::process::Command::new(program).args(args).spawn()?;
+    let pid = child.id();
+    children().push(pid);
     // ponytail: one waiter per child; replace with session process supervision if launch volume grows.
     std::thread::spawn(move || {
         let _ = child.wait();
+        children().retain(|tracked| *tracked != pid);
     });
     Ok(())
+}
+
+/// Wayland clients exit on their own once the socket closes; anything else we
+/// launched would outlive the session and keep logind from ending it.
+fn terminate_children() {
+    for pid in children().drain(..) {
+        if let Some(pid) = Pid::from_raw(pid as i32) {
+            let _ = kill_process(pid, Signal::TERM);
+        }
+    }
+}
+
+/// The event loop's stop switch, so the signal handler can reach it.
+static LOOP_SIGNAL: OnceLock<LoopSignal> = OnceLock::new();
+
+extern "C" fn on_terminate(_signal: libc::c_int) {
+    state::start_shutdown();
+    if let Some(signal) = LOOP_SIGNAL.get() {
+        signal.stop();
+        signal.wakeup();
+    }
+}
+
+/// A display manager ends the session with `SIGTERM`. Without a handler the
+/// process dies on the spot and none of [`shutdown`] runs, leaving the seat
+/// open and the session environment polluted.
+fn install_signal_handlers(signal: LoopSignal) {
+    let _ = LOOP_SIGNAL.set(signal);
+    // SAFETY: the handler only performs relaxed atomic stores and a write to the
+    // event loop's eventfd, all of which are async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            on_terminate as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_terminate as *const () as libc::sighandler_t,
+        );
+    }
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Mode>> {
@@ -263,6 +367,14 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_terminates_tracked_children() {
+        spawn(&["sleep", "10"]).unwrap();
+        assert!(!children().is_empty());
+        terminate_children();
+        assert!(children().is_empty());
+    }
 
     #[test]
     fn parses_cli() {

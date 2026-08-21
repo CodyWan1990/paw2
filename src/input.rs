@@ -80,11 +80,7 @@ impl Paw2 {
                 }
             }
             InputEvent::PointerMotion { event, .. } => {
-                let geometries = self
-                    .output_geometries()
-                    .into_iter()
-                    .map(|(_, geometry)| geometry)
-                    .collect::<Vec<_>>();
+                let geometries = self.output_rects().collect::<Vec<_>>();
                 if geometries.is_empty() {
                     return;
                 }

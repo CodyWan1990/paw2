@@ -68,6 +68,9 @@ type FrameFeedback = OutputPresentationFeedback;
 type KmsOutput = DrmOutput<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
 type OutputManager = DrmOutputManager<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
 
+/// How many times to retry a render fence before declaring the GPU wedged.
+const SYNC_WAIT_ATTEMPTS: u32 = 8;
+
 struct ActiveOutput {
     connector: connector::Handle,
     crtc: crtc::Handle,
@@ -87,13 +90,15 @@ pub struct DirectBackend {
     handle: LoopHandle<'static, Paw2>,
     _session: LibSeatSession,
     node: DrmNode,
+    // Declaration order is drop order: every field below borrows GPU resources
+    // from `renderer`, so the renderer must be declared after all of them.
     manager: OutputManager,
     scanner: DrmScanner,
-    pub renderer: GlesRenderer,
     outputs: Vec<ActiveOutput>,
     cursor: Option<crate::cursor::Cursor>,
     cursor_fallback: SolidColorBuffer,
     effects: Effects,
+    pub renderer: GlesRenderer,
 }
 
 pub fn init(
@@ -161,11 +166,11 @@ pub fn init(
         node,
         manager,
         scanner: DrmScanner::new(),
-        renderer,
         outputs: Vec::new(),
         cursor,
         cursor_fallback: SolidColorBuffer::new((12, 12), [1.0, 1.0, 1.0, 1.0]),
         effects,
+        renderer,
     };
     backend.rescan(state)?;
     if backend.outputs.is_empty() {
@@ -224,7 +229,10 @@ pub fn init(
             });
         })?;
 
-    let render_handle = event_loop.handle();
+    // A `LoopHandle` owns an `Rc` to the loop, and this callback is stored *in*
+    // the loop: keeping a strong handle here would leak every event source,
+    // including the libseat session that must be closed on exit.
+    let render_handle = event_loop.handle().downgrade();
     event_loop
         .handle()
         .insert_source(drm_notifier, move |event, metadata, state| {
@@ -254,8 +262,10 @@ pub fn init(
                 }
                 DrmEvent::Error(error) => warn!(?error, "DRM event error"),
             });
-            if let Some((crtc, delay)) = repaint {
-                schedule_repaint(&render_handle, crtc, delay);
+            if let Some((crtc, delay)) = repaint
+                && let Some(handle) = render_handle.upgrade()
+            {
+                schedule_repaint(&handle, crtc, delay);
             }
         })?;
 
@@ -269,7 +279,7 @@ pub fn init(
             }
             UdevEvent::Removed { device_id } if device_id == backend.node.dev_id() => {
                 error!("DRM device was removed");
-                state.loop_signal.stop();
+                state.begin_shutdown();
             }
             _ => {}
         });
@@ -319,6 +329,9 @@ fn with_backend(state: &mut Paw2, f: impl FnOnce(&mut DirectBackend, &mut Paw2))
 }
 
 pub fn redraw(state: &mut Paw2) {
+    if crate::state::shutting_down() {
+        return;
+    }
     with_backend(state, |backend, state| backend.render(state));
 }
 
@@ -569,6 +582,18 @@ impl DirectBackend {
         info!(connector = %name, "disabled output");
     }
 
+    /// Hand the GPU back in the state the previous session left it in.
+    ///
+    /// Dropping the outputs clears each surface, and the device-wide reset
+    /// disables any connector or plane left over, so the next compositor does
+    /// not inherit a conflicting atomic state.
+    pub fn shutdown(mut self) {
+        self.outputs.clear();
+        if let Err(error) = self.manager.device_mut().reset_state() {
+            warn!(?error, "could not reset the DRM device on shutdown");
+        }
+    }
+
     fn render(&mut self, state: &mut Paw2) {
         let crtcs = self
             .outputs
@@ -627,8 +652,17 @@ impl DirectBackend {
                     && let PrimaryPlaneElement::Swapchain(element) = &frame.primary_element
                 {
                     // KMS cannot wait on this render fence, so finish it before
-                    // submitting the buffer.
-                    while element.sync.wait().is_err() {}
+                    // submitting the buffer. A fence that keeps failing means the
+                    // GPU is wedged; give up rather than spin the event loop
+                    // forever with no input and no way out.
+                    for attempt in 1..=SYNC_WAIT_ATTEMPTS {
+                        if element.sync.wait().is_ok() {
+                            break;
+                        }
+                        if attempt == SYNC_WAIT_ATTEMPTS {
+                            warn!("render fence never signalled; submitting anyway");
+                        }
+                    }
                 }
                 let feedback = state.take_presentation_feedback(&active.output, &frame.states);
                 if let Err(error) = active.kms.queue_frame(feedback) {
@@ -711,13 +745,13 @@ impl DirectBackend {
                         .damage(0, 0, crop.size.w as u32, crop.size.h as u32);
                 }
                 capture.frame.flags(Flags::empty());
-                let elapsed = state.start_time.elapsed();
-                let seconds = elapsed.as_secs();
-                capture.frame.ready(
-                    (seconds >> 32) as u32,
-                    seconds as u32,
-                    elapsed.subsec_nanos(),
-                );
+                // The same clock wp_presentation reports, not uptime: consumers
+                // line these up against audio timestamps.
+                let now = Duration::from(state.clock.now());
+                let seconds = now.as_secs();
+                capture
+                    .frame
+                    .ready((seconds >> 32) as u32, seconds as u32, now.subsec_nanos());
                 Ok(())
             })();
             if let Err(error) = result {
@@ -729,9 +763,7 @@ impl DirectBackend {
 
     fn automatic_position(&self, state: &Paw2) -> Point<i32, Logical> {
         let x = state
-            .output_geometries()
-            .into_iter()
-            .map(|(_, geometry)| geometry)
+            .output_rects()
             .map(|geometry| geometry.loc.x + geometry.size.w)
             .max()
             .unwrap_or(0);
@@ -740,9 +772,7 @@ impl DirectBackend {
 
     fn position_overlaps(&self, state: &Paw2, proposed: Rectangle<i32, Logical>) -> bool {
         state
-            .output_geometries()
-            .into_iter()
-            .map(|(_, geometry)| geometry)
+            .output_rects()
             .any(|geometry| geometry.overlaps(proposed))
     }
 

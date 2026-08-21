@@ -144,9 +144,9 @@ impl CompositorHandler for Paw2 {
             && !popup.is_initial_configure_sent()
         {
             self.unconstrain_popup(&popup);
-            popup
-                .send_configure()
-                .expect("initial popup configure failed");
+            if let Err(error) = popup.send_configure() {
+                tracing::warn!(?error, "initial popup configure failed");
+            }
         }
 
         let is_layer_surface = with_states(surface, |states| {
@@ -441,15 +441,11 @@ impl PointerConstraintsHandler for Paw2 {
 }
 
 impl IdleInhibitHandler for Paw2 {
-    fn inhibit(&mut self, surface: WlSurface) {
-        if !self.idle_inhibitors.contains(&surface) {
-            self.idle_inhibitors.push(surface);
-        }
-    }
+    // The protocol stays advertised so clients can inhibit, but Paw2 has no idle
+    // or DPMS timer for the inhibitors to suppress; there is nothing to record.
+    fn inhibit(&mut self, _surface: WlSurface) {}
 
-    fn uninhibit(&mut self, surface: WlSurface) {
-        self.idle_inhibitors.retain(|item| item != &surface);
-    }
+    fn uninhibit(&mut self, _surface: WlSurface) {}
 }
 impl OutputHandler for Paw2 {
     fn output_bound(&mut self, output: smithay::output::Output, wl_output: WlOutput) {

@@ -994,6 +994,7 @@ dependencies = [
 name = "paw2"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "smithay",
  "smithay-drm-extras",

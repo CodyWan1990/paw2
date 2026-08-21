@@ -38,11 +38,16 @@ pub fn start(handle: LoopHandle<'static, Paw2>, state: &mut Paw2) -> io::Result<
     )?;
     let display_number = xwayland.display_number();
     let display = state.display_handle.clone();
-    let xwm_handle = handle.clone();
+    // A strong `LoopHandle` stored in a source callback is a reference cycle that
+    // leaks the whole event loop, and with it XWayland and the libseat session.
+    let xwm_handle = handle.downgrade();
     handle
         .insert_source(xwayland, move |event, _, state| match event {
             XWaylandEvent::Ready { x11_socket, .. } => {
-                match X11Wm::start_wm(xwm_handle.clone(), &display, x11_socket, client.clone()) {
+                let Some(loop_handle) = xwm_handle.upgrade() else {
+                    return;
+                };
+                match X11Wm::start_wm(loop_handle, &display, x11_socket, client.clone()) {
                     Ok(xwm) => {
                         state.xwm = Some(xwm);
                         tracing::info!(display = display_number, "XWayland ready");

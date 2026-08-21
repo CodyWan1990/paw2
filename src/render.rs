@@ -24,7 +24,6 @@ use smithay::{
         space_render_elements,
     },
     output::{Output, OutputNoMode},
-    reexports::wayland_server::Resource,
     utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform, user_data::UserDataMap},
     wayland::{
         background_effect::BackgroundEffectSurfaceCachedState,
@@ -330,6 +329,12 @@ impl Effects {
         state.advance_animations();
         let scale = Scale::from(output.current_scale().fractional_scale());
         if let Some(window) = state.fullscreen_window(output).cloned() {
+            // A suspended output is unmapped from its space but still owns the
+            // fullscreen window, so its geometry can be gone.
+            let Some(output_size) = state.output_geometry(output).map(|geometry| geometry.size)
+            else {
+                return Ok(Vec::new());
+            };
             let layers = smithay::desktop::layer_map_for_output(output);
             let mut elements = layers
                 .layers()
@@ -366,7 +371,6 @@ impl Effects {
                     })
                     .map(PawRenderElements::Cursor),
             );
-            let output_size = state.output_geometry(output).unwrap().size;
             elements.extend(
                 constrain_space_element::<_, _, FullscreenElement, _, _>(
                     renderer,
@@ -387,8 +391,9 @@ impl Effects {
             return Ok(elements);
         }
 
-        state.blur_surfaces.retain(Resource::is_alive);
-        let space = state.space_for_output(output).unwrap();
+        let Some(space) = state.space_for_output(output) else {
+            return Ok(Vec::new());
+        };
         let space_elements = space_render_elements(renderer, [space], output, 1.0)?;
         let output_bounds = Rectangle::from_size(
             output

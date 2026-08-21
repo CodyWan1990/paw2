@@ -707,13 +707,13 @@ impl Paw2 {
     }
 
     pub fn focus_output_at(&mut self, position: Point<f64, Logical>) {
-        let name = self
-            .output_geometries()
-            .into_iter()
-            .find_map(|(name, geometry)| geometry.to_f64().contains(position).then_some(name));
-        if let Some(name) = name
-            && self.scroller.set_focused_output(&name)
-        {
+        let Some(name) = self
+            .monitor_at(position)
+            .map(|monitor| monitor.output.name())
+        else {
+            return;
+        };
+        if self.scroller.set_focused_output(&name) {
             self.sync_focus();
         }
     }
@@ -1093,14 +1093,16 @@ impl Paw2 {
         tracing::info!("window left fullscreen");
     }
 
-    fn toggle_fullscreen(&mut self) -> bool {
+    /// Both branches relayout and refocus themselves, and the redraw arrives with
+    /// the client's configure-commit, so `run_action` has nothing left to do.
+    fn toggle_fullscreen(&mut self) {
         let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
             let workspace = scroller.active();
             workspace
                 .focused
                 .map(|index| workspace.windows[index].clone())
         }) else {
-            return false;
+            return;
         };
         let is_fullscreen = self
             .scroller
@@ -1113,7 +1115,6 @@ impl Paw2 {
         } else {
             self.fullscreen_managed_window(window, None);
         }
-        false
     }
 
     pub fn run_action(&mut self, action: Action) {
@@ -1160,7 +1161,10 @@ impl Paw2 {
                 }
                 false
             }
-            Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::ToggleFullscreen => {
+                self.toggle_fullscreen();
+                false
+            }
             Action::FocusMonitorLeft => self.change_monitor(Direction::Left, false),
             Action::FocusMonitorRight => self.change_monitor(Direction::Right, false),
             Action::FocusMonitorUp => self.change_monitor(Direction::Up, false),
@@ -1186,7 +1190,7 @@ impl Paw2 {
                 false
             }
             Action::Quit => {
-                self.loop_signal.stop();
+                self.begin_shutdown();
                 false
             }
         };
@@ -1207,16 +1211,17 @@ impl Paw2 {
     }
 
     fn change_workspace(&mut self, delta: i32, move_window: bool) -> bool {
-        let Some(scroller) = self.scroller.focused_mut() else {
-            return false;
+        let target = {
+            let Some(scroller) = self.scroller.focused_mut() else {
+                return false;
+            };
+            let target = workspace_neighbor(scroller.active_workspace, delta);
+            if !move_window {
+                return scroller.switch_workspace(target);
+            }
+            target
         };
-        let target = workspace_neighbor(scroller.active_workspace, delta);
-        if move_window {
-            let _ = scroller;
-            self.move_focused_to_workspace(target)
-        } else {
-            scroller.switch_workspace(target)
-        }
+        self.move_focused_to_workspace(target)
     }
 
     fn move_focused_to_workspace(&mut self, workspace: usize) -> bool {
@@ -1355,6 +1360,16 @@ impl Paw2 {
             .collect()
     }
 
+    /// Output rectangles without their names, for callers that only need geometry.
+    /// `output_geometries` clones a `String` per output, and the pointer path runs
+    /// on every motion event.
+    pub fn output_rects(&self) -> impl Iterator<Item = Rectangle<i32, Logical>> + '_ {
+        self.scroller
+            .monitors
+            .iter()
+            .filter_map(|monitor| monitor.space.output_geometry(&monitor.output))
+    }
+
     pub fn output_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
         let monitor = self.scroller.monitor(&output.name())?;
         monitor.space.output_geometry(&monitor.output)
@@ -1429,6 +1444,9 @@ impl Paw2 {
     /// Output-relative geometry and effective opacity for a rendered element,
     /// or `None` when the element is not a window's root surface. Matches only
     /// root surfaces, so subsurfaces fall through untouched.
+    // ponytail: linear scan per element, so O(n^2) per frame in window count.
+    // Never runs on the fullscreen path and n is small; index by surface id if a
+    // workspace ever holds enough windows for it to show up in a profile.
     pub fn window_render_state(
         &self,
         output: &Output,
@@ -1451,34 +1469,35 @@ impl Paw2 {
         Some((geometry, self.config.appearance.window_opacity() * fade))
     }
 
-    pub fn pre_repaint(&mut self, output: &Output, frame_target: Time<Monotonic>) {
-        let clients = {
-            let mut clients = Vec::<Client>::new();
-            let mut signal =
-                |surface: &WlSurface, states: &smithay::wayland::compositor::SurfaceData| {
-                    let Some(commit_timer) =
-                        states.data_map.get::<CommitTimerBarrierStateUserData>()
-                    else {
-                        return;
-                    };
-                    commit_timer.lock().unwrap().signal_until(frame_target);
-                    if let Some(client) = surface.client()
-                        && !clients.iter().any(|known| known.id() == client.id())
-                    {
-                        clients.push(client);
-                    }
-                };
-            if let Some(space) = self.space_for_output(output) {
-                for window in space.elements() {
-                    window.with_surfaces(&mut signal);
+    /// Runs `ready` over every surface on the output and clears the commit
+    /// blocker of each distinct client whose surface reported `true`.
+    fn unblock_surfaces(
+        &mut self,
+        output: &Output,
+        mut ready: impl FnMut(&WlSurface, &smithay::wayland::compositor::SurfaceData) -> bool,
+    ) {
+        let mut clients = Vec::<Client>::new();
+        let mut collect =
+            |surface: &WlSurface, states: &smithay::wayland::compositor::SurfaceData| {
+                if !ready(surface, states) {
+                    return;
                 }
+                if let Some(client) = surface.client()
+                    && !clients.iter().any(|known| known.id() == client.id())
+                {
+                    clients.push(client);
+                }
+            };
+        if let Some(space) = self.space_for_output(output) {
+            for window in space.elements() {
+                window.with_surfaces(&mut collect);
             }
-            let layers = layer_map_for_output(output);
-            for layer in layers.layers() {
-                layer.with_surfaces(&mut signal);
-            }
-            clients
-        };
+        }
+        let layers = layer_map_for_output(output);
+        for layer in layers.layers() {
+            layer.with_surfaces(&mut collect);
+        }
+        drop(layers);
 
         let display_handle = self.display_handle.clone();
         for client in clients {
@@ -1487,53 +1506,52 @@ impl Paw2 {
         }
     }
 
+    pub fn pre_repaint(&mut self, output: &Output, frame_target: Time<Monotonic>) {
+        self.unblock_surfaces(output, |_, states| {
+            let Some(commit_timer) = states.data_map.get::<CommitTimerBarrierStateUserData>()
+            else {
+                return false;
+            };
+            commit_timer.lock().unwrap().signal_until(frame_target);
+            true
+        });
+    }
+
     pub fn send_frames(&mut self, output: &Output) {
         let time = self.start_time.elapsed();
-        let clients = {
-            let mut clients = Vec::<Client>::new();
-            let mut signal =
-                |surface: &WlSurface, states: &smithay::wayland::compositor::SurfaceData| {
-                    if surface_primary_scanout_output(surface, states)
-                        .as_ref()
-                        .is_none_or(|primary| primary == output)
-                        && let Some(barrier) = states
-                            .cached_state
-                            .get::<FifoBarrierCachedState>()
-                            .current()
-                            .barrier
-                            .take()
-                    {
-                        barrier.signal();
-                        if let Some(client) = surface.client()
-                            && !clients.iter().any(|known| known.id() == client.id())
-                        {
-                            clients.push(client);
-                        }
-                    }
-                };
-            if let Some(space) = self.space_for_output(output) {
-                for window in space.elements() {
-                    window.with_surfaces(&mut signal);
-                    window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
-                        Some(output.clone())
-                    });
-                }
-            }
-            let layers = layer_map_for_output(output);
-            for layer in layers.layers() {
-                layer.with_surfaces(&mut signal);
-                layer.send_frame(output, time, Some(Duration::ZERO), |_, _| {
+        if let Some(space) = self.space_for_output(output) {
+            for window in space.elements() {
+                window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
                     Some(output.clone())
                 });
             }
-            clients
-        };
-
-        let display_handle = self.display_handle.clone();
-        for client in clients {
-            self.client_compositor_state(&client)
-                .blocker_cleared(self, &display_handle);
         }
+        let layers = layer_map_for_output(output);
+        for layer in layers.layers() {
+            layer.send_frame(output, time, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+        drop(layers);
+
+        self.unblock_surfaces(output, |surface, states| {
+            if surface_primary_scanout_output(surface, states)
+                .is_some_and(|primary| primary != *output)
+            {
+                return false;
+            }
+            let barrier = states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take();
+            let Some(barrier) = barrier else {
+                return false;
+            };
+            barrier.signal();
+            true
+        });
     }
 
     pub fn take_presentation_feedback(
@@ -1588,7 +1606,9 @@ impl Paw2 {
             monitor.space.refresh();
         }
         self.popups.cleanup();
-        self.idle_inhibitors.retain(Resource::is_alive);
+        // Pruned here rather than while collecting elements: the fullscreen path
+        // returns before that, and a game can stay fullscreen for hours.
+        self.blur_surfaces.retain(Resource::is_alive);
     }
 
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<&Window> {

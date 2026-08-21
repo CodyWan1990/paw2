@@ -113,13 +113,20 @@ fn executable_id(path: &Path) -> Option<ExecutableId> {
 }
 
 fn trusted_client(client: &Client, display: &DisplayHandle, trusted: &[ExecutableId]) -> bool {
-    client
-        .get_credentials(display)
-        .ok()
-        .and_then(|credentials| {
-            executable_id(&PathBuf::from(format!("/proc/{}/exe", credentials.pid)))
-        })
-        .is_some_and(|executable| trusted.contains(&executable))
+    let Ok(credentials) = client.get_credentials(display) else {
+        return false;
+    };
+    let allowed = executable_id(&PathBuf::from(format!("/proc/{}/exe", credentials.pid)))
+        .is_some_and(|executable| trusted.contains(&executable));
+    if !allowed {
+        // `trusted` is a startup snapshot, so a portal package upgrade that changes
+        // the binary's inode surfaces here rather than as a silent capture failure.
+        tracing::debug!(
+            pid = credentials.pid,
+            "screencopy denied to untrusted client"
+        );
+    }
+    allowed
 }
 
 type GlobalData = (DisplayHandle, Arc<Vec<ExecutableId>>);
@@ -216,7 +223,7 @@ impl Paw2 {
         }));
         let frame = data_init.init(frame, data);
         let data = frame.data::<FrameData>().unwrap().0.lock().unwrap();
-        if data.output.is_some() {
+        if data.output.is_some() && frame.version() >= 3 {
             frame.linux_dmabuf(
                 data.format as u32,
                 data.region.size.w as u32,

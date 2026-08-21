@@ -3,7 +3,13 @@ name = "paw2"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
+# Only for installing the SIGTERM/SIGINT handlers; rustix has no stable sigaction.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 tracing = "0.1"

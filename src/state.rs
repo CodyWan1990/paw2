@@ -1,4 +1,11 @@
-use std::{ffi::OsString, sync::Arc, time::Instant};
+use std::{
+    ffi::OsString,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use smithay::{
     desktop::PopupManager,
@@ -79,7 +86,6 @@ pub struct Paw2 {
     pub blur_surfaces: Vec<WlSurface>,
     pub cursor_status: smithay::input::pointer::CursorImageStatus,
     pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
-    pub idle_inhibitors: Vec<WlSurface>,
     pub direct: Option<crate::drm::DirectBackend>,
     pub config: Config,
     pub scroller: Scrollers,
@@ -88,6 +94,25 @@ pub struct Paw2 {
     pub pending_wheel_action: Option<Action>,
     pub workspace_state: WorkspaceState,
     pub screencopy_state: ScreencopyState,
+}
+
+/// Whether the compositor is on its way out.
+///
+/// This is a global rather than a field on [`Paw2`] because the `SIGTERM`
+/// handler has to set it too, and a signal handler cannot reach the state.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Mark the compositor as shutting down without stopping the event loop; only
+/// the signal handler needs this, everything else calls [`Paw2::begin_shutdown`].
+pub fn start_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+}
+
+/// Once this is true nothing may queue another page flip: a frame submitted
+/// after the last dispatch is never acknowledged, and the outstanding flip makes
+/// the DRM state restore fail with `EBUSY`.
+pub fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(Ordering::Relaxed)
 }
 
 impl Paw2 {
@@ -162,7 +187,6 @@ impl Paw2 {
             blur_surfaces: Vec::new(),
             cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
             cursor_position_hint: None,
-            idle_inhibitors: Vec::new(),
             direct: None,
             config,
             scroller: Scrollers::default(),
@@ -172,6 +196,13 @@ impl Paw2 {
             workspace_state,
             screencopy_state,
         }
+    }
+
+    /// Every exit path goes through here so shutdown behaves the same whether it
+    /// was a keybinding, a lost device, or a closed nested window.
+    pub fn begin_shutdown(&mut self) {
+        start_shutdown();
+        self.loop_signal.stop();
     }
 
     pub fn enable_background_effects(&mut self) {
@@ -188,10 +219,14 @@ impl Paw2 {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, state| {
-                state
+                // Refusing one client must never end the session: hitting the
+                // open-file limit is recoverable, losing every running program is not.
+                if let Err(error) = state
                     .display_handle
                     .insert_client(stream, Arc::new(ClientState::default()))
-                    .expect("failed to accept Wayland client");
+                {
+                    tracing::warn!(?error, "failed to accept Wayland client");
+                }
             })
             .expect("failed to listen for Wayland clients");
 

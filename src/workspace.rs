@@ -32,10 +32,35 @@ struct OutputInstance {
     workspaces: Vec<ExtWorkspaceHandleV1>,
 }
 
-struct PendingActivation {
-    manager: ExtWorkspaceManagerV1,
+struct PendingActivation<M = ExtWorkspaceManagerV1> {
+    manager: M,
     output: String,
     workspace: usize,
+}
+
+/// Keeps one pending activation per manager and output: a repeat replaces the
+/// earlier request, which is all commit would have kept anyway. Without this a
+/// client that activates but never commits grows `pending` without bound.
+///
+/// Generic over the manager purely so the bound can be unit tested without a
+/// Wayland display, for the same reason `Column<T>` in `layout` is generic.
+fn record_activation<M: Clone + PartialEq>(
+    pending: &mut Vec<PendingActivation<M>>,
+    manager: &M,
+    output: &str,
+    workspace: usize,
+) {
+    match pending
+        .iter_mut()
+        .find(|item| item.manager == *manager && item.output == output)
+    {
+        Some(existing) => existing.workspace = workspace,
+        None => pending.push(PendingActivation {
+            manager: manager.clone(),
+            output: output.into(),
+            workspace,
+        }),
+    }
 }
 
 #[derive(Clone)]
@@ -223,21 +248,11 @@ impl Dispatch<ExtWorkspaceManagerV1, ()> for Paw2 {
     ) {
         match request {
             ext_workspace_manager_v1::Request::Commit => {
-                let pending = std::mem::take(&mut state.workspace_state.pending);
-                let mut requested: Vec<PendingActivation> = Vec::new();
-                for request in pending {
-                    if request.manager != *manager {
-                        state.workspace_state.pending.push(request);
-                        continue;
-                    }
-                    match requested
-                        .iter_mut()
-                        .find(|item| item.output == request.output)
-                    {
-                        Some(existing) => *existing = request,
-                        None => requested.push(request),
-                    }
-                }
+                let requested = state
+                    .workspace_state
+                    .pending
+                    .extract_if(.., |request| request.manager == *manager)
+                    .collect::<Vec<_>>();
                 for request in requested {
                     state.activate_workspace(&request.output, request.workspace);
                 }
@@ -272,11 +287,32 @@ impl Dispatch<ExtWorkspaceHandleV1, WorkspaceData> for Paw2 {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         if matches!(request, ext_workspace_handle_v1::Request::Activate) {
-            state.workspace_state.pending.push(PendingActivation {
-                manager: data.manager.clone(),
-                output: data.output.clone(),
-                workspace: data.workspace,
-            });
+            record_activation(
+                &mut state.workspace_state.pending,
+                &data.manager,
+                &data.output,
+                data.workspace,
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_activations_stay_one_per_manager_and_output() {
+        let mut pending = Vec::<PendingActivation<u8>>::new();
+        for workspace in 0..1_000 {
+            record_activation(&mut pending, &1, "DP-1", workspace % WORKSPACE_COUNT);
+        }
+        record_activation(&mut pending, &1, "DP-2", 3);
+        record_activation(&mut pending, &2, "DP-1", 4);
+
+        // A client that never commits cannot grow this past managers x outputs.
+        assert_eq!(pending.len(), 3);
+        // The last request for a slot is the one that survives.
+        assert_eq!(pending[0].workspace, 999 % WORKSPACE_COUNT);
     }
 }
