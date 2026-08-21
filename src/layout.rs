@@ -377,6 +377,16 @@ impl Workspace {
         column.width = Some(adjusted);
         true
     }
+
+    fn adjust_row_height(&mut self, delta: f64) -> bool {
+        let Some(column) = self
+            .focused_column()
+            .and_then(|index| self.columns.get_mut(index))
+        else {
+            return false;
+        };
+        adjust_row_weights(column, delta)
+    }
 }
 
 fn column_insertion_index(focused: Option<usize>, column_count: usize) -> usize {
@@ -508,6 +518,31 @@ fn resized_row_weights(
             .map(|height| (height - minimum).max(0.0))
             .collect(),
     )
+}
+
+fn adjust_row_weights<T>(column: &mut Column<T>, delta: f64) -> bool {
+    if column.windows.len() < 2 {
+        return false;
+    }
+    let focused = column.focused;
+    let neighbor = if focused + 1 < column.windows.len() {
+        focused + 1
+    } else {
+        focused - 1
+    };
+    let amount = column.row_weights.iter().sum::<f64>() * delta.abs();
+    let (from, to) = if delta < 0.0 {
+        (focused, neighbor)
+    } else {
+        (neighbor, focused)
+    };
+    let moved = column.row_weights[from].min(amount);
+    if moved <= 0.0 {
+        return false;
+    }
+    column.row_weights[from] -= moved;
+    column.row_weights[to] += moved;
+    true
 }
 
 struct Scroller {
@@ -1725,6 +1760,12 @@ impl Paw2 {
             Action::IncreaseColumnWidth => {
                 let default = self.config.layout.column_width;
                 self.layout_action(|workspace| workspace.adjust_column_width(default, 0.05))
+            }
+            Action::DecreaseRowHeight => {
+                self.layout_action(|workspace| workspace.adjust_row_height(-0.05))
+            }
+            Action::IncreaseRowHeight => {
+                self.layout_action(|workspace| workspace.adjust_row_height(0.05))
             }
             Action::ToggleFloating => self.toggle_floating(),
             Action::CloseWindow => {
@@ -3213,6 +3254,30 @@ mod tests {
         ];
         assert!(consume_or_expel_columns(&mut columns, 1, -1));
         assert_eq!(columns[0].row_weights, [2.0, 4.0, 3.0]);
+
+        let mut column = Column {
+            windows: vec![1, 2, 3],
+            row_weights: vec![1.0, 1.0, 1.0],
+            focused: 1,
+            width: None,
+        };
+        assert!(adjust_row_weights(&mut column, -0.05));
+        assert!((column.row_weights[1] - 0.85).abs() < f64::EPSILON);
+        assert!((column.row_weights[2] - 1.15).abs() < f64::EPSILON);
+        assert!(adjust_row_weights(&mut column, 0.05));
+        assert!(
+            column
+                .row_weights
+                .iter()
+                .zip([1.0, 1.0, 1.0])
+                .all(|(actual, expected)| (actual - expected).abs() < f64::EPSILON)
+        );
+        column.focused = 2;
+        assert!(adjust_row_weights(&mut column, 0.05));
+        assert!((column.row_weights.iter().sum::<f64>() - 3.0).abs() < f64::EPSILON);
+        column.row_weights[2] = 0.0;
+        assert!(!adjust_row_weights(&mut column, -0.05));
+        assert!(!adjust_row_weights(&mut Column::new(1), 0.05));
     }
 
     #[test]

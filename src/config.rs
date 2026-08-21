@@ -96,13 +96,17 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
+increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
+decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Down"]
+increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Up"]
 toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
-focus_monitor_up = ["Super+Ctrl+Up"]
-focus_monitor_down = ["Super+Ctrl+Down"]
+focus_monitor_up = []
+focus_monitor_down = []
 move_to_monitor_left = ["Super+Shift+comma"]
 move_to_monitor_right = ["Super+Shift+period"]
 move_to_monitor_up = ["Super+Ctrl+Shift+Up"]
@@ -146,6 +150,8 @@ pub enum Action {
     CycleColumnWidth,
     DecreaseColumnWidth,
     IncreaseColumnWidth,
+    DecreaseRowHeight,
+    IncreaseRowHeight,
     ToggleFloating,
     CloseWindow,
     ToggleFullscreen,
@@ -542,13 +548,15 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
     ("decrease_column_width",  Action::DecreaseColumnWidth,  ""),
     ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
+    ("decrease_row_height",    Action::DecreaseRowHeight,    ""),
+    ("increase_row_height",    Action::IncreaseRowHeight,    ""),
     ("toggle_floating",        Action::ToggleFloating,       "Super+Shift+space"),
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
     ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
     ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
     ("focus_monitor_right",    Action::FocusMonitorRight,    "Super+period"),
-    ("focus_monitor_up",       Action::FocusMonitorUp,       "Super+Ctrl+Up"),
-    ("focus_monitor_down",     Action::FocusMonitorDown,     "Super+Ctrl+Down"),
+    ("focus_monitor_up",       Action::FocusMonitorUp,       ""),
+    ("focus_monitor_down",     Action::FocusMonitorDown,     ""),
     ("move_to_monitor_left",   Action::MoveToMonitorLeft,    "Super+Shift+comma"),
     ("move_to_monitor_right",  Action::MoveToMonitorRight,   "Super+Shift+period"),
     ("move_to_monitor_up",     Action::MoveToMonitorUp,      "Super+Ctrl+Shift+Up"),
@@ -976,7 +984,7 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 55);
+        assert_eq!(config.bindings.len(), 61);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -1003,6 +1011,28 @@ mod tests {
                 xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
             ),
             None
+        );
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    ctrl: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("k", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::DecreaseRowHeight)
+        );
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    ctrl: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("Down", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::IncreaseRowHeight)
         );
         assert!(!config.input.focus_follows_mouse);
         assert!(config.input.middle_click_paste);
@@ -1179,8 +1209,12 @@ mod tests {
                 "focus_left = [\"Super+h\", \"Super+Left\", \"Super+WheelScrollUp\"]",
             )
             .replace(
-                "cycle_column_width = [\"Super+backslash\"]",
-                "cycle_column_width = [\"Super+backslash\"]\ndecrease_column_width = [\"Ctrl+Alt+WheelScrollDown\"]\nincrease_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
+                "decrease_column_width = [\"Super+Ctrl+h\", \"Super+Ctrl+Left\"]",
+                "decrease_column_width = [\"Ctrl+Alt+WheelScrollDown\"]",
+            )
+            .replace(
+                "increase_column_width = [\"Super+Ctrl+l\", \"Super+Ctrl+Right\"]",
+                "increase_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
             );
         let config = parse(&wheel_bindings).unwrap();
         assert_eq!(
@@ -1266,7 +1300,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 55);
+        assert_eq!(legacy.bindings.len(), 61);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -1298,7 +1332,26 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 50);
+        assert_eq!(config.bindings.len(), 48);
+
+        let old_monitor_bindings = DEFAULT_CONFIG
+            .replace(
+                "decrease_row_height = [\"Super+Ctrl+k\", \"Super+Ctrl+Up\"]\n",
+                "",
+            )
+            .replace(
+                "increase_row_height = [\"Super+Ctrl+j\", \"Super+Ctrl+Down\"]\n",
+                "",
+            )
+            .replace(
+                "focus_monitor_up = []",
+                "focus_monitor_up = [\"Super+Ctrl+Up\"]",
+            )
+            .replace(
+                "focus_monitor_down = []",
+                "focus_monitor_down = [\"Super+Ctrl+Down\"]",
+            );
+        assert!(parse(&old_monitor_bindings).is_ok());
 
         let invalid_workspaces = DEFAULT_CONFIG.replace(
             "  [\"Super+7\"], [\"Super+8\"], [\"Super+9\"],\n]",

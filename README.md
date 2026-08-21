@@ -137,13 +137,17 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
+increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
+decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
+increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
 toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
-focus_monitor_up = ["Super+Ctrl+Up"]
-focus_monitor_down = ["Super+Ctrl+Down"]
+focus_monitor_up = []
+focus_monitor_down = []
 move_to_monitor_left = ["Super+Shift+comma"]
 move_to_monitor_right = ["Super+Shift+period"]
 move_to_monitor_up = ["Super+Ctrl+Shift+Up"]
@@ -183,6 +187,9 @@ rows, with a 48 logical pixel minimum. A tiled window's left or right edge
 resizes its column. Standalone columns and floating windows can be dragged
 between monitors. `toggle_floating` detaches only the focused window from a
 stack and tiles it again at the pointer position.
+The `Super+Ctrl` arrow or Vim bindings resize the focused column or stacked row
+by 5%; vertical monitor focus remains available through `focus_monitor_up` and
+`focus_monitor_down` if configured.
 Appearance sizes are logical
 pixels; set the ring width or blur radius to `0` to disable that feature. Transparency and blur are
 applied automatically to normal window areas that clients do not declare
