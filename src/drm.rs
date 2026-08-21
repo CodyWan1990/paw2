@@ -16,16 +16,16 @@ use smithay::{
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Bind, ImportDma, ImportEgl, ImportMemWl,
+            Bind, BufferType, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen, buffer_type,
             damage::OutputDamageTracker,
             element::{
-                AsRenderElements, Kind,
+                AsRenderElements, Kind, RenderElement,
                 memory::MemoryRenderBufferRenderElement,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::WaylandSurfaceRenderElement,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement},
             },
-            gles::GlesRenderer,
+            gles::{GlesRenderer, GlesTarget, GlesTexture},
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
@@ -42,15 +42,18 @@ use smithay::{
         input::Libinput,
         rustix::fs::OFlags,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
-        wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::Flags,
-        wayland_server::backend::GlobalId,
+        wayland_server::{backend::GlobalId, protocol::wl_shm},
     },
-    utils::{DeviceFd, IsAlive, Logical, Monotonic, Point, Rectangle, Scale, Time, Transform},
+    utils::{
+        DeviceFd, IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time,
+        Transform,
+    },
     wayland::{
         compositor,
-        dmabuf::DmabufFeedbackBuilder,
+        dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
         presentation::Refresh,
+        shm::{with_buffer_contents, with_buffer_contents_mut},
     },
 };
 use smithay_drm_extras::{display_info, drm_scanner::DrmScanner};
@@ -59,6 +62,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::{MonitorConfig, VrrPolicy},
     render::{Effects, PawRenderElements, clear_color},
+    screencopy::CaptureTarget,
     state::Paw2,
 };
 
@@ -67,9 +71,80 @@ type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
 type FrameFeedback = OutputPresentationFeedback;
 type KmsOutput = DrmOutput<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
 type OutputManager = DrmOutputManager<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
+type CaptureRenderElement = RelocateRenderElement<CropRenderElement<PawRenderElements>>;
+
+struct CaptureScene {
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    elements: Vec<CaptureRenderElement>,
+    clear: [f32; 4],
+}
 
 /// How many times to retry a render fence before declaring the GPU wedged.
 const SYNC_WAIT_ATTEMPTS: u32 = 8;
+
+fn render_capture_frame<E>(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut GlesTarget<'_>,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    elements: &[E],
+    clear: [f32; 4],
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    E: RenderElement<GlesRenderer>,
+{
+    let mut tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+    tracker
+        .render_output(renderer, framebuffer, 0, elements, clear)?
+        .sync
+        .wait()?;
+    Ok(())
+}
+
+fn copy_to_shm(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    pixels: &[u8],
+    size: Size<i32, Physical>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let row_bytes = usize::try_from(size.w)? * 4;
+    let height = usize::try_from(size.h)?;
+    if pixels.len() < row_bytes * height {
+        return Err("renderer returned a short screenshot".into());
+    }
+    let copied = with_buffer_contents_mut(buffer, |pointer, length, data| {
+        let Ok(offset) = usize::try_from(data.offset) else {
+            return false;
+        };
+        let Ok(stride) = usize::try_from(data.stride) else {
+            return false;
+        };
+        if stride < row_bytes
+            || offset
+                .checked_add(stride.saturating_mul(height.saturating_sub(1)))
+                .and_then(|last_row| last_row.checked_add(row_bytes))
+                .is_none_or(|required| required > length)
+        {
+            return false;
+        }
+        for row in 0..height {
+            // The pool can be concurrently mapped by the client, so copy bytes
+            // directly instead of creating a Rust reference to shared memory.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pixels.as_ptr().add(row * row_bytes),
+                    pointer.add(offset + row * stride),
+                    row_bytes,
+                );
+            }
+        }
+        true
+    })?;
+    if !copied {
+        return Err("screenshot SHM buffer is too small".into());
+    }
+    Ok(())
+}
 
 struct ActiveOutput {
     connector: connector::Handle,
@@ -152,7 +227,7 @@ pub fn init(
         device,
         allocator,
         exporter,
-        Some(gbm),
+        Some(gbm.clone()),
         [Fourcc::Argb8888, Fourcc::Abgr8888],
         formats,
     );
@@ -408,6 +483,26 @@ fn update_vrr(output: &mut ActiveOutput, fullscreen: bool) {
 }
 
 impl DirectBackend {
+    pub(crate) fn render_node(&self) -> DrmNode {
+        self.node
+    }
+
+    pub(crate) fn capture_formats(&self) -> Vec<(Fourcc, Vec<Modifier>)> {
+        let mut formats = Vec::<(Fourcc, Vec<Modifier>)>::new();
+        for format in self.renderer.egl_context().dmabuf_render_formats().iter() {
+            if !matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Argb8888) {
+                continue;
+            }
+            if let Some((_, modifiers)) = formats.iter_mut().find(|(code, _)| *code == format.code)
+            {
+                modifiers.push(format.modifier);
+            } else {
+                formats.push((format.code, vec![format.modifier]));
+            }
+        }
+        formats
+    }
+
     fn rescan(&mut self, state: &mut Paw2) -> Result<(), Box<dyn std::error::Error>> {
         let scan = self.scanner.scan_connectors(self.manager.device())?;
         // A changed connector keeps its layout; a disconnected one hands it over.
@@ -696,69 +791,167 @@ impl DirectBackend {
     }
 
     fn capture_output(&mut self, state: &mut Paw2, output: &Output) {
-        let captures = state.screencopy_state.take_for_output(output);
-        for mut capture in captures {
-            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                if state.output_geometry(output).is_none() {
-                    return Err("capture output disappeared".into());
-                }
-                let mut elements =
-                    self.effects
-                        .output_elements(&mut self.renderer, state, output)?;
-                if capture.overlay_cursor {
-                    Self::add_cursor(
-                        &mut self.renderer,
-                        &self.cursor,
-                        &self.cursor_fallback,
-                        state,
-                        output,
-                        &mut elements,
-                    );
-                }
-                let scale = Scale::from(output.current_scale().fractional_scale());
-                let crop = capture.region;
-                let elements = elements
-                    .into_iter()
-                    .filter_map(|element| CropRenderElement::from_element(element, scale, crop))
-                    .map(|element| {
-                        RelocateRenderElement::from_element(
-                            element,
-                            (-crop.loc.x, -crop.loc.y),
-                            Relocate::Relative,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let mut framebuffer = self.renderer.bind(&mut capture.buffer)?;
-                let mut tracker = OutputDamageTracker::new(crop.size, scale, Transform::Normal);
-                let fullscreen = state.fullscreen_window(output).is_some();
-                let result = tracker.render_output(
-                    &mut self.renderer,
-                    &mut framebuffer,
-                    0,
-                    &elements,
-                    clear_color(fullscreen),
-                )?;
-                result.sync.wait()?;
-                if capture.with_damage {
-                    capture
-                        .frame
-                        .damage(0, 0, crop.size.w as u32, crop.size.h as u32);
-                }
-                capture.frame.flags(Flags::empty());
-                // The same clock wp_presentation reports, not uptime: consumers
-                // line these up against audio timestamps.
-                let now = Duration::from(state.clock.now());
-                let seconds = now.as_secs();
-                capture
-                    .frame
-                    .ready((seconds >> 32) as u32, seconds as u32, now.subsec_nanos());
-                Ok(())
-            })();
+        let mut captures = state.screencopy_state.take_for_output(output);
+        if self
+            .outputs
+            .first()
+            .is_some_and(|active| active.output == *output)
+        {
+            captures.extend(state.screencopy_state.take_window_captures());
+        }
+        for capture in captures {
+            let result = self.render_capture(state, capture);
             if let Err(error) = result {
-                warn!(?error, "failed to capture output");
-                capture.frame.failed();
+                warn!(?error, "failed to capture image");
             }
         }
+    }
+
+    fn render_capture(
+        &mut self,
+        state: &mut Paw2,
+        capture: crate::screencopy::PendingCapture,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let scene = self.capture_scene(state, &capture.target, capture.draw_cursor)?;
+        let size = scene.size;
+        let buffer = capture.frame.buffer();
+        match buffer_type(&buffer) {
+            Some(BufferType::Dma) => {
+                let mut dmabuf = get_dmabuf(&buffer)?.clone();
+                let mut framebuffer = self.renderer.bind(&mut dmabuf)?;
+                render_capture_frame(
+                    &mut self.renderer,
+                    &mut framebuffer,
+                    scene.size,
+                    scene.scale,
+                    &scene.elements,
+                    scene.clear,
+                )?;
+            }
+            Some(BufferType::Shm) => {
+                let data = with_buffer_contents(&buffer, |_, _, data| data)?;
+                let format = match data.format {
+                    wl_shm::Format::Xrgb8888 => Fourcc::Xrgb8888,
+                    wl_shm::Format::Argb8888 => Fourcc::Argb8888,
+                    _ => return Err("unsupported screenshot SHM format".into()),
+                };
+                let mut texture = Offscreen::<GlesTexture>::create_buffer(
+                    &mut self.renderer,
+                    format,
+                    (scene.size.w, scene.size.h).into(),
+                )?;
+                let mut framebuffer = self.renderer.bind(&mut texture)?;
+                render_capture_frame(
+                    &mut self.renderer,
+                    &mut framebuffer,
+                    scene.size,
+                    scene.scale,
+                    &scene.elements,
+                    scene.clear,
+                )?;
+                let mapping = self.renderer.copy_framebuffer(
+                    &framebuffer,
+                    Rectangle::from_size((scene.size.w, scene.size.h).into()),
+                    format,
+                )?;
+                let pixels = self.renderer.map_texture(&mapping)?;
+                copy_to_shm(&buffer, pixels, scene.size)?;
+            }
+            _ => return Err("unsupported screenshot buffer".into()),
+        }
+
+        let now = Duration::from(state.clock.now());
+        capture.frame.success(
+            Transform::Normal,
+            vec![Rectangle::<i32, smithay::utils::Buffer>::from_size(
+                (size.w, size.h).into(),
+            )],
+            now,
+        );
+        Ok(())
+    }
+
+    fn capture_scene(
+        &mut self,
+        state: &mut Paw2,
+        target: &CaptureTarget,
+        draw_cursor: bool,
+    ) -> Result<CaptureScene, Box<dyn std::error::Error>> {
+        let (target_output, scale, crop, mut elements, clear) = match target {
+            CaptureTarget::Output(target) => {
+                let output = target.upgrade().ok_or("capture output disappeared")?;
+                let geometry = state
+                    .output_geometry(&output)
+                    .ok_or("capture output disappeared")?;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let crop = Rectangle::from_size(geometry.size)
+                    .to_f64()
+                    .to_physical(scale)
+                    .to_i32_round();
+                let elements = self
+                    .effects
+                    .output_elements(&mut self.renderer, state, &output)?;
+                let clear = clear_color(state.fullscreen_window(&output).is_some());
+                (output, scale, crop, elements, clear)
+            }
+            CaptureTarget::Window(target) => {
+                let window = target.upgrade().ok_or("capture window disappeared")?;
+                let output = state
+                    .capture_output_for_window(&window)
+                    .ok_or("capture window is not on an output")?;
+                let output_geometry = state
+                    .output_geometry(&output)
+                    .ok_or("capture output disappeared")?;
+                let window_location = state
+                    .capture_window_location(&window)
+                    .ok_or("capture window is not mapped")?;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let bbox = window.bbox_with_popups();
+                let crop =
+                    Rectangle::new(window_location + bbox.loc - output_geometry.loc, bbox.size)
+                        .to_f64()
+                        .to_physical(scale)
+                        .to_i32_round();
+                let location = (window_location - output_geometry.loc)
+                    .to_f64()
+                    .to_physical(scale)
+                    .to_i32_round();
+                let elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(&window, &mut self.renderer, location, scale, 1.0)
+                .into_iter()
+                .map(PawRenderElements::Cursor)
+                .collect();
+                (output, scale, crop, elements, [0.0, 0.0, 0.0, 0.0])
+            }
+        };
+        if draw_cursor {
+            Self::add_cursor(
+                &mut self.renderer,
+                &self.cursor,
+                &self.cursor_fallback,
+                state,
+                &target_output,
+                &mut elements,
+            );
+        }
+        let elements = elements
+            .into_iter()
+            .filter_map(|element| CropRenderElement::from_element(element, scale, crop))
+            .map(|element| {
+                RelocateRenderElement::from_element(
+                    element,
+                    (-crop.loc.x, -crop.loc.y),
+                    Relocate::Relative,
+                )
+            })
+            .collect();
+        Ok(CaptureScene {
+            size: crop.size,
+            scale,
+            elements,
+            clear,
+        })
     }
 
     fn automatic_position(&self, state: &Paw2) -> Point<i32, Logical> {

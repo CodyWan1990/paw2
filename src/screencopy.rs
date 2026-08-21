@@ -1,327 +1,272 @@
-use std::{
-    fs,
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
 
 use smithay::{
-    backend::allocator::{Buffer, Fourcc, dmabuf::Dmabuf},
-    output::Output,
-    reexports::{
-        wayland_protocols_wlr::screencopy::v1::server::{
-            zwlr_screencopy_frame_v1::{self, Error, ZwlrScreencopyFrameV1},
-            zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
+    desktop::{WeakWindow, Window},
+    output::{Output, WeakOutput},
+    reexports::wayland_server::protocol::wl_shm,
+    utils::{Buffer as BufferCoords, Size},
+    wayland::{
+        compositor::with_states,
+        foreign_toplevel_list::{
+            ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
         },
-        wayland_server::{
-            Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-            backend::GlobalId, protocol::wl_buffer::WlBuffer,
+        image_capture_source::{
+            ImageCaptureSource, ImageCaptureSourceHandler, OutputCaptureSourceHandler,
+            OutputCaptureSourceState, ToplevelCaptureSourceHandler, ToplevelCaptureSourceState,
         },
+        image_copy_capture::{
+            BufferConstraints, CaptureFailureReason, DmabufConstraints, Frame,
+            ImageCopyCaptureHandler, ImageCopyCaptureState, Session, SessionRef,
+        },
+        shell::xdg::XdgToplevelSurfaceData,
     },
-    utils::{Logical, Physical, Rectangle},
-    wayland::dmabuf::get_dmabuf,
 };
 
 use crate::state::Paw2;
 
+#[derive(Debug, Clone)]
+pub(crate) enum CaptureTarget {
+    Output(WeakOutput),
+    Window(WeakWindow),
+}
+
 pub struct ScreencopyState {
-    _global: GlobalId,
-    pending: Vec<Capture>,
+    pub output_capture_source: OutputCaptureSourceState,
+    pub toplevel_capture_source: ToplevelCaptureSourceState,
+    pub image_copy_capture: ImageCopyCaptureState,
+    pub foreign_toplevel_list: ForeignToplevelListState,
+    sessions: Vec<Session>,
+    toplevels: HashMap<usize, (WeakWindow, ForeignToplevelHandle)>,
+    pending: Vec<PendingCapture>,
 }
 
-pub(crate) struct Capture {
-    pub frame: ZwlrScreencopyFrameV1,
-    pub output: Output,
-    pub region: Rectangle<i32, Physical>,
-    pub buffer: Dmabuf,
-    pub overlay_cursor: bool,
-    pub with_damage: bool,
-}
-
-pub struct FrameData(Mutex<FrameState>);
-
-struct FrameState {
-    output: Option<Output>,
-    region: Rectangle<i32, Physical>,
-    format: Fourcc,
-    overlay_cursor: bool,
-    used: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ExecutableId {
-    device: u64,
-    inode: u64,
+pub(crate) struct PendingCapture {
+    pub target: CaptureTarget,
+    pub frame: Frame,
+    pub draw_cursor: bool,
 }
 
 impl ScreencopyState {
-    pub fn new(display: &DisplayHandle) -> Self {
-        let executables = Arc::new(trusted_executables());
-        if executables.is_empty() {
-            tracing::warn!("xdg-desktop-portal-wlr was not found; screencopy is disabled");
-        }
-        let filter_display = display.clone();
-        let filter_executables = executables.clone();
-        let global = display.create_global::<Paw2, ZwlrScreencopyManagerV1, _>(
-            3,
-            (filter_display, filter_executables),
-        );
+    pub fn new(display: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
         Self {
-            _global: global,
+            output_capture_source: OutputCaptureSourceState::new::<Paw2>(display),
+            toplevel_capture_source: ToplevelCaptureSourceState::new::<Paw2>(display),
+            image_copy_capture: ImageCopyCaptureState::new::<Paw2>(display),
+            foreign_toplevel_list: ForeignToplevelListState::new::<Paw2>(display),
+            sessions: Vec::new(),
+            toplevels: HashMap::new(),
             pending: Vec::new(),
         }
     }
 
-    pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<Capture> {
+    pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<PendingCapture> {
         self.pending
-            .extract_if(.., |capture| capture.output == *output)
+            .extract_if(.., |capture| match &capture.target {
+                CaptureTarget::Output(target) => target.upgrade().as_ref() == Some(output),
+                CaptureTarget::Window(_) => false,
+            })
             .collect()
     }
 
-    pub fn fail_output(&mut self, output: &Output) {
+    pub(crate) fn take_window_captures(&mut self) -> Vec<PendingCapture> {
+        self.pending
+            .extract_if(.., |capture| {
+                matches!(capture.target, CaptureTarget::Window(_))
+            })
+            .collect()
+    }
+
+    pub(crate) fn fail_output(&mut self, output: &Output) {
         for capture in self.take_for_output(output) {
-            capture.frame.failed();
-        }
-    }
-}
-
-fn trusted_executables() -> Vec<ExecutableId> {
-    let mut candidates = vec![
-        PathBuf::from("/usr/libexec/xdg-desktop-portal-wlr"),
-        PathBuf::from("/usr/lib/xdg-desktop-portal-wlr"),
-    ];
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(
-            std::env::split_paths(&path).map(|directory| directory.join("xdg-desktop-portal-wlr")),
-        );
-    }
-    let mut ids = Vec::new();
-    for id in candidates.iter().filter_map(|path| executable_id(path)) {
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-fn executable_id(path: &Path) -> Option<ExecutableId> {
-    let metadata = fs::metadata(path).ok()?;
-    Some(ExecutableId {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-fn trusted_client(client: &Client, display: &DisplayHandle, trusted: &[ExecutableId]) -> bool {
-    let Ok(credentials) = client.get_credentials(display) else {
-        return false;
-    };
-    let allowed = executable_id(&PathBuf::from(format!("/proc/{}/exe", credentials.pid)))
-        .is_some_and(|executable| trusted.contains(&executable));
-    if !allowed {
-        // `trusted` is a startup snapshot, so a portal package upgrade that changes
-        // the binary's inode surfaces here rather than as a silent capture failure.
-        tracing::debug!(
-            pid = credentials.pid,
-            "screencopy denied to untrusted client"
-        );
-    }
-    allowed
-}
-
-type GlobalData = (DisplayHandle, Arc<Vec<ExecutableId>>);
-
-impl GlobalDispatch<ZwlrScreencopyManagerV1, GlobalData> for Paw2 {
-    fn bind(
-        _state: &mut Self,
-        _display: &DisplayHandle,
-        _client: &Client,
-        resource: New<ZwlrScreencopyManagerV1>,
-        _global_data: &GlobalData,
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        data_init.init(resource, ());
-    }
-
-    fn can_view(client: Client, global_data: &GlobalData) -> bool {
-        trusted_client(&client, &global_data.0, &global_data.1)
-    }
-}
-
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for Paw2 {
-    fn request(
-        state: &mut Self,
-        _client: &Client,
-        _manager: &ZwlrScreencopyManagerV1,
-        request: zwlr_screencopy_manager_v1::Request,
-        _data: &(),
-        _display: &DisplayHandle,
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        match request {
-            zwlr_screencopy_manager_v1::Request::CaptureOutput {
-                frame,
-                overlay_cursor,
-                output,
-            } => state.new_capture(frame, overlay_cursor != 0, output, None, data_init),
-            zwlr_screencopy_manager_v1::Request::CaptureOutputRegion {
-                frame,
-                overlay_cursor,
-                output,
-                x,
-                y,
-                width,
-                height,
-            } => state.new_capture(
-                frame,
-                overlay_cursor != 0,
-                output,
-                Some(Rectangle::new((x, y).into(), (width, height).into())),
-                data_init,
-            ),
-            zwlr_screencopy_manager_v1::Request::Destroy => {}
-            _ => {}
+            capture.frame.fail(CaptureFailureReason::Stopped);
         }
     }
 }
 
 impl Paw2 {
-    fn new_capture(
-        &mut self,
-        frame: New<ZwlrScreencopyFrameV1>,
-        overlay_cursor: bool,
-        wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
-        requested_region: Option<Rectangle<i32, Logical>>,
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        let output = Output::from_resource(&wl_output);
-        let capture = output.as_ref().and_then(|output| {
-            let geometry = self.output_geometry(output)?;
-            let logical_bounds = Rectangle::from_size(geometry.size);
-            let logical_region = requested_region
-                .unwrap_or(logical_bounds)
-                .intersection(logical_bounds)?;
-            if logical_region.is_empty() {
-                return None;
-            }
-            let scale = output.current_scale().fractional_scale();
-            let region = logical_region.to_f64().to_physical(scale).to_i32_round();
-            let format = self.capture_format()?;
-            Some((output.clone(), region, format))
-        });
+    pub(crate) fn capture_window_added(&mut self, window: &Window) {
+        let (title, app_id) = window_metadata(window);
+        let handle = self
+            .screencopy_state
+            .foreign_toplevel_list
+            .new_toplevel::<Self>(title, app_id);
+        self.screencopy_state
+            .toplevels
+            .insert(window.id(), (window.downgrade(), handle));
+    }
 
-        let (output, region, format) = capture.map_or_else(
-            || (None, Rectangle::default(), Fourcc::Xrgb8888),
-            |(output, region, format)| (Some(output), region, format),
-        );
-        let data = FrameData(Mutex::new(FrameState {
-            output,
-            region,
-            format,
-            overlay_cursor,
-            used: false,
-        }));
-        let frame = data_init.init(frame, data);
-        let data = frame.data::<FrameData>().unwrap().0.lock().unwrap();
-        if data.output.is_some() && frame.version() >= 3 {
-            frame.linux_dmabuf(
-                data.format as u32,
-                data.region.size.w as u32,
-                data.region.size.h as u32,
-            );
-            frame.buffer_done();
-        } else {
-            frame.failed();
+    pub(crate) fn capture_window_removed(&mut self, window: &Window) {
+        if let Some((_, handle)) = self.screencopy_state.toplevels.remove(&window.id()) {
+            self.screencopy_state
+                .foreign_toplevel_list
+                .remove_toplevel(&handle);
+        }
+        let removed = self
+            .screencopy_state
+            .pending
+            .extract_if(.., |capture| {
+                matches!(
+                    &capture.target,
+                    CaptureTarget::Window(target)
+                        if target.upgrade().as_ref() == Some(window)
+                )
+            })
+            .collect::<Vec<_>>();
+        for capture in removed {
+            capture.frame.fail(CaptureFailureReason::Stopped);
         }
     }
 
-    fn capture_format(&self) -> Option<Fourcc> {
-        let formats = self
-            .direct
-            .as_ref()?
-            .renderer
-            .egl_context()
-            .dmabuf_render_formats();
-        [Fourcc::Xrgb8888, Fourcc::Argb8888]
-            .into_iter()
-            .find(|wanted| formats.iter().any(|format| format.code == *wanted))
-    }
-}
-
-impl Dispatch<ZwlrScreencopyFrameV1, FrameData> for Paw2 {
-    fn request(
-        state: &mut Self,
-        _client: &Client,
-        frame: &ZwlrScreencopyFrameV1,
-        request: zwlr_screencopy_frame_v1::Request,
-        data: &FrameData,
-        _display: &DisplayHandle,
-        _data_init: &mut DataInit<'_, Self>,
-    ) {
-        let (buffer, with_damage) = match request {
-            zwlr_screencopy_frame_v1::Request::Copy { buffer } => (buffer, false),
-            zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
-            zwlr_screencopy_frame_v1::Request::Destroy => return,
-            _ => return,
+    pub(crate) fn capture_window_metadata_changed(&mut self, window: &Window) {
+        let Some((_, handle)) = self.screencopy_state.toplevels.get(&window.id()) else {
+            return;
         };
-        queue_capture(state, frame, data, buffer, with_damage);
+        let (title, app_id) = window_metadata(window);
+        handle.send_title(&title);
+        handle.send_app_id(&app_id);
+        handle.send_done();
+    }
+
+    fn capture_constraints_for(&self, target: &CaptureTarget) -> Option<BufferConstraints> {
+        let size = match target {
+            CaptureTarget::Output(output) => {
+                let output = output.upgrade()?;
+                output
+                    .current_transform()
+                    .transform_size(output.current_mode()?.size)
+            }
+            CaptureTarget::Window(window) => {
+                let window = window.upgrade()?;
+                let scale = self
+                    .capture_output_for_window(&window)
+                    .map_or(1.0, |output| output.current_scale().fractional_scale());
+                window
+                    .bbox_with_popups()
+                    .size
+                    .to_f64()
+                    .to_physical(scale)
+                    .to_i32_round()
+            }
+        };
+        if size.w <= 0 || size.h <= 0 {
+            return None;
+        }
+        let backend = self.direct.as_ref()?;
+        let formats = backend.capture_formats();
+        Some(BufferConstraints {
+            size: Size::<i32, BufferCoords>::from((size.w, size.h)),
+            shm: capture_shm_formats(),
+            dma: (!formats.is_empty()).then(|| DmabufConstraints {
+                node: backend.render_node(),
+                formats,
+            }),
+        })
     }
 }
 
-fn queue_capture(
-    state: &mut Paw2,
-    frame: &ZwlrScreencopyFrameV1,
-    data: &FrameData,
-    buffer: WlBuffer,
-    with_damage: bool,
-) {
-    let mut data = data.0.lock().unwrap();
-    if data.used {
-        frame.post_error(Error::AlreadyUsed, "screencopy frame was already used");
-        return;
+fn capture_shm_formats() -> Vec<wl_shm::Format> {
+    vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]
+}
+
+fn window_metadata(window: &Window) -> (String, String) {
+    if let Some(surface) = window.toplevel() {
+        return with_states(surface.wl_surface(), |states| {
+            let attributes = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            (
+                attributes.title.clone().unwrap_or_default(),
+                attributes.app_id.clone().unwrap_or_default(),
+            )
+        });
     }
-    data.used = true;
-    let Some(output) = data.output.clone() else {
-        frame.failed();
-        return;
-    };
-    let Ok(buffer) = get_dmabuf(&buffer) else {
-        frame.post_error(Error::InvalidBuffer, "screencopy requires a DMA-BUF");
-        return;
-    };
-    if buffer.size().w != data.region.size.w
-        || buffer.size().h != data.region.size.h
-        || buffer.format().code != data.format
-    {
-        frame.post_error(
-            Error::InvalidBuffer,
-            "DMA-BUF does not match capture constraints",
-        );
-        return;
+    window.x11_surface().map_or_else(
+        || (String::new(), String::new()),
+        |surface| (surface.title(), surface.class()),
+    )
+}
+
+impl ImageCaptureSourceHandler for Paw2 {}
+
+impl OutputCaptureSourceHandler for Paw2 {
+    fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.screencopy_state.output_capture_source
     }
-    let renderable = state.direct.as_ref().is_some_and(|backend| {
-        backend
-            .renderer
-            .egl_context()
-            .dmabuf_render_formats()
-            .contains(&buffer.format())
-    });
-    if !renderable {
-        frame.post_error(
-            Error::InvalidBuffer,
-            "DMA-BUF format or modifier is not renderable",
-        );
-        return;
+
+    fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
+        source
+            .user_data()
+            .insert_if_missing(|| CaptureTarget::Output(output.downgrade()));
     }
-    state.screencopy_state.pending.push(Capture {
-        frame: frame.clone(),
-        output,
-        region: data.region,
-        buffer: buffer.clone(),
-        overlay_cursor: data.overlay_cursor,
-        with_damage,
-    });
-    crate::drm::redraw(state);
+}
+
+impl ToplevelCaptureSourceHandler for Paw2 {
+    fn toplevel_capture_source_state(&mut self) -> &mut ToplevelCaptureSourceState {
+        &mut self.screencopy_state.toplevel_capture_source
+    }
+
+    fn toplevel_source_created(
+        &mut self,
+        source: ImageCaptureSource,
+        toplevel: ForeignToplevelHandle,
+    ) {
+        let window = self
+            .screencopy_state
+            .toplevels
+            .values()
+            .find(|(_, handle)| handle.matches(&toplevel))
+            .map(|(window, _)| window.clone());
+        if let Some(window) = window {
+            source
+                .user_data()
+                .insert_if_missing(|| CaptureTarget::Window(window));
+        }
+    }
+}
+
+impl ForeignToplevelListHandler for Paw2 {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.screencopy_state.foreign_toplevel_list
+    }
+}
+
+impl ImageCopyCaptureHandler for Paw2 {
+    fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.screencopy_state.image_copy_capture
+    }
+
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
+        self.capture_constraints_for(source.user_data().get::<CaptureTarget>()?)
+    }
+
+    fn new_session(&mut self, session: Session) {
+        if let Some(constraints) = self.capture_constraints(&session.source()) {
+            session.update_constraints(constraints);
+            self.screencopy_state.sessions.push(session);
+        }
+    }
+
+    fn frame(&mut self, session: &SessionRef, frame: Frame) {
+        let Some(target) = session.source().user_data().get::<CaptureTarget>().cloned() else {
+            frame.fail(CaptureFailureReason::Unknown);
+            return;
+        };
+        self.screencopy_state.pending.push(PendingCapture {
+            target,
+            frame,
+            draw_cursor: session.draw_cursor(),
+        });
+        crate::drm::redraw(self);
+    }
+
+    fn session_destroyed(&mut self, session: SessionRef) {
+        self.screencopy_state
+            .sessions
+            .retain(|owned| owned.as_ref() != session);
+    }
 }
 
 #[cfg(test)]
@@ -329,9 +274,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executable_identity_is_stable() {
-        let current = executable_id(Path::new("/proc/self/exe")).unwrap();
-        let again = executable_id(Path::new("/proc/self/exe")).unwrap();
-        assert_eq!((current.device, current.inode), (again.device, again.inode));
+    fn screenshots_offer_mandatory_8_bit_shm_formats() {
+        assert_eq!(
+            capture_shm_formats(),
+            [wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]
+        );
     }
 }

@@ -132,6 +132,11 @@ impl XwmHandler for Paw2 {
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if matches!(property, WmWindowProperty::Title | WmWindowProperty::Class)
+            && let Some(window) = self.window_for_x11_surface(&window).cloned()
+        {
+            self.capture_window_metadata_changed(&window);
+        }
         if matches!(
             property,
             WmWindowProperty::NormalHints

@@ -321,6 +321,18 @@ impl XdgShellHandler for Paw2 {
         self.refresh_wayland_floating(&surface);
     }
 
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() {
+            self.capture_window_metadata_changed(&window);
+        }
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() {
+            self.capture_window_metadata_changed(&window);
+        }
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.remove_window(surface.wl_surface());
     }

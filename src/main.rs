@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if mode == Mode::Direct {
         import_activation_environment();
+        update_graphical_session("start");
     }
 
     for command in &state.config.autostart {
@@ -129,6 +130,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// no source callback holds a strong `LoopHandle` back to it.
 fn shutdown(mut state: Paw2, event_loop: EventLoop<'static, Paw2>, mode: &Mode) {
     state::start_shutdown();
+    if *mode == Mode::Direct {
+        update_graphical_session("stop");
+    }
     if let Some(backend) = state.direct.take() {
         backend.shutdown();
     }
@@ -179,6 +183,17 @@ fn import_activation_environment() {
         Ok(status) if status.success() => {}
         Ok(status) => tracing::warn!(%status, "could not import portal activation environment"),
         Err(error) => tracing::warn!(?error, "could not run dbus-update-activation-environment"),
+    }
+}
+
+fn update_graphical_session(action: &str) {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", action, "paw2-session.target"])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, action, "could not update graphical session target"),
+        Err(error) => tracing::warn!(?error, action, "could not run systemctl"),
     }
 }
 

@@ -1307,6 +1307,7 @@ impl Paw2 {
     }
 
     fn add_managed_window(&mut self, window: Window, fullscreen: bool, floating: bool) {
+        self.capture_window_added(&window);
         let pointer = self.seat.get_pointer().unwrap().current_location();
         self.focus_output_at(pointer);
         if let Some(output) = self.scroller.focused_output.clone()
@@ -1400,6 +1401,7 @@ impl Paw2 {
     }
 
     fn forget_window(&mut self, window: &Window) {
+        self.capture_window_removed(window);
         self.scroller.animations.remove(&window.id());
         self.scroller.manual_floating.remove(&window.id());
         self.relayout(true);
@@ -2240,6 +2242,23 @@ impl Paw2 {
         surface: &smithay::xwayland::X11Surface,
     ) -> Option<&Window> {
         self.find_window(|window| window.x11_surface() == Some(surface))
+    }
+
+    pub(crate) fn capture_output_for_window(&self, window: &Window) -> Option<Output> {
+        self.scroller.monitors.iter().find_map(|monitor| {
+            monitor
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.windows.contains(window))
+                .then(|| monitor.output.clone())
+        })
+    }
+
+    pub(crate) fn capture_window_location(&self, window: &Window) -> Option<Point<i32, Logical>> {
+        self.scroller
+            .monitors
+            .iter()
+            .find_map(|monitor| monitor.space.element_location(window))
     }
 
     /// Mapped windows first, then every workspace: a window on an inactive

@@ -21,7 +21,7 @@ as the shell layer.
 - Wayland wallpaper clients through WLR layer shell
 - Configurable focus, swapping, application launch, terminal, and quit controls
 - Keyboard, pointer, focus, clipboard, primary selection, and drag-and-drop plumbing
-- XDG desktop portals with DMA-BUF monitor sharing through xdg-desktop-portal-wlr
+- Standard monitor/window screenshots and DMA-BUF OBS capture through PipeWire
 - Application secret storage through GNOME Keyring's Secret Service
 
 ## Install
@@ -29,12 +29,13 @@ as the shell layer.
 Install Rust plus the native Smithay development dependencies for your
 distribution, then build Paw2:
 
-On Fedora, install the portal services, screen-sharing selector, and GNOME
-Keyring integration:
+On Fedora, install the build dependencies, portal services, screenshot tool,
+and GNOME Keyring integration:
 
 ```sh
-sudo dnf install gnome-keyring gnome-keyring-pam libsecret xorg-x11-server-Xwayland \
-  xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr slurp
+sudo dnf install gnome-keyring gnome-keyring-pam libsecret \
+  xorg-x11-server-Xwayland xdg-desktop-portal xdg-desktop-portal-gtk \
+  xdg-desktop-portal-wlr grim slurp
 ```
 
 ```sh
@@ -48,10 +49,20 @@ commands as root from the checkout:
 install -Dm755 target/release/paw2 /usr/local/bin/paw2
 install -Dm644 packaging/paw2.desktop /usr/share/wayland-sessions/paw2.desktop
 install -Dm644 packaging/paw2-portals.conf /usr/share/xdg-desktop-portal/paw2-portals.conf
+install -Dm644 packaging/paw2-session.target /usr/lib/systemd/user/paw2-session.target
 ```
 
-Log out and select **Paw2** in the display manager. The session entry is kept
-separate from any existing Paw session.
+If you installed an earlier screen-capture build, remove its obsolete session
+wrapper and user units as root:
+
+```sh
+rm -f /usr/local/bin/paw2-session /usr/lib/systemd/user/paw2.service \
+  /usr/lib/systemd/user/paw2-shutdown.target
+```
+
+Run `systemctl --user daemon-reload` as your regular user, then log out and
+select **Paw2** in the display manager. The session entry is kept separate from
+any existing Paw session.
 
 For development without changing virtual terminals, run Paw2 nested and
 optionally start an application inside it:
@@ -250,12 +261,15 @@ fullscreen window controls the output, `always` leaves it enabled, and `never`
 disables it. Unconfigured monitors default to `automatic`. Unsupported monitors
 remain synchronized normally. Changing this setting requires restarting Paw2.
 
-Screen sharing is available in the standalone session through the standard
-desktop portal. Paw2 restricts its screencopy protocol to the installed
-`xdg-desktop-portal-wlr` executable; applications should use the portal rather
-than connecting to screencopy directly. The initial implementation captures
-monitors or monitor regions using DMA-BUF and does not provide individual-window
-capture.
+Screenshots use the standard `ext-image-copy-capture` protocols. `grim` can
+capture the whole desktop, an output or region, an individual window with `-T`,
+and the cursor with `-c`. These protocols are available to applications running
+in the local Paw2 session.
+
+OBS and sandboxed applications use `xdg-desktop-portal-wlr` and PipeWire. Paw2
+provides the standard capture protocols while the portal owns PipeWire and the
+source chooser. Monitor selection works with `slurp`; choosing individual
+windows requires configuring a dmenu-style xdp-wlr chooser.
 
 Application passwords and tokens are stored through GNOME Keyring's standard
 Secret Service. A password-based SDDM login unlocks the login keyring through
