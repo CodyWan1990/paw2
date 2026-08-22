@@ -89,6 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Never let nested clients escape to the parent X server.
     unsafe { std::env::remove_var("DISPLAY") };
+    if mode == Mode::Direct {
+        initialize_keyring();
+    }
     match xwayland::start(event_loop.handle(), &mut state) {
         Ok(display) => unsafe { std::env::set_var("DISPLAY", format!(":{display}")) },
         Err(error) => tracing::warn!(?error, "XWayland unavailable; continuing Wayland-only"),
@@ -160,6 +163,7 @@ fn activation_environment() -> Vec<&'static str> {
     ];
     for name in [
         "DISPLAY",
+        "GNOME_KEYRING_CONTROL",
         "XCURSOR_THEME",
         "XCURSOR_SIZE",
         "GTK_THEME",
@@ -184,6 +188,40 @@ fn import_activation_environment() {
         Ok(status) => tracing::warn!(%status, "could not import portal activation environment"),
         Err(error) => tracing::warn!(?error, "could not run dbus-update-activation-environment"),
     }
+}
+
+/// Finish initializing the login daemon that `pam_gnome_keyring` unlocked.
+fn initialize_keyring() {
+    let output = std::process::Command::new("gnome-keyring-daemon")
+        .args(["--start", "--components=secrets"])
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::warn!(status = %output.status, "could not initialize GNOME Keyring");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(?error, "could not run gnome-keyring-daemon");
+            return;
+        }
+    };
+
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        tracing::warn!("GNOME Keyring returned an invalid control path");
+        return;
+    };
+    if let Some(control) = keyring_control(stdout) {
+        // SAFETY: startup is single-threaded and no clients have been spawned yet.
+        unsafe { std::env::set_var("GNOME_KEYRING_CONTROL", control) };
+    }
+}
+
+fn keyring_control(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("GNOME_KEYRING_CONTROL=")
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn update_graphical_session(action: &str) {
@@ -389,6 +427,18 @@ mod tests {
         assert!(!children().is_empty());
         terminate_children();
         assert!(children().is_empty());
+    }
+
+    #[test]
+    fn reads_only_a_valid_keyring_control_path() {
+        assert_eq!(
+            keyring_control(
+                "SSH_AUTH_SOCK=/tmp/ssh\nGNOME_KEYRING_CONTROL=/run/user/1000/keyring\n"
+            ),
+            Some("/run/user/1000/keyring")
+        );
+        assert_eq!(keyring_control("GNOME_KEYRING_CONTROL=\n"), None);
+        assert_eq!(keyring_control("UNRELATED=value\n"), None);
     }
 
     #[test]

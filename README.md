@@ -299,7 +299,8 @@ windows requires configuring a dmenu-style xdp-wlr chooser.
 
 Application passwords and tokens are stored through GNOME Keyring's standard
 Secret Service. A password-based SDDM login unlocks the login keyring through
-PAM; do not add `gnome-keyring-daemon` to Paw2's autostart commands. Test the
+PAM, and Paw2 finishes initializing its Secret Service component. Do not add a
+second `gnome-keyring-daemon` command to Paw2's autostart list. Test the
 integration from a Paw2 terminal with a temporary value:
 
 ```sh
