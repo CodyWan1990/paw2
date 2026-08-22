@@ -1,5 +1,7 @@
 use std::{
     ffi::OsString,
+    os::unix::net::UnixStream,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,7 +17,7 @@ use smithay::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
         },
         wayland_server::{
-            Display, DisplayHandle,
+            Client, Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
         },
@@ -219,11 +221,17 @@ impl Paw2 {
         event_loop
             .handle()
             .insert_source(socket, |stream, _, state| {
+                // Resolved once, here: the filter closures on the privileged
+                // globals only get a `&Client`, and reaching credentials from
+                // there would mean storing a `DisplayHandle` inside data the
+                // display itself owns.
+                let privileged =
+                    is_privileged_client(&stream, &state.config.security.privileged_clients);
                 // Refusing one client must never end the session: hitting the
                 // open-file limit is recoverable, losing every running program is not.
                 if let Err(error) = state
                     .display_handle
-                    .insert_client(stream, Arc::new(ClientState::default()))
+                    .insert_client(stream, Arc::new(ClientState::new(privileged)))
                 {
                     tracing::warn!(?error, "failed to accept Wayland client");
                 }
@@ -249,9 +257,94 @@ impl Paw2 {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Whether this client may bind the globals that expose other clients'
+    /// windows. See [`is_privileged_client`] for what that is worth.
+    pub privileged: bool,
+}
+
+impl ClientState {
+    fn new(privileged: bool) -> Self {
+        Self {
+            privileged,
+            ..Default::default()
+        }
+    }
 }
 
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Client filter for the globals that expose other clients' windows: the
+/// foreign-toplevel list, per-window capture, and workspace control.
+///
+/// Whole-output capture is deliberately not gated on this, so `grim` and
+/// `wf-recorder` keep working with no allowlist entry.
+pub fn is_privileged(client: &Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_some_and(|state| state.privileged)
+}
+
+/// Whether a connecting client may bind the privileged globals.
+///
+/// Reads the peer's executable rather than `/proc/<pid>/comm`, which truncates
+/// to 15 bytes and would collapse every `xdg-desktop-portal-*` binary onto the
+/// same string.
+///
+/// This is a soft boundary and must not be described as more. A process running
+/// as the user can already ptrace the compositor, and the peer credentials
+/// themselves are spoofable. What it buys is that an ordinary application can no
+/// longer enumerate every window title just by binding a global that was there
+/// for the taking.
+fn is_privileged_client(stream: &UnixStream, allowlist: &[String]) -> bool {
+    // `std::os::unix::net::UnixStream::peer_cred` is still nightly-only.
+    let Ok(peer) = smithay::reexports::rustix::net::sockopt::socket_peercred(stream) else {
+        return false;
+    };
+    let Ok(executable) = std::fs::read_link(format!("/proc/{}/exe", peer.pid.as_raw_nonzero()))
+    else {
+        return false;
+    };
+    allowlisted(&executable, allowlist)
+}
+
+/// Split from [`is_privileged_client`] so the matching rule is testable without
+/// a live socket.
+fn allowlisted(executable: &Path, allowlist: &[String]) -> bool {
+    executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| allowlist.iter().any(|allowed| allowed == name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_allowlisted_executables_are_privileged() {
+        let allowlist = ["xdg-desktop-portal-wlr".to_string()];
+        assert!(allowlisted(
+            Path::new("/usr/lib/xdg-desktop-portal-wlr"),
+            &allowlist
+        ));
+        // Matched on the basename, so the install prefix does not matter.
+        assert!(allowlisted(
+            Path::new("/usr/local/libexec/xdg-desktop-portal-wlr"),
+            &allowlist
+        ));
+        // A prefix of an allowed name is not an allowed name.
+        assert!(!allowlisted(
+            Path::new("/usr/lib/xdg-desktop-portal"),
+            &allowlist
+        ));
+        assert!(!allowlisted(Path::new("/usr/bin/kitty"), &allowlist));
+        // An empty allowlist privileges nobody.
+        assert!(!allowlisted(
+            Path::new("/usr/lib/xdg-desktop-portal-wlr"),
+            &[]
+        ));
+    }
 }

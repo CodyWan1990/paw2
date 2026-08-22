@@ -75,8 +75,15 @@ impl XWaylandShellHandler for Paw2 {
 }
 
 impl XwmHandler for Paw2 {
+    /// `disconnected` clears `xwm`, but cannot be followed by another callback:
+    /// smithay drives the XWM from a `calloop` channel, which drains every
+    /// queued `Msg` before emitting `Closed`, and nothing arrives after that.
+    /// The trait returns `&mut X11Wm`, so there is no `None` to hand back here
+    /// even if it could - the message is for the day that invariant breaks.
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().unwrap()
+        self.xwm
+            .as_mut()
+            .expect("XwmHandler callback after XWayland disconnected")
     }
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}

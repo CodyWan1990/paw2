@@ -143,6 +143,10 @@ impl<T> Column<T> {
 
 struct Workspace {
     windows: Vec<Window>,
+    /// Index into `windows`. Kept in step by `focus_after_removal` and by every
+    /// mutation that touches `windows`; readers still go through `get` rather
+    /// than indexing, because a desync here would panic the whole session
+    /// rather than lose one window's focus.
     focused: Option<usize>,
     columns: Vec<Column>,
     offset: i32,
@@ -770,49 +774,6 @@ fn dwindle_split(focused: usize, tiled: usize, vertical: bool) -> Option<usize> 
     (0..=last).rev().find(|split| (*split % 2 == 0) == vertical)
 }
 
-#[cfg(test)]
-fn move_column_to<T>(columns: &mut Vec<Column<T>>, current: usize, insertion: usize) -> bool {
-    let insertion = insertion.saturating_sub(usize::from(insertion > current));
-    if insertion == current {
-        return false;
-    }
-    let column = columns.remove(current);
-    columns.insert(insertion, column);
-    true
-}
-
-#[cfg(test)]
-fn move_row_to<T>(column: &mut Column<T>, current: usize, insertion: usize) -> bool {
-    let insertion = insertion.saturating_sub(usize::from(insertion > current));
-    if insertion == current {
-        return false;
-    }
-    let window = column.windows.remove(current);
-    let weight = column.row_weights.remove(current);
-    column.windows.insert(insertion, window);
-    column.row_weights.insert(insertion, weight);
-    column.focused = insertion;
-    true
-}
-
-#[cfg(test)]
-fn expel_row<T>(columns: &mut Vec<Column<T>>, column: usize, row: usize, insertion: usize) {
-    let source = &mut columns[column];
-    let window = source.windows.remove(row);
-    source.row_weights.remove(row);
-    source.focused = row.min(source.windows.len() - 1);
-    let width = source.width;
-    columns.insert(
-        insertion,
-        Column {
-            windows: vec![window],
-            row_weights: vec![1.0],
-            focused: 0,
-            width,
-        },
-    );
-}
-
 fn resized_column(
     initial_width: f64,
     initial_offset: i32,
@@ -892,6 +853,12 @@ fn adjust_weights(weights: &mut [f64], focused: usize, delta: f64) -> bool {
 
 struct Scroller {
     output: Output,
+    /// `Output::name` takes a mutex and clones a `String` on every call, and
+    /// this is the identity key for every monitor lookup - including
+    /// `window_render_state`, which runs per render element per frame. The name
+    /// is invariant for a monitor's lifetime, because `replace_output` is only
+    /// reached after finding the monitor by this same name.
+    name: String,
     space: Space<Window>,
     workspaces: [Workspace; WORKSPACE_COUNT],
     active_workspace: usize,
@@ -902,6 +869,7 @@ impl Scroller {
         let mut space = Space::default();
         space.map_output(&output, position);
         Self {
+            name: output.name(),
             output,
             space,
             workspaces: Default::default(),
@@ -910,6 +878,7 @@ impl Scroller {
     }
 
     fn replace_output(&mut self, output: Output, position: Point<i32, Logical>) {
+        debug_assert_eq!(self.name, output.name());
         self.space.unmap_output(&self.output);
         self.space.map_output(&output, position);
         self.output = output;
@@ -1072,28 +1041,27 @@ fn start_motion(
 }
 
 impl Scrollers {
-    pub fn focused_output(&self) -> Option<&str> {
-        self.focused_output.as_deref()
+    /// Lookup by output identity rather than by name. `Output: PartialEq` is an
+    /// `Arc::ptr_eq`, so this costs nothing next to `Output::name`, which locks
+    /// a mutex and clones a `String` on every call.
+    fn monitor_for(&self, output: &Output) -> Option<&Scroller> {
+        self.monitors
+            .iter()
+            .find(|monitor| monitor.output == *output)
     }
 
     fn monitor(&self, output: &str) -> Option<&Scroller> {
-        self.monitors
-            .iter()
-            .find(|monitor| monitor.output.name() == output)
+        self.monitors.iter().find(|monitor| monitor.name == output)
     }
 
     fn monitor_mut(&mut self, output: &str) -> Option<&mut Scroller> {
         self.monitors
             .iter_mut()
-            .find(|monitor| monitor.output.name() == output)
+            .find(|monitor| monitor.name == output)
     }
 
     fn set_focused_output(&mut self, output: &str) -> bool {
-        if self
-            .monitors
-            .iter()
-            .any(|monitor| monitor.output.name() == output)
-        {
+        if self.monitors.iter().any(|monitor| monitor.name == output) {
             let changed = self.focused_output.as_deref() != Some(output);
             self.focused_output = Some(output.into());
             changed
@@ -1273,7 +1241,7 @@ impl Paw2 {
         self.scroller.drag_preview = Some(window.id());
         Some(MouseOperation::MoveTiled {
             window,
-            origin_output: monitor.output.name(),
+            origin_output: monitor.name.clone(),
             origin_workspace,
             origin_geometry,
             preview_size,
@@ -1481,7 +1449,7 @@ impl Paw2 {
             self.scroller.monitors[target]
                 .active_mut()
                 .add(window, true);
-            self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+            self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
         }
         let monitor = &mut self.scroller.monitors[target];
         let Some(output) = monitor.space.output_geometry(&monitor.output) else {
@@ -1599,7 +1567,7 @@ impl Paw2 {
             .scroller
             .monitors
             .iter()
-            .position(|monitor| monitor.output.name() == *origin_output)
+            .position(|monitor| monitor.name == *origin_output)
         else {
             self.scroller.drag_preview = None;
             return;
@@ -1643,7 +1611,7 @@ impl Paw2 {
                         target_workspace.focus_window(window);
                         displaced = Some(target_window);
                         self.scroller.focused_output =
-                            Some(self.scroller.monitors[target].output.name());
+                            Some(self.scroller.monitors[target].name.clone());
                     }
                 }
             }
@@ -1654,7 +1622,7 @@ impl Paw2 {
                 self.scroller.monitors[target]
                     .active_mut()
                     .add(window, false);
-                self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+                self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
             }
         }
         self.scroller.drag_preview = None;
@@ -1877,7 +1845,7 @@ impl Paw2 {
             .scroller
             .monitors
             .iter()
-            .position(|monitor| monitor.output.name() == name)
+            .position(|monitor| monitor.name == name)
         else {
             return;
         };
@@ -1926,11 +1894,8 @@ impl Paw2 {
                 }
             }
             if removed_was_focused {
-                self.scroller.focused_output = self
-                    .scroller
-                    .monitors
-                    .first()
-                    .map(|item| item.output.name());
+                self.scroller.focused_output =
+                    self.scroller.monitors.first().map(|item| item.name.clone());
             }
         }
         for window in restore_tiled {
@@ -1952,7 +1917,7 @@ impl Paw2 {
     pub fn focus_output_at(&mut self, position: Point<f64, Logical>) {
         let Some(name) = self
             .monitor_at(position)
-            .map(|monitor| monitor.output.name())
+            .map(|monitor| monitor.name.clone())
         else {
             return;
         };
@@ -1976,7 +1941,7 @@ impl Paw2 {
         let window = Window::new_x11_window(surface);
         let output = self
             .monitor_at(location.to_f64())
-            .map(|monitor| monitor.output.name())
+            .map(|monitor| monitor.name.clone())
             .or_else(|| self.scroller.focused_output.clone());
         if let Some(monitor) = output.and_then(|name| self.scroller.monitor_mut(&name)) {
             monitor.space.map_element(window, location, true);
@@ -2176,7 +2141,7 @@ impl Paw2 {
         };
         let monitor = &self.scroller.monitors[monitor_index];
         let already_focused = self.scroller.focused_output.as_deref()
-            == Some(monitor.output.name().as_str())
+            == Some(monitor.name.as_str())
             && monitor
                 .active()
                 .focused
@@ -2188,7 +2153,7 @@ impl Paw2 {
         self.scroller.monitors[monitor_index]
             .active_mut()
             .focus_window(window);
-        self.scroller.focused_output = Some(self.scroller.monitors[monitor_index].output.name());
+        self.scroller.focused_output = Some(self.scroller.monitors[monitor_index].name.clone());
         self.relayout(reveal_and_raise);
         if reveal_and_raise && self.scroller.is_floating(window) {
             self.scroller.monitors[monitor_index]
@@ -2330,7 +2295,7 @@ impl Paw2 {
             let workspace = scroller.active();
             workspace
                 .focused
-                .map(|index| workspace.windows[index].clone())
+                .and_then(|index| workspace.windows.get(index).cloned())
         }) else {
             return;
         };
@@ -2356,7 +2321,7 @@ impl Paw2 {
             .scroller
             .monitors
             .iter()
-            .position(|monitor| monitor.output.name() == output)
+            .position(|monitor| monitor.name == output)
         else {
             return false;
         };
@@ -2483,7 +2448,9 @@ impl Paw2 {
             Action::CloseWindow => {
                 if let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
                     let workspace = scroller.active();
-                    workspace.focused.map(|index| &workspace.windows[index])
+                    workspace
+                        .focused
+                        .and_then(|index| workspace.windows.get(index))
                 }) {
                     if let Some(surface) = window.toplevel() {
                         surface.send_close();
@@ -2515,8 +2482,9 @@ impl Paw2 {
             Action::MoveToPreviousWorkspace => self.change_workspace(-1, true),
             Action::MoveToNextWorkspace => self.change_workspace(1, true),
             Action::LaunchCommand(index) => {
-                let command = &self.config.binding_commands[index];
-                if let Err(error) = crate::spawn(command) {
+                if let Some(command) = self.config.binding_commands.get(index)
+                    && let Err(error) = crate::spawn(command)
+                {
                     tracing::error!(?error, program = command[0], "failed to launch command");
                 }
                 false
@@ -2546,7 +2514,7 @@ impl Paw2 {
             .scroller
             .monitors
             .iter()
-            .position(|monitor| monitor.output.name() == output)
+            .position(|monitor| monitor.name == output)
         else {
             return false;
         };
@@ -2632,7 +2600,7 @@ impl Paw2 {
             return false;
         }
         let moved = scroller.active().focused.and_then(|index| {
-            let window = &scroller.active().windows[index];
+            let window = scroller.active().windows.get(index)?;
             (scroller.active().fullscreen.as_ref() == Some(window)).then(|| window.clone())
         });
         let conflict = moved.is_some() && scroller.workspaces[workspace].fullscreen.is_some();
@@ -2670,7 +2638,7 @@ impl Paw2 {
             .scroller
             .monitors
             .iter()
-            .map(|monitor| (monitor.output.name(), monitor.active_workspace))
+            .map(|monitor| (monitor.name.clone(), monitor.active_workspace))
             .collect::<Vec<_>>();
         for (output, workspace) in active {
             self.workspace_state.set_active(&output, workspace);
@@ -2754,9 +2722,33 @@ impl Paw2 {
                 monitor
                     .space
                     .output_geometry(&monitor.output)
-                    .map(|geometry| (monitor.output.name(), geometry))
+                    .map(|geometry| (monitor.name.clone(), geometry))
             })
             .collect()
+    }
+
+    /// Geometry of the output the pointer should treat as current: the focused
+    /// one, else the first. Split out so the absolute-motion path, which runs on
+    /// every event, does not have to build the whole name/geometry vector.
+    pub fn focused_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let focused = self.scroller.focused_output.as_deref();
+        // Falls through to the first monitor that *has* geometry, not simply the
+        // first monitor: a suspended output is unmapped from its space, and the
+        // pointer still has to land somewhere.
+        let mut mapped = self
+            .scroller
+            .monitors
+            .iter()
+            .filter_map(|monitor| {
+                let geometry = monitor.space.output_geometry(&monitor.output)?;
+                Some((monitor.name.as_str(), geometry))
+            })
+            .peekable();
+        let first = mapped.peek().map(|(_, geometry)| *geometry);
+        mapped
+            .find(|(name, _)| Some(*name) == focused)
+            .map(|(_, geometry)| geometry)
+            .or(first)
     }
 
     /// Output rectangles without their names, for callers that only need geometry.
@@ -2770,7 +2762,7 @@ impl Paw2 {
     }
 
     pub fn output_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
-        let monitor = self.scroller.monitor(&output.name())?;
+        let monitor = self.scroller.monitor_for(output)?;
         monitor.space.output_geometry(&monitor.output)
     }
 
@@ -2793,30 +2785,30 @@ impl Paw2 {
 
     pub fn space_for_output(&self, output: &Output) -> Option<&Space<Window>> {
         self.scroller
-            .monitor(&output.name())
+            .monitor_for(output)
             .map(|monitor| &monitor.space)
     }
 
     pub fn focused_window_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
-        if self.scroller.focused_output.as_deref() != Some(output.name().as_str()) {
+        let monitor = self.scroller.monitor_for(output)?;
+        if self.scroller.focused_output.as_deref() != Some(monitor.name.as_str()) {
             return None;
         }
-        let monitor = self.scroller.monitor(&output.name())?;
         let workspace = monitor.active();
-        let window = &workspace.windows[workspace.focused?];
+        let window = workspace.windows.get(workspace.focused?)?;
         monitor.space.element_geometry(window)
     }
 
     pub fn fullscreen_window(&self, output: &Output) -> Option<&Window> {
         self.scroller
-            .monitor(&output.name())?
+            .monitor_for(output)?
             .active()
             .fullscreen
             .as_ref()
     }
 
     pub fn x11_override_windows(&self, output: &Output) -> Vec<(Window, Point<i32, Logical>)> {
-        let Some(monitor) = self.scroller.monitor(&output.name()) else {
+        let Some(monitor) = self.scroller.monitor_for(output) else {
             return Vec::new();
         };
         let Some(output_location) = monitor.space.output_geometry(output).map(|value| value.loc)
@@ -2851,7 +2843,7 @@ impl Paw2 {
         output: &Output,
         element: &Id,
     ) -> Option<(Rectangle<i32, Logical>, f32)> {
-        let monitor = self.scroller.monitor(&output.name())?;
+        let monitor = self.scroller.monitor_for(output)?;
         let window = self
             .scroller
             .workspaces()
@@ -3208,14 +3200,18 @@ impl Paw2 {
                 workspace.offset = 0;
             }
         }
+        // Keyed by index rather than name: the geometry has to be collected up
+        // front to release the borrow, and re-finding each monitor by name
+        // afterwards costs a lock and an allocation per monitor per pass.
         let work_areas = self
             .scroller
             .monitors
             .iter()
-            .filter_map(|monitor| {
+            .enumerate()
+            .filter_map(|(index, monitor)| {
                 let output = monitor.space.output_geometry(&monitor.output)?;
                 let zone = layer_map_for_output(&monitor.output).non_exclusive_zone();
-                Some((monitor.output.name(), output, work_area(output, zone)))
+                Some((index, output, work_area(output, zone)))
             })
             .collect::<Vec<_>>();
         let manual_floating = &self.scroller.manual_floating;
@@ -3224,11 +3220,8 @@ impl Paw2 {
         let now = self.start_time.elapsed();
         let duration =
             (animate && self.config.animations.active()).then_some(self.config.animations.duration);
-        for (name, output_geometry, geometry) in work_areas {
-            let Some(monitor) = monitors
-                .iter_mut()
-                .find(|monitor| monitor.output.name() == name)
-            else {
+        for (index, output_geometry, geometry) in work_areas {
+            let Some(monitor) = monitors.get_mut(index) else {
                 continue;
             };
             let Scroller {
@@ -3429,7 +3422,7 @@ impl Paw2 {
             self.scroller
                 .monitors
                 .iter()
-                .find(|monitor| Some(monitor.output.name().as_str()) == active_output)
+                .find(|monitor| Some(monitor.name.as_str()) == active_output)
                 .and_then(|monitor| {
                     let workspace = monitor.active();
                     workspace
@@ -3439,7 +3432,8 @@ impl Paw2 {
                         .or_else(|| {
                             workspace
                                 .focused
-                                .and_then(|index| window_surface(&workspace.windows[index]))
+                                .and_then(|index| workspace.windows.get(index))
+                                .and_then(window_surface)
                         })
                 })
         });
@@ -3448,7 +3442,7 @@ impl Paw2 {
             for (workspace_index, workspace) in monitor.workspaces.iter().enumerate() {
                 for (index, window) in workspace.windows.iter().enumerate() {
                     window.set_activated(
-                        Some(monitor.output.name().as_str()) == active_output
+                        Some(monitor.name.as_str()) == active_output
                             && workspace_index == monitor.active_workspace
                             && if let Some(fullscreen) = &workspace.fullscreen {
                                 window == fullscreen
@@ -3480,12 +3474,12 @@ impl Paw2 {
         self.scroller
             .monitors
             .iter()
-            .filter(|monitor| Some(monitor.output.name().as_str()) == focused_output)
+            .filter(|monitor| Some(monitor.name.as_str()) == focused_output)
             .chain(
                 self.scroller
                     .monitors
                     .iter()
-                    .filter(|monitor| Some(monitor.output.name().as_str()) != focused_output),
+                    .filter(|monitor| Some(monitor.name.as_str()) != focused_output),
             )
             .find_map(|monitor| {
                 let layers = layer_map_for_output(&monitor.output);
@@ -4402,16 +4396,6 @@ mod tests {
         assert_eq!(insertion_index(&[100, 300, 500], 50.0), 0);
         assert_eq!(insertion_index(&[100, 300, 500], 350.0), 2);
         assert_eq!(insertion_index(&[100, 300, 500], 550.0), 3);
-        let mut columns = vec![Column::new(1), Column::new(2), Column::new(3)];
-        assert!(move_column_to(&mut columns, 0, 3));
-        assert_eq!(
-            columns
-                .iter()
-                .map(|column| column.windows[0])
-                .collect::<Vec<_>>(),
-            [2, 3, 1]
-        );
-        assert!(!move_column_to(&mut columns, 2, 3));
         let (width, offset) = resized_column(0.5, 100, ColumnEdge::Left, 100.0, 1000, 10);
         assert!(width < 0.5);
         assert!(offset < 100);
@@ -4829,22 +4813,6 @@ mod tests {
         let weights = resized_row_weights(&[106.0, 164.0], 0, 1000.0, MIN_ROW_HEIGHT).unwrap();
         let rows = stacked_rows(0, 300, &weights, 10, MIN_ROW_HEIGHT);
         assert_eq!([rows[0].size.h, rows[1].size.h], [222, 48]);
-
-        let mut column = Column {
-            windows: vec![1, 2, 3],
-            row_weights: vec![1.0, 2.0, 3.0],
-            focused: 0,
-            width: Some(0.5),
-        };
-        assert!(move_row_to(&mut column, 0, 3));
-        assert_eq!(column.windows, [2, 3, 1]);
-        assert_eq!(column.row_weights, [2.0, 3.0, 1.0]);
-        let mut columns = vec![column];
-        expel_row(&mut columns, 0, 1, 1);
-        assert_eq!(columns[0].windows, [2, 1]);
-        assert_eq!(columns[0].row_weights, [2.0, 1.0]);
-        assert_eq!(columns[1].windows, [3]);
-        assert_eq!(columns[1].width, Some(0.5));
 
         let mut columns = vec![
             Column {

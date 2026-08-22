@@ -79,6 +79,13 @@ direct_scanout = true
 #transform = "normal"
 #vrr = "automatic"
 
+[security]
+# Clients allowed to bind the privileged globals: the window list
+# (ext-foreign-toplevel-list-v1) and per-window capture. Everything else can
+# still capture whole outputs, so grim and wf-recorder work without an entry.
+# Matched against the basename of the connecting process's executable.
+privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
+
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
 commands = [
@@ -258,6 +265,21 @@ impl Default for InputConfig {
     }
 }
 
+/// Which clients may bind the globals that expose other clients' windows.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    pub privileged_clients: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            privileged_clients: vec!["xdg-desktop-portal-wlr".into(), "xdg-desktop-portal".into()],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub layout: LayoutConfig,
@@ -266,6 +288,7 @@ pub struct Config {
     pub input: InputConfig,
     pub theme: ThemeConfig,
     pub backend: BackendConfig,
+    pub security: SecurityConfig,
     pub monitors: Vec<MonitorConfig>,
     pub autostart: Vec<Vec<String>>,
     pub binding_commands: Vec<Vec<String>>,
@@ -362,6 +385,7 @@ impl Config {
             || self.monitors != updated.monitors
             || self.autostart != updated.autostart
             || self.input.middle_click_paste != updated.input.middle_click_paste
+            || self.security != updated.security
             || self.theme != updated.theme;
         self.layout = updated.layout;
         self.appearance = updated.appearance;
@@ -376,10 +400,30 @@ impl Config {
 pub struct ConfigWatcher {
     path: PathBuf,
     source: String,
+    modified: Option<std::time::SystemTime>,
 }
 
 impl ConfigWatcher {
+    /// Polled twice a second for the life of the session, so the common case -
+    /// nothing changed - stops at the metadata check rather than reading and
+    /// comparing the whole file. An unreadable mtime just falls through to the
+    /// read, which is the behaviour this had before.
+    fn unchanged_since_last_read(&mut self) -> bool {
+        let Ok(modified) = fs::metadata(&self.path).and_then(|data| data.modified()) else {
+            self.modified = None;
+            return false;
+        };
+        if self.modified == Some(modified) {
+            return true;
+        }
+        self.modified = Some(modified);
+        false
+    }
+
     pub fn reload(&mut self) -> io::Result<Option<Config>> {
+        if self.unchanged_since_last_read() {
+            return Ok(None);
+        }
         let source = fs::read_to_string(&self.path)
             .map_err(|error| invalid_data(&self.path, format!("could not read config: {error}")))?;
         if source == self.source {
@@ -486,6 +530,8 @@ struct RawConfig {
     theme: ThemeConfig,
     #[serde(default)]
     backend: BackendConfig,
+    #[serde(default)]
+    security: SecurityConfig,
     #[serde(default)]
     monitors: Vec<RawMonitor>,
     #[serde(default)]
@@ -671,7 +717,14 @@ pub fn load() -> io::Result<(Config, ConfigWatcher)> {
     let source = fs::read_to_string(&path)
         .map_err(|error| invalid_data(&path, format!("could not read config: {error}")))?;
     let config = parse(&source).map_err(|error| invalid_data(&path, error))?;
-    Ok((config, ConfigWatcher { path, source }))
+    let mut watcher = ConfigWatcher {
+        path,
+        source,
+        modified: None,
+    };
+    // Seed the stamp so the first tick does not re-read what load just read.
+    watcher.unchanged_since_last_read();
+    Ok((config, watcher))
 }
 
 fn config_path() -> io::Result<PathBuf> {
@@ -783,6 +836,14 @@ fn parse(source: &str) -> Result<Config, String> {
         .is_some_and(|connector| connector.trim().is_empty())
     {
         return Err("backend.connector cannot be empty".into());
+    }
+    if raw
+        .security
+        .privileged_clients
+        .iter()
+        .any(|name| name.trim().is_empty())
+    {
+        return Err("security.privileged_clients entries cannot be empty".into());
     }
     for (index, command) in raw.autostart.commands.iter().enumerate() {
         if command.is_empty() || command[0].trim().is_empty() {
@@ -932,6 +993,7 @@ fn parse(source: &str) -> Result<Config, String> {
         input: raw.input,
         theme: raw.theme,
         backend: raw.backend,
+        security: raw.security,
         monitors,
         autostart: raw.autostart.commands,
         binding_commands,
@@ -1109,6 +1171,20 @@ mod tests {
         assert_eq!(config.appearance.window_opacity(), 0.95);
         assert!(config.animations.active());
         assert!(config.backend.direct_scanout);
+        // The shipped config and the built-in default must not drift apart.
+        assert_eq!(config.security, SecurityConfig::default());
+        assert_eq!(
+            config.security.privileged_clients,
+            ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
+        );
+        assert!(
+            parse(&DEFAULT_CONFIG.replace(
+                r#"privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]"#,
+                r#"privileged_clients = ["  "]"#,
+            ))
+            .unwrap_err()
+            .contains("cannot be empty")
+        );
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         // The shipped config configures no monitors; they are auto-detected.
         assert!(config.monitors.is_empty());
@@ -1373,6 +1449,7 @@ mod tests {
         // A config predating every optional section still parses to the defaults.
         let legacy = without_section(DEFAULT_CONFIG, "[appearance]");
         let legacy = without_section(&legacy, "[animations]");
+        let legacy = without_section(&legacy, "[security]");
         let legacy = without_section(&legacy, "[backend]")
             .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
             .replace("toggle_fullscreen = [\"Super+Shift+f\"]\n", "")
@@ -1386,6 +1463,7 @@ mod tests {
         assert_eq!(legacy.animations, config.animations);
         assert_eq!(legacy.input, config.input);
         assert_eq!(legacy.backend, config.backend);
+        assert_eq!(legacy.security, config.security);
         assert!(legacy.monitors.is_empty());
         assert_eq!(
             legacy.action(
@@ -1566,8 +1644,15 @@ swap_right = ["Super+Shift+l"]
         let mut watcher = ConfigWatcher {
             path: path.clone(),
             source: with_monitors.clone(),
+            modified: None,
         };
         assert!(watcher.reload().unwrap().is_none());
+
+        // Prove the mtime gate short-circuits rather than re-reading: the cached
+        // source is now a lie, and an untouched file must still report no change.
+        watcher.source = "stale".into();
+        assert!(watcher.reload().unwrap().is_none());
+        watcher.source = with_monitors.clone();
 
         let changed = with_monitors
             .replace("column_width = 0.6", "column_width = 0.7")
@@ -1593,6 +1678,14 @@ swap_right = ["Super+Shift+l"]
                 .iter()
                 .any(|command| command[0] == "fuzzel")
         );
+
+        let updated = parse(&with_monitors.replace(
+            r#"privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]"#,
+            r#"privileged_clients = ["waybar"]"#,
+        ))
+        .unwrap();
+        assert!(active.apply_runtime(updated));
+        assert_eq!(active.security, SecurityConfig::default());
 
         let updated = parse(
             &with_monitors.replace("middle_click_paste = true", "middle_click_paste = false"),

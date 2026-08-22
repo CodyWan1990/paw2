@@ -404,8 +404,11 @@ impl Effects {
         elements.extend(self.focus_ring(state, output).map(PawRenderElements::Ring));
 
         for element in space_elements {
-            let blur = self.blur_elements(state, output, &element, scale, output_bounds);
-            elements.push(self.window_element(state, output, element, scale));
+            // Resolved once per element: the lookup walks every window on every
+            // workspace, and both consumers below want the same answer.
+            let window_state = state.window_render_state(output, element.id());
+            let blur = self.blur_elements(state, &element, scale, output_bounds, window_state);
+            elements.push(self.window_element(element, scale, window_state));
             elements.extend(blur.into_iter().map(PawRenderElements::Blur));
         }
         Ok(elements)
@@ -416,10 +419,9 @@ impl Effects {
     /// apply is passed through untouched, so the opaque fast path survives.
     fn window_element(
         &self,
-        state: &Paw2,
-        output: &Output,
         element: SpaceElements,
         scale: Scale<f64>,
+        window_state: Option<(Rectangle<i32, Logical>, f32)>,
     ) -> PawRenderElements {
         let radius = self.appearance.corner_radius as f64 * scale.x;
         if !matches!(element, SpaceElements::Element(_)) || !window_effects(&self.appearance) {
@@ -428,7 +430,7 @@ impl Effects {
         let Some(program) = self.window_program.clone() else {
             return PawRenderElements::Space(element);
         };
-        let Some((window, opacity)) = state.window_render_state(output, element.id()) else {
+        let Some((window, opacity)) = window_state else {
             return PawRenderElements::Space(element);
         };
         let window = window.to_f64().to_physical(scale).to_i32_round();
@@ -452,10 +454,10 @@ impl Effects {
     fn blur_elements(
         &self,
         state: &Paw2,
-        output: &Output,
         element: &SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
         scale: Scale<f64>,
         output_bounds: Rectangle<i32, Physical>,
+        window_state: Option<(Rectangle<i32, Logical>, f32)>,
     ) -> Vec<BlurElement> {
         if !self.appearance.blur_enabled() {
             return Vec::new();
@@ -464,40 +466,39 @@ impl Effects {
             return Vec::new();
         };
         let geometry = element.geometry(scale);
-        let rectangles: Vec<Rectangle<i32, Physical>> = if let Some(region) =
-            requested_blur_region(state, element.id())
-        {
-            region_rectangles(
-                &region,
-                geometry.size.to_f64().to_logical(scale).to_i32_round(),
-            )
-            .into_iter()
-            .map(|rectangle| {
-                Rectangle::new(
-                    geometry.loc + rectangle.loc.to_physical_precise_round(scale),
-                    rectangle.size.to_physical_precise_round(scale),
+        let rectangles: Vec<Rectangle<i32, Physical>> =
+            if let Some(region) = requested_blur_region(state, element.id()) {
+                region_rectangles(
+                    &region,
+                    geometry.size.to_f64().to_logical(scale).to_i32_round(),
                 )
-            })
-            .collect()
-        } else if matches!(element, SpaceRenderElements::Element(_)) {
-            let Some((window_geometry, _)) = state.window_render_state(output, element.id()) else {
+                .into_iter()
+                .map(|rectangle| {
+                    Rectangle::new(
+                        geometry.loc + rectangle.loc.to_physical_precise_round(scale),
+                        rectangle.size.to_physical_precise_round(scale),
+                    )
+                })
+                .collect()
+            } else if matches!(element, SpaceRenderElements::Element(_)) {
+                let Some((window_geometry, _)) = window_state else {
+                    return Vec::new();
+                };
+                let window_geometry = window_geometry.to_f64().to_physical(scale).to_i32_round();
+                Rectangle::subtract_rects_many_in_place(
+                    vec![Rectangle::from_size(geometry.size)],
+                    element.opaque_regions(scale),
+                )
+                .into_iter()
+                .map(|mut rectangle| {
+                    rectangle.loc += geometry.loc;
+                    rectangle
+                })
+                .filter_map(|rectangle| rectangle.intersection(window_geometry))
+                .collect()
+            } else {
                 return Vec::new();
             };
-            let window_geometry = window_geometry.to_f64().to_physical(scale).to_i32_round();
-            Rectangle::subtract_rects_many_in_place(
-                vec![Rectangle::from_size(geometry.size)],
-                element.opaque_regions(scale),
-            )
-            .into_iter()
-            .map(|mut rectangle| {
-                rectangle.loc += geometry.loc;
-                rectangle
-            })
-            .filter_map(|rectangle| rectangle.intersection(window_geometry))
-            .collect()
-        } else {
-            return Vec::new();
-        };
 
         let radius = (self.appearance.blur_radius as f64 * scale.x).ceil() as i32;
         rectangles

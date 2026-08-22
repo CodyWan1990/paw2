@@ -30,6 +30,15 @@ pub(crate) enum CaptureTarget {
     Window(WeakWindow),
 }
 
+impl CaptureTarget {
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Output(output) => output.upgrade().is_some(),
+            Self::Window(window) => window.upgrade().is_some(),
+        }
+    }
+}
+
 pub struct ScreencopyState {
     pub output_capture_source: OutputCaptureSourceState,
     pub toplevel_capture_source: ToplevelCaptureSourceState,
@@ -49,10 +58,21 @@ pub(crate) struct PendingCapture {
 impl ScreencopyState {
     pub fn new(display: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
         Self {
+            // Whole-output capture stays open to every client: gating it would
+            // break `grim` and `wf-recorder`, which is not what this buys.
             output_capture_source: OutputCaptureSourceState::new::<Paw2>(display),
-            toplevel_capture_source: ToplevelCaptureSourceState::new::<Paw2>(display),
             image_copy_capture: ImageCopyCaptureState::new::<Paw2>(display),
-            foreign_toplevel_list: ForeignToplevelListState::new::<Paw2>(display),
+            // Seeing *which* windows exist, and capturing one of them, is
+            // another matter: an ordinary application has no business
+            // enumerating every window title on the desktop.
+            toplevel_capture_source: ToplevelCaptureSourceState::new_with_filter::<Paw2, _>(
+                display,
+                crate::state::is_privileged,
+            ),
+            foreign_toplevel_list: ForeignToplevelListState::new_with_filter::<Paw2>(
+                display,
+                crate::state::is_privileged,
+            ),
             sessions: Vec::new(),
             toplevels: HashMap::new(),
             pending: Vec::new(),
@@ -60,6 +80,16 @@ impl ScreencopyState {
     }
 
     pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<PendingCapture> {
+        // A target whose weak handle no longer upgrades matches no output and no
+        // window, so without this it would sit in `pending` for the rest of the
+        // session. `fail_output` only covers the clean disconnect path.
+        let orphaned = self
+            .pending
+            .extract_if(.., |capture| !capture.target.is_alive())
+            .collect::<Vec<_>>();
+        for capture in orphaned {
+            capture.frame.fail(CaptureFailureReason::Stopped);
+        }
         self.pending
             .extract_if(.., |capture| match &capture.target {
                 CaptureTarget::Output(target) => target.upgrade().as_ref() == Some(output),
@@ -243,6 +273,9 @@ impl ImageCopyCaptureHandler for Paw2 {
     }
 
     fn new_session(&mut self, session: Session) {
+        // Smithay only reaches this after `capture_constraints` already answered
+        // `Some` for this source, and sends `stopped` itself otherwise, so there
+        // is no rejection case to handle here.
         if let Some(constraints) = self.capture_constraints(&session.source()) {
             session.update_constraints(constraints);
             self.screencopy_state.sessions.push(session);

@@ -80,9 +80,20 @@ pub fn init(
                 state.pre_repaint(&output, frame_target);
                 let damage = Rectangle::from_size(backend.window_size());
                 let fullscreen = state.fullscreen_window(&output).is_some();
-                let mut feedback = {
-                    let (renderer, mut framebuffer) = backend.bind().unwrap();
-                    let elements = effects.output_elements(renderer, state, &output).unwrap();
+                // Skip the frame rather than the session. The DRM path already
+                // warns and returns on a failed frame; this one used to panic,
+                // which turns one bad frame into a lost nested session.
+                let feedback = (|| {
+                    let (renderer, mut framebuffer) = backend
+                        .bind()
+                        .map_err(|error| tracing::warn!(?error, "failed to bind the window"))
+                        .ok()?;
+                    let elements = effects
+                        .output_elements(renderer, state, &output)
+                        .map_err(|error| {
+                            tracing::warn!(?error, "failed to collect render elements")
+                        })
+                        .ok()?;
                     let result = damage_tracker
                         .render_output(
                             renderer,
@@ -91,17 +102,22 @@ pub fn init(
                             &elements,
                             clear_color(fullscreen),
                         )
-                        .unwrap();
-                    state.take_presentation_feedback(&output, &result.states)
-                };
-                backend.submit(Some(&[damage])).unwrap();
+                        .map_err(|error| tracing::warn!(?error, "failed to render frame"))
+                        .ok()?;
+                    Some(state.take_presentation_feedback(&output, &result.states))
+                })();
+                if let Err(error) = backend.submit(Some(&[damage])) {
+                    tracing::warn!(?error, "failed to submit frame");
+                }
                 sequence += 1;
-                feedback.presented(
-                    state.clock.now(),
-                    Refresh::fixed(frame_duration),
-                    sequence,
-                    wp_presentation_feedback::Kind::Vsync,
-                );
+                if let Some(mut feedback) = feedback {
+                    feedback.presented(
+                        state.clock.now(),
+                        Refresh::fixed(frame_duration),
+                        sequence,
+                        wp_presentation_feedback::Kind::Vsync,
+                    );
+                }
 
                 state.send_frames(&output);
                 state.finish_frame();

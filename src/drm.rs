@@ -337,10 +337,21 @@ pub fn init(
                 }
                 DrmEvent::Error(error) => warn!(?error, "DRM event error"),
             });
-            if let Some((crtc, delay)) = repaint
-                && let Some(handle) = render_handle.upgrade()
-            {
-                schedule_repaint(&handle, crtc, delay);
+            if let Some((crtc, delay)) = repaint {
+                let scheduled = render_handle
+                    .upgrade()
+                    .is_some_and(|handle| schedule_repaint(&handle, crtc, delay));
+                if !scheduled {
+                    with_backend(state, |backend, _| {
+                        if let Some(output) = backend
+                            .outputs
+                            .iter_mut()
+                            .find(|output| output.crtc == crtc)
+                        {
+                            output.repaint_scheduled = false;
+                        }
+                    });
+                }
             }
         })?;
 
@@ -378,22 +389,38 @@ fn select_device(session: &LibSeatSession, configured: Option<PathBuf>) -> io::R
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DRM device found for this seat"))
 }
 
-fn schedule_repaint(handle: &LoopHandle<'static, Paw2>, crtc: crtc::Handle, delay: Duration) {
-    handle
-        .insert_source(Timer::from_duration(delay), move |_, _, state| {
-            with_backend(state, |backend, state| {
-                if let Some(output) = backend
-                    .outputs
-                    .iter_mut()
-                    .find(|output| output.crtc == crtc)
-                {
-                    output.repaint_scheduled = false;
-                }
-                backend.render_output(state, crtc)
-            });
-            TimeoutAction::Drop
-        })
-        .expect("failed to schedule DRM repaint");
+/// Arms the next composition for `crtc`, reporting whether it was armed.
+///
+/// The caller owns `repaint_scheduled`, and only this timer's callback clears
+/// it, so a failure that went unreported would leave the flag set and
+/// `render_output` would skip that output forever. Panicking instead would take
+/// the whole session down over fd exhaustion, which clears on its own.
+#[must_use]
+fn schedule_repaint(
+    handle: &LoopHandle<'static, Paw2>,
+    crtc: crtc::Handle,
+    delay: Duration,
+) -> bool {
+    let scheduled = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        with_backend(state, |backend, state| {
+            if let Some(output) = backend
+                .outputs
+                .iter_mut()
+                .find(|output| output.crtc == crtc)
+            {
+                output.repaint_scheduled = false;
+            }
+            backend.render_output(state, crtc)
+        });
+        TimeoutAction::Drop
+    });
+    match scheduled {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(?error, "failed to schedule DRM repaint");
+            false
+        }
+    }
 }
 
 fn with_backend(state: &mut Paw2, f: impl FnOnce(&mut DirectBackend, &mut Paw2)) {
@@ -783,10 +810,9 @@ impl DirectBackend {
         // stops. Mid-animation that would strand a window short of its target.
         let active = &mut self.outputs[index];
         if state.animations_active() && !active.frame_pending && !active.repaint_scheduled {
-            active.repaint_scheduled = true;
             let delay = frame_duration(&active.output).mul_f64(0.6);
             let crtc = active.crtc;
-            schedule_repaint(&self.handle, crtc, delay);
+            active.repaint_scheduled = schedule_repaint(&self.handle, crtc, delay);
         }
     }
 

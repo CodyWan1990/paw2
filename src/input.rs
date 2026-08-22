@@ -314,14 +314,9 @@ impl Paw2 {
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let geometries = self.output_geometries();
-                let geometry = self
-                    .scroller
-                    .focused_output()
-                    .and_then(|name| geometries.iter().find(|(output, _)| output == name))
-                    .or_else(|| geometries.first())
-                    .map(|(_, geometry)| *geometry);
-                let Some(geometry) = geometry else { return };
+                let Some(geometry) = self.focused_output_geometry() else {
+                    return;
+                };
                 let location = event.position_transformed(geometry.size) + geometry.loc.to_f64();
                 self.focus_output_at(location);
                 let pointer = self.seat.get_pointer().unwrap();
