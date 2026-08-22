@@ -24,6 +24,7 @@ const BTN_LEFT: u32 = 0x110;
 struct MouseGrab {
     start_data: GrabStartData<Paw2>,
     operation: MouseOperation,
+    location: Point<f64, Logical>,
 }
 
 impl PointerGrab<Paw2> for MouseGrab {
@@ -35,6 +36,7 @@ impl PointerGrab<Paw2> for MouseGrab {
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
+        self.location = event.location;
         // Smithay holds the pointer lock here. Rendering would read the cursor
         // position and deadlock; each backend redraws after input dispatch.
         data.update_mouse_operation(
@@ -62,6 +64,9 @@ impl PointerGrab<Paw2> for MouseGrab {
     ) {
         handle.button(data, event);
         if !handle.current_pressed().contains(&BTN_LEFT) {
+            // PointerGrab callbacks already hold Smithay's pointer lock. Use
+            // the location delivered by motion instead of locking it again.
+            data.finish_mouse_operation(&self.operation, self.location);
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -366,6 +371,7 @@ impl Paw2 {
                                     location,
                                 },
                                 operation,
+                                location,
                             },
                             serial,
                             Focus::Clear,

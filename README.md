@@ -11,7 +11,7 @@ as the shell layer.
 - One automatically selected GPU with multiple configured or automatic displays
 - Wayland application rendering through XDG shell and linux-dmabuf
 - Rootless XWayland support for Steam and X11 games
-- Horizontal scrolling columns with vertically stacked windows; new windows open beside focus
+- Per-workspace scrolling, dwindle, master-stack, and monocle tiling layouts
 - Centered client-sized launcher and dialog windows
 - Dedicated fullscreen path with scanout-friendly rendering and presentation timing
 - Automatic per-monitor VRR for fullscreen games
@@ -87,6 +87,7 @@ never replaced silently.
 
 ```toml
 [layout]
+enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
 column_width = 0.6
 preset_column_widths = [0.33333, 0.5, 0.66667]
 center_focused_column = false
@@ -148,6 +149,11 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+cycle_layout = ["Super+Tab"]
+switch_layout_scrolling = []
+switch_layout_dwindle = []
+switch_layout_master_stack = []
+switch_layout_monocle = []
 decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
 increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
 decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
@@ -187,20 +193,39 @@ move_previous = ["Super+Shift+Page_Up"]
 move_next = ["Super+Shift+Page_Down"]
 ```
 
+Each workspace remembers its layout. `enabled_layouts` controls which layouts
+can be selected and their cycling order; it must contain at least one unique
+layout. A direct binding for a disabled layout does nothing. Dwindle alternates
+horizontal and vertical splits, master-stack uses `column_width` for its master
+area, and monocle fills the usable area with the focused tiled window on top.
+The default scrolling layout keeps horizontal columns with vertical stacks.
 `column_width` is the default fraction of each output used by new columns.
 `preset_column_widths` controls the sizes cycled on the focused column; all
 widths must be between `0.1` and `1.0`. A lone window is consumed into the
 neighboring column with `consume_or_expel_left` or `consume_or_expel_right`;
-a window already sharing a column is expelled in that direction. `Super+left-drag`
-reorders windows inside a stack; dragging one sideways expels only that window
-into a new column. Dragging an internal horizontal edge resizes the two adjacent
-rows, with a 48 logical pixel minimum. A tiled window's left or right edge
-resizes its column. Standalone columns and floating windows can be dragged
-between monitors. `toggle_floating` detaches only the focused window from a
-stack and tiles it again at the pointer position.
+a window already sharing a column is expelled in that direction. Away from a
+resize edge, `Super+left-drag` lifts a tiled window at 75% size in every layout.
+Releasing over another tile swaps their positions; releasing on an empty output
+moves it there. Existing floating windows can also be dragged between monitors.
+`toggle_floating` detaches only the focused window from a stack, sizes it to
+half the usable monitor width and height, and centers it. On floating windows,
+`Super+left-drag` within 8 logical pixels of an edge resizes that edge; corners
+resize both axes, while the interior moves the window. Toggling again tiles it
+at the pointer position.
 The `Super+Ctrl` arrow or Vim bindings resize the focused column or stacked row
 by 5%; vertical monitor focus remains available through `focus_monitor_up` and
-`focus_monitor_down` if configured.
+`focus_monitor_down` if configured. In master-stack they resize the main split
+or a focused stack row; in dwindle they resize the nearest matching split around
+the focused window. `cycle_column_width` also cycles the master-stack split.
+`Super+left-drag` resizes any internal master-stack or dwindle divider. Monocle
+intentionally has no resize operation. Manual proportions are remembered per workspace until
+Paw2 exits. In scrolling, master-stack, and dwindle, dragging from a tiled
+window corner resizes both dividers at once. In master-stack, `Super+[` and
+`Super+]` decrease and increase the number of master windows. Directional focus
+and swap stay within each side vertically, and cross to the nearest window on
+the other side horizontally. Dwindle focus and swap prefer the nearest aligned
+window in the pressed direction, falling back to diagonal tiles. Monocle
+traverses tiled-window order.
 Appearance sizes are logical
 pixels; set the ring width or blur radius to `0` to disable that feature. Transparency and blur are
 applied automatically to normal window areas that clients do not declare
@@ -224,8 +249,9 @@ Wheel shortcuts run once per physical detent and consume matching mouse-wheel
 events; touchpad and unmatched scrolling continue to applications.
 Bindings, commands, layout, appearance, and `focus_follows_mouse` update within
 about half a second after saving the file. Invalid saves leave the last working
-settings active. Focus follows mouse never scrolls the workspace viewport or
-raises floating windows. Backend, monitor, autostart, and `middle_click_paste`
+settings active. Disabling a layout currently in use moves that workspace to
+the first enabled layout. Focus follows mouse never scrolls the workspace
+viewport or raises floating windows. Backend, monitor, autostart, and `middle_click_paste`
 changes take effect after restarting Paw2. Theme settings are optional and also
 take effect after a restart. Paw2 synchronizes configured cursor, icon, GTK, and
 font values through GSettings, and exports the GTK and Qt settings to launched

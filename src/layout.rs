@@ -27,7 +27,10 @@ use smithay::{
     xwayland::xwm::WmWindowType,
 };
 
-use crate::{config::Action, state::Paw2};
+use crate::{
+    config::{Action, LayoutMode},
+    state::Paw2,
+};
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -60,6 +63,8 @@ struct WindowGroup {
 struct ManualFloating {
     floating: bool,
     width: Option<f64>,
+    size: Option<Size<i32, Logical>>,
+    location: Option<Point<i32, Logical>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,28 +73,61 @@ pub(crate) enum ColumnEdge {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloatingEdge {
+    Start,
+    End,
+}
+
 pub(crate) enum MouseOperation {
-    MoveColumn {
+    MoveTiled {
         window: Window,
-    },
-    MoveWindow {
-        window: Window,
+        origin_output: String,
+        origin_workspace: usize,
+        origin_geometry: Rectangle<i32, Logical>,
+        preview_size: Size<i32, Logical>,
+        grab_offset: Point<f64, Logical>,
     },
     MoveFloating {
         window: Window,
         initial_location: Point<i32, Logical>,
     },
-    ResizeColumn {
+    ResizeFloating {
         window: Window,
+        initial_geometry: Rectangle<i32, Logical>,
+        x: Option<FloatingEdge>,
+        y: Option<FloatingEdge>,
+    },
+    ResizeTiled {
+        window: Window,
+        x: Option<AxisResize>,
+        y: Option<AxisResize>,
+    },
+}
+
+pub(crate) enum AxisResize {
+    Column {
         edge: ColumnEdge,
         initial_width: f64,
         initial_offset: i32,
     },
-    ResizeRows {
-        window: Window,
+    Rows {
+        master: bool,
+        start: usize,
         boundary: usize,
         initial_heights: Vec<f64>,
     },
+    Split {
+        target: LayoutResizeTarget,
+        initial_ratio: f64,
+        length: i32,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutResizeTarget {
+    Master,
+    Dwindle(usize),
 }
 
 impl<T> Column<T> {
@@ -103,16 +141,61 @@ impl<T> Column<T> {
     }
 }
 
-#[derive(Default)]
 struct Workspace {
     windows: Vec<Window>,
     focused: Option<usize>,
     columns: Vec<Column>,
     offset: i32,
     fullscreen: Option<Window>,
+    layout: LayoutMode,
+    master_count: usize,
+    master_ratio: Option<f64>,
+    master_weights: Vec<f64>,
+    dwindle_ratios: Vec<f64>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            windows: Vec::new(),
+            focused: None,
+            columns: Vec::new(),
+            offset: 0,
+            fullscreen: None,
+            layout: LayoutMode::Scrolling,
+            master_count: 1,
+            master_ratio: None,
+            master_weights: Vec::new(),
+            dwindle_ratios: Vec::new(),
+        }
+    }
 }
 
 impl Workspace {
+    fn replace_tiled_window(&mut self, old: &Window, new: Window) -> bool {
+        let Some((column, row)) = self
+            .tiled_slots()
+            .into_iter()
+            .find(|&(column, row)| &self.columns[column].windows[row] == old)
+        else {
+            return false;
+        };
+        let Some(index) = self.window_index(old) else {
+            return false;
+        };
+        self.columns[column].windows[row] = new.clone();
+        self.windows[index] = new;
+        true
+    }
+
+    fn adopt_layout_state(&mut self, source: &Self) {
+        self.layout = source.layout;
+        self.master_count = source.master_count;
+        self.master_ratio = source.master_ratio;
+        self.master_weights.clone_from(&source.master_weights);
+        self.dwindle_ratios.clone_from(&source.dwindle_ratios);
+    }
+
     fn add(&mut self, window: Window, floating: bool) {
         if !floating {
             let index = column_insertion_index(self.focused_column(), self.columns.len());
@@ -302,6 +385,158 @@ impl Workspace {
         true
     }
 
+    fn tiled_slots(&self) -> Vec<(usize, usize)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .flat_map(|(column, item)| (0..item.windows.len()).map(move |row| (column, row)))
+            .collect()
+    }
+
+    fn focused_tiled_index(&self) -> Option<usize> {
+        let focused = self.focused.and_then(|index| self.windows.get(index))?;
+        self.tiled_slots()
+            .into_iter()
+            .position(|(column, row)| &self.columns[column].windows[row] == focused)
+    }
+
+    fn sync_layout_sizes(&mut self, tiled: usize) {
+        self.master_weights.resize(tiled, 1.0);
+        self.master_weights.truncate(tiled);
+        self.dwindle_ratios.resize(tiled.saturating_sub(1), 0.5);
+        self.dwindle_ratios.truncate(tiled.saturating_sub(1));
+    }
+
+    fn effective_master_count(&self, tiled: usize) -> usize {
+        self.master_count.clamp(1, tiled.max(1)).min(tiled)
+    }
+
+    fn adjust_master_count(&mut self, delta: i32) -> bool {
+        if self.layout != LayoutMode::MasterStack {
+            return false;
+        }
+        let tiled = self.tiled_slots().len();
+        if tiled == 0 {
+            return false;
+        }
+        let current = self.effective_master_count(tiled);
+        let adjusted = (current as i32 + delta).clamp(1, tiled as i32) as usize;
+        if adjusted == current {
+            return false;
+        }
+        self.master_count = adjusted;
+        true
+    }
+
+    fn focus_tiled(&mut self, delta: i32) -> bool {
+        let Some(focused) = self.focused.and_then(|index| self.windows.get(index)) else {
+            return false;
+        };
+        let slots = self.tiled_slots();
+        let Some(current) = slots
+            .iter()
+            .position(|&(column, row)| &self.columns[column].windows[row] == focused)
+        else {
+            return false;
+        };
+        let Some(next) = neighbor(current, slots.len(), delta) else {
+            return false;
+        };
+        self.focus_tiled_at(next)
+    }
+
+    fn focus_tiled_at(&mut self, target: usize) -> bool {
+        let Some((column, row)) = self.tiled_slots().get(target).copied() else {
+            return false;
+        };
+        let window = self.columns[column].windows[row].clone();
+        self.focus_window(&window);
+        true
+    }
+
+    fn swap_tiled(&mut self, delta: i32) -> bool {
+        let Some(focused) = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .cloned()
+        else {
+            return false;
+        };
+        let slots = self.tiled_slots();
+        let Some(current) = slots
+            .iter()
+            .position(|&(column, row)| self.columns[column].windows[row] == focused)
+        else {
+            return false;
+        };
+        let Some(next) = neighbor(current, slots.len(), delta) else {
+            return false;
+        };
+        self.swap_tiled_at(next)
+    }
+
+    fn swap_tiled_at(&mut self, target: usize) -> bool {
+        let Some(focused) = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .cloned()
+        else {
+            return false;
+        };
+        let slots = self.tiled_slots();
+        let Some(current) = slots
+            .iter()
+            .position(|&(column, row)| self.columns[column].windows[row] == focused)
+        else {
+            return false;
+        };
+        let Some(&(to_column, to_row)) = slots.get(target) else {
+            return false;
+        };
+        if current == target {
+            return false;
+        }
+        let (from_column, from_row) = slots[current];
+        let other = self.columns[to_column].windows[to_row].clone();
+        self.columns[from_column].windows[from_row] = other;
+        self.columns[to_column].windows[to_row] = focused.clone();
+        self.focus_window(&focused);
+        true
+    }
+
+    fn switch_layout(&mut self, layout: LayoutMode, enabled: &[LayoutMode]) -> bool {
+        if self.layout == layout || !enabled.contains(&layout) {
+            return false;
+        }
+        self.layout = layout;
+        self.offset = 0;
+        true
+    }
+
+    fn cycle_layout(&mut self, enabled: &[LayoutMode]) -> bool {
+        let current = enabled
+            .iter()
+            .position(|layout| *layout == self.layout)
+            .unwrap_or_default();
+        self.switch_layout(enabled[(current + 1) % enabled.len()], enabled)
+    }
+
+    fn focus_direction(&mut self, horizontal: bool, delta: i32) -> bool {
+        match (self.layout, horizontal) {
+            (LayoutMode::Scrolling, true) => self.focus_horizontal(delta),
+            (LayoutMode::Scrolling, false) => self.focus_vertical(delta),
+            _ => self.focus_tiled(delta),
+        }
+    }
+
+    fn swap_direction(&mut self, horizontal: bool, delta: i32) -> bool {
+        match (self.layout, horizontal) {
+            (LayoutMode::Scrolling, true) => self.swap(delta),
+            (LayoutMode::Scrolling, false) => self.swap_vertical(delta),
+            _ => self.swap_tiled(delta),
+        }
+    }
+
     fn swap(&mut self, delta: i32) -> bool {
         let Some(current) = self.focused_column() else {
             return false;
@@ -352,6 +587,20 @@ impl Workspace {
     }
 
     fn cycle_column_width(&mut self, default: f64, presets: &[f64]) -> bool {
+        if self.layout == LayoutMode::MasterStack {
+            let tiled = self.tiled_slots().len();
+            if self.effective_master_count(tiled) == tiled || self.focused_tiled_index().is_none() {
+                return false;
+            }
+            self.master_ratio = Some(adjusted_split_ratio(
+                next_preset(self.master_ratio.unwrap_or(default), presets),
+                0.0,
+            ));
+            return true;
+        }
+        if self.layout != LayoutMode::Scrolling {
+            return false;
+        }
         let Some(column) = self
             .focused_column()
             .and_then(|index| self.columns.get_mut(index))
@@ -363,6 +612,41 @@ impl Workspace {
     }
 
     fn adjust_column_width(&mut self, default: f64, delta: f64) -> bool {
+        let tiled = self.tiled_slots().len();
+        let focused = self.focused_tiled_index();
+        match self.layout {
+            LayoutMode::MasterStack if tiled > 1 => {
+                let Some(focused) = focused else {
+                    return false;
+                };
+                let master = self.effective_master_count(tiled);
+                if master == tiled {
+                    return false;
+                }
+                let delta = if focused < master { delta } else { -delta };
+                let current = self.master_ratio.unwrap_or(default);
+                let adjusted = adjusted_split_ratio(current, delta);
+                if adjusted == current {
+                    return false;
+                }
+                self.master_ratio = Some(adjusted);
+                return true;
+            }
+            LayoutMode::Dwindle => {
+                let Some(focused) = focused else {
+                    return false;
+                };
+                let Some(split) = dwindle_split(focused, tiled, true) else {
+                    return false;
+                };
+                self.sync_layout_sizes(tiled);
+                let delta = if focused == split { delta } else { -delta };
+                return adjust_split_ratio(&mut self.dwindle_ratios[split], delta);
+            }
+            LayoutMode::Monocle => return false,
+            LayoutMode::Scrolling => {}
+            LayoutMode::MasterStack => return false,
+        }
         let Some(column) = self
             .focused_column()
             .and_then(|index| self.columns.get_mut(index))
@@ -379,6 +663,40 @@ impl Workspace {
     }
 
     fn adjust_row_height(&mut self, delta: f64) -> bool {
+        let tiled = self.tiled_slots().len();
+        let focused = self.focused_tiled_index();
+        match self.layout {
+            LayoutMode::MasterStack => {
+                let Some(focused) = focused else {
+                    return false;
+                };
+                self.sync_layout_sizes(tiled);
+                let master = self.effective_master_count(tiled);
+                let range = if focused < master {
+                    0..master
+                } else {
+                    master..tiled
+                };
+                return adjust_weights(
+                    &mut self.master_weights[range.clone()],
+                    focused - range.start,
+                    delta,
+                );
+            }
+            LayoutMode::Dwindle => {
+                let Some(focused) = focused else {
+                    return false;
+                };
+                let Some(split) = dwindle_split(focused, tiled, false) else {
+                    return false;
+                };
+                self.sync_layout_sizes(tiled);
+                let delta = if focused == split { delta } else { -delta };
+                return adjust_split_ratio(&mut self.dwindle_ratios[split], delta);
+            }
+            LayoutMode::Monocle => return false,
+            LayoutMode::Scrolling => {}
+        }
         let Some(column) = self
             .focused_column()
             .and_then(|index| self.columns.get_mut(index))
@@ -434,6 +752,25 @@ fn adjusted_column_width(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(0.1, 1.0)
 }
 
+fn adjusted_split_ratio(current: f64, delta: f64) -> f64 {
+    (current + delta).clamp(0.1, 0.9)
+}
+
+fn adjust_split_ratio(ratio: &mut f64, delta: f64) -> bool {
+    let adjusted = adjusted_split_ratio(*ratio, delta);
+    if adjusted == *ratio {
+        return false;
+    }
+    *ratio = adjusted;
+    true
+}
+
+fn dwindle_split(focused: usize, tiled: usize, vertical: bool) -> Option<usize> {
+    let last = focused.min(tiled.checked_sub(2)?);
+    (0..=last).rev().find(|split| (*split % 2 == 0) == vertical)
+}
+
+#[cfg(test)]
 fn move_column_to<T>(columns: &mut Vec<Column<T>>, current: usize, insertion: usize) -> bool {
     let insertion = insertion.saturating_sub(usize::from(insertion > current));
     if insertion == current {
@@ -444,6 +781,7 @@ fn move_column_to<T>(columns: &mut Vec<Column<T>>, current: usize, insertion: us
     true
 }
 
+#[cfg(test)]
 fn move_row_to<T>(column: &mut Column<T>, current: usize, insertion: usize) -> bool {
     let insertion = insertion.saturating_sub(usize::from(insertion > current));
     if insertion == current {
@@ -457,6 +795,7 @@ fn move_row_to<T>(column: &mut Column<T>, current: usize, insertion: usize) -> b
     true
 }
 
+#[cfg(test)]
 fn expel_row<T>(columns: &mut Vec<Column<T>>, column: usize, row: usize, insertion: usize) {
     let source = &mut columns[column];
     let window = source.windows.remove(row);
@@ -521,27 +860,33 @@ fn resized_row_weights(
 }
 
 fn adjust_row_weights<T>(column: &mut Column<T>, delta: f64) -> bool {
-    if column.windows.len() < 2 {
+    if column.windows.len() != column.row_weights.len() {
         return false;
     }
-    let focused = column.focused;
-    let neighbor = if focused + 1 < column.windows.len() {
+    adjust_weights(&mut column.row_weights, column.focused, delta)
+}
+
+fn adjust_weights(weights: &mut [f64], focused: usize, delta: f64) -> bool {
+    if weights.len() < 2 || focused >= weights.len() {
+        return false;
+    }
+    let neighbor = if focused + 1 < weights.len() {
         focused + 1
     } else {
         focused - 1
     };
-    let amount = column.row_weights.iter().sum::<f64>() * delta.abs();
+    let amount = weights.iter().sum::<f64>() * delta.abs();
     let (from, to) = if delta < 0.0 {
         (focused, neighbor)
     } else {
         (neighbor, focused)
     };
-    let moved = column.row_weights[from].min(amount);
+    let moved = weights[from].min(amount);
     if moved <= 0.0 {
         return false;
     }
-    column.row_weights[from] -= moved;
-    column.row_weights[to] += moved;
+    weights[from] -= moved;
+    weights[to] += moved;
     true
 }
 
@@ -627,6 +972,7 @@ pub struct Scrollers {
     parked: [Workspace; WORKSPACE_COUNT],
     animations: HashMap<usize, WindowAnimation>,
     manual_floating: HashMap<usize, ManualFloating>,
+    drag_preview: Option<usize>,
 }
 
 /// A window gliding to a new position, and fading in if it was just mapped.
@@ -817,7 +1163,7 @@ impl Scrollers {
 
 impl Paw2 {
     pub(crate) fn begin_mouse_operation(
-        &self,
+        &mut self,
         window: Window,
         location: Point<f64, Logical>,
     ) -> Option<MouseOperation> {
@@ -831,10 +1177,28 @@ impl Paw2 {
             return None;
         }
         if workspace.is_floating(&window) {
+            let geometry = monitor.space.element_geometry(&window)?;
+            let (x, y) = floating_resize_edges(location, geometry, 8);
+            if !window_is_fixed_size(&window) && (x.is_some() || y.is_some()) {
+                return Some(MouseOperation::ResizeFloating {
+                    window,
+                    initial_geometry: geometry,
+                    x,
+                    y,
+                });
+            }
             return Some(MouseOperation::MoveFloating {
                 initial_location: monitor.space.element_location(&window)?,
                 window,
             });
+        }
+        if workspace.layout != LayoutMode::Scrolling {
+            if let Some(operation) =
+                self.begin_layout_resize(monitor, workspace, window.clone(), location)
+            {
+                return Some(operation);
+            }
+            return self.begin_tiled_drag(window, location);
         }
         let geometry = monitor.space.element_geometry(&window)?;
         let column = workspace
@@ -844,9 +1208,12 @@ impl Paw2 {
         let row = column.windows.iter().position(|item| item == &window)?;
         let column_edge = column_edge(location.x, geometry, 8);
         let row_edge = row_boundary(location.y, geometry, row, column.windows.len(), 8);
-        if let Some((boundary, row_distance)) = row_edge
-            && column_edge.is_none_or(|(_, column_distance)| row_distance < column_distance)
-        {
+        let x = column_edge.map(|(edge, _)| AxisResize::Column {
+            edge,
+            initial_width: column.width.unwrap_or(self.config.layout.column_width),
+            initial_offset: workspace.offset,
+        });
+        let y = row_edge.and_then(|(boundary, _)| {
             let initial_heights = column
                 .windows
                 .iter()
@@ -857,24 +1224,156 @@ impl Paw2 {
                         .map(|geometry| f64::from(geometry.size.h))
                 })
                 .collect::<Option<Vec<_>>>()?;
-            return Some(MouseOperation::ResizeRows {
-                window,
+            Some(AxisResize::Rows {
+                master: false,
+                start: 0,
                 boundary,
                 initial_heights,
-            });
+            })
+        });
+        if x.is_some() || y.is_some() {
+            return Some(MouseOperation::ResizeTiled { window, x, y });
         }
-        if let Some((edge, _)) = column_edge {
-            return Some(MouseOperation::ResizeColumn {
-                window,
-                edge,
-                initial_width: column.width.unwrap_or(self.config.layout.column_width),
-                initial_offset: workspace.offset,
-            });
-        }
-        if column.windows.len() > 1 {
-            Some(MouseOperation::MoveWindow { window })
-        } else {
-            Some(MouseOperation::MoveColumn { window })
+        self.begin_tiled_drag(window, location)
+    }
+
+    fn begin_tiled_drag(
+        &mut self,
+        window: Window,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let monitor_index = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.active().windows.contains(&window))?;
+        let monitor = &self.scroller.monitors[monitor_index];
+        let origin_workspace = monitor.active_workspace;
+        let origin_geometry = monitor.space.element_geometry(&window)?;
+        let preview_size = drag_preview_size(origin_geometry.size);
+        let grab_offset = drag_grab_offset(location, origin_geometry);
+        let output = monitor.space.output_geometry(&monitor.output)?;
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let preview_location =
+            constrain_window(area, preview_size, (location - grab_offset).to_i32_round());
+        configure_window(
+            &window,
+            Rectangle::new(preview_location, preview_size),
+            false,
+        );
+        let monitor = &mut self.scroller.monitors[monitor_index];
+        monitor
+            .space
+            .map_element(window.clone(), preview_location, true);
+        monitor.space.raise_element(&window, false);
+        self.scroller.animations.remove(&window.id());
+        self.scroller.drag_preview = Some(window.id());
+        Some(MouseOperation::MoveTiled {
+            window,
+            origin_output: monitor.output.name(),
+            origin_workspace,
+            origin_geometry,
+            preview_size,
+            grab_offset,
+        })
+    }
+
+    fn begin_layout_resize(
+        &self,
+        monitor: &Scroller,
+        workspace: &Workspace,
+        window: Window,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let output = monitor.space.output_geometry(&monitor.output)?;
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let tiled = workspace
+            .columns
+            .iter()
+            .flat_map(|column| column.windows.iter())
+            .collect::<Vec<_>>();
+        let index = tiled.iter().position(|candidate| *candidate == &window)?;
+        let gap = effective_gap(self.config.appearance.gaps, area.size.w, area.size);
+        let inner = inset_rectangle(area, gap);
+        match workspace.layout {
+            LayoutMode::Dwindle => {
+                let (vertical, horizontal) = dwindle_dividers_at(
+                    inner,
+                    tiled.len(),
+                    gap,
+                    &workspace.dwindle_ratios,
+                    location,
+                    8,
+                );
+                let split = |hit: DividerHit| AxisResize::Split {
+                    target: LayoutResizeTarget::Dwindle(hit.split),
+                    initial_ratio: workspace
+                        .dwindle_ratios
+                        .get(hit.split)
+                        .copied()
+                        .unwrap_or(0.5),
+                    length: hit.length,
+                };
+                (vertical.is_some() || horizontal.is_some()).then(|| MouseOperation::ResizeTiled {
+                    window,
+                    x: vertical.map(split),
+                    y: horizontal.map(split),
+                })
+            }
+            LayoutMode::MasterStack if !tiled.is_empty() => {
+                let master_count = workspace.effective_master_count(tiled.len());
+                let ratio = workspace
+                    .master_ratio
+                    .unwrap_or(self.config.layout.column_width);
+                let x = (master_count < tiled.len())
+                    .then(|| {
+                        let (master, stack) = split_rectangle(inner, true, ratio, gap);
+                        divider_distance(location, master, stack, true, 8).map(|_| {
+                            AxisResize::Split {
+                                target: LayoutResizeTarget::Master,
+                                initial_ratio: ratio,
+                                length: split_length(inner, true, gap),
+                            }
+                        })
+                    })
+                    .flatten();
+                let range = if index < master_count {
+                    0..master_count
+                } else {
+                    master_count..tiled.len()
+                };
+                let row = monitor
+                    .space
+                    .element_geometry(&window)
+                    .and_then(|geometry| {
+                        row_boundary(location.y, geometry, index - range.start, range.len(), 8)
+                    });
+                let y = row.and_then(|(boundary, _)| {
+                    let initial_heights = tiled[range.clone()]
+                        .iter()
+                        .map(|window| {
+                            monitor
+                                .space
+                                .element_geometry(window)
+                                .map(|geometry| f64::from(geometry.size.h))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(AxisResize::Rows {
+                        master: true,
+                        start: range.start,
+                        boundary,
+                        initial_heights,
+                    })
+                });
+                (x.is_some() || y.is_some()).then(|| MouseOperation::ResizeTiled { window, x, y })
+            }
+            LayoutMode::MasterStack | LayoutMode::Monocle | LayoutMode::Scrolling => None,
         }
     }
 
@@ -884,146 +1383,60 @@ impl Paw2 {
         start: Point<f64, Logical>,
         location: Point<f64, Logical>,
     ) {
-        if let MouseOperation::MoveWindow { window } = operation {
-            let window = window.clone();
-            if self.drag_window(&window, location) {
-                *operation = MouseOperation::MoveColumn {
-                    window: window.clone(),
-                };
-                self.drag_column(&window, location);
-            }
-            return;
-        }
         match operation {
-            MouseOperation::MoveColumn { window } => self.drag_column(window, location),
+            MouseOperation::MoveTiled {
+                window,
+                preview_size,
+                grab_offset,
+                ..
+            } => self.drag_tiled_preview(window, *preview_size, *grab_offset, location),
             MouseOperation::MoveFloating {
                 window,
                 initial_location,
             } => self.drag_floating(window, *initial_location, location - start, location),
-            MouseOperation::ResizeColumn {
+            MouseOperation::ResizeFloating {
                 window,
+                initial_geometry,
+                x,
+                y,
+            } => self.drag_floating_resize(window, *initial_geometry, *x, *y, location - start),
+            MouseOperation::ResizeTiled { window, x, y } => {
+                if let Some(resize) = x {
+                    self.drag_axis_resize(window, resize, location.x - start.x);
+                }
+                if let Some(resize) = y {
+                    self.drag_axis_resize(window, resize, location.y - start.y);
+                }
+            }
+        }
+    }
+
+    fn drag_axis_resize(&mut self, window: &Window, resize: &AxisResize, delta: f64) {
+        match resize {
+            AxisResize::Column {
                 edge,
                 initial_width,
                 initial_offset,
-            } => self.drag_column_edge(
-                window,
-                *edge,
-                *initial_width,
-                *initial_offset,
-                location.x - start.x,
-            ),
-            MouseOperation::ResizeRows {
-                window,
+            } => self.drag_column_edge(window, *edge, *initial_width, *initial_offset, delta),
+            AxisResize::Rows {
+                master,
+                start,
                 boundary,
                 initial_heights,
-            } => self.drag_row_boundary(window, *boundary, initial_heights, location.y - start.y),
-            MouseOperation::MoveWindow { .. } => unreachable!(),
-        }
-    }
-
-    fn drag_window(&mut self, window: &Window, location: Point<f64, Logical>) -> bool {
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.active().windows.contains(window))
-        else {
-            return false;
-        };
-        let monitor = &self.scroller.monitors[monitor_index];
-        let workspace = monitor.active();
-        let Some(column_index) = workspace
-            .columns
-            .iter()
-            .position(|column| column.windows.contains(window))
-        else {
-            return false;
-        };
-        let Some(row) = workspace.columns[column_index]
-            .windows
-            .iter()
-            .position(|item| item == window)
-        else {
-            return false;
-        };
-        if workspace.columns[column_index].windows.len() == 1 {
-            return true;
-        }
-        let Some(geometry) = monitor.space.element_geometry(window) else {
-            return false;
-        };
-        let row_insertion =
-            row_insertion_at(&workspace.columns[column_index], &monitor.space, location.y);
-        let workspace = self.scroller.monitors[monitor_index].active_mut();
-        if location.x < f64::from(geometry.loc.x)
-            || location.x >= f64::from(geometry.loc.x + geometry.size.w)
-        {
-            let insertion = column_index + usize::from(location.x >= f64::from(geometry.loc.x));
-            expel_row(&mut workspace.columns, column_index, row, insertion);
-            self.relayout_with_animation(false, false);
-            self.sync_focus();
-            return true;
-        }
-
-        if move_row_to(&mut workspace.columns[column_index], row, row_insertion) {
-            self.relayout_with_animation(false, false);
-            self.sync_focus();
-        }
-        false
-    }
-
-    fn drag_column(&mut self, window: &Window, location: Point<f64, Logical>) {
-        let Some(source) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.active().windows.contains(window))
-        else {
-            return;
-        };
-        let Some(target) = self.scroller.monitors.iter().position(|monitor| {
-            monitor
-                .space
-                .output_geometry(&monitor.output)
-                .is_some_and(|geometry| geometry.to_f64().contains(location))
-        }) else {
-            return;
-        };
-        if self.scroller.monitors[target].active().fullscreen.is_some() {
-            return;
-        }
-
-        let insertion = column_insertion_at(
-            self.scroller.monitors[target].active(),
-            &self.scroller.monitors[target].space,
-            location.x,
-        );
-        if source == target {
-            let workspace = self.scroller.monitors[source].active_mut();
-            let Some(current) = workspace
-                .columns
-                .iter()
-                .position(|column| column.windows.contains(window))
-            else {
-                return;
-            };
-            if !move_column_to(&mut workspace.columns, current, insertion) {
-                return;
+            } if *master => {
+                self.drag_master_row_boundary(window, *start, *boundary, initial_heights, delta)
             }
-        } else {
-            self.scroller.monitors[source]
-                .active_mut()
-                .focus_window(window);
-            let Some(group) = self.scroller.monitors[source].take_focused_group() else {
-                return;
-            };
-            self.scroller.monitors[target]
-                .active_mut()
-                .add_group_at(group, insertion);
-            self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+            AxisResize::Rows {
+                boundary,
+                initial_heights,
+                ..
+            } => self.drag_row_boundary(window, *boundary, initial_heights, delta),
+            AxisResize::Split {
+                target,
+                initial_ratio,
+                length,
+            } => self.drag_layout_split(window, *target, *initial_ratio, delta, *length),
         }
-        self.relayout_with_animation(false, false);
-        self.sync_focus();
     }
 
     fn drag_floating(
@@ -1041,6 +1454,12 @@ impl Paw2 {
         else {
             return;
         };
+        let size = self
+            .scroller
+            .manual_floating
+            .get(&window.id())
+            .and_then(|override_| override_.size)
+            .unwrap_or_else(|| floating_size(window));
         let desired = initial_location.to_f64() + delta;
         let Some(target) = self.scroller.monitors.iter().position(|monitor| {
             monitor
@@ -1072,9 +1491,193 @@ impl Paw2 {
             output,
             layer_map_for_output(&monitor.output).non_exclusive_zone(),
         );
-        let location = constrain_window(area, floating_size(window), desired.to_i32_round());
+        let location = constrain_window(area, size, desired.to_i32_round());
         monitor.space.map_element(window.clone(), location, true);
         self.scroller.animations.remove(&window.id());
+        if let Some(override_) = self.scroller.manual_floating.get_mut(&window.id()) {
+            override_.location = Some(location);
+        }
+        self.sync_focus();
+    }
+
+    fn drag_floating_resize(
+        &mut self,
+        window: &Window,
+        initial: Rectangle<i32, Logical>,
+        x: Option<FloatingEdge>,
+        y: Option<FloatingEdge>,
+        delta: Point<f64, Logical>,
+    ) {
+        let Some(monitor) = self
+            .scroller
+            .monitors
+            .iter_mut()
+            .find(|monitor| monitor.active().windows.contains(window))
+        else {
+            return;
+        };
+        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let rectangle = resized_floating_rectangle(initial, x, y, delta, area, MIN_ROW_HEIGHT);
+        configure_window(window, rectangle, false);
+        monitor
+            .space
+            .map_element(window.clone(), rectangle.loc, true);
+        monitor.space.raise_element(window, false);
+        self.scroller.animations.remove(&window.id());
+        let override_ =
+            self.scroller
+                .manual_floating
+                .entry(window.id())
+                .or_insert(ManualFloating {
+                    floating: true,
+                    width: None,
+                    size: None,
+                    location: None,
+                });
+        override_.size = Some(rectangle.size);
+        override_.location = Some(rectangle.loc);
+    }
+
+    fn drag_tiled_preview(
+        &mut self,
+        window: &Window,
+        size: Size<i32, Logical>,
+        grab_offset: Point<f64, Logical>,
+        pointer: Point<f64, Logical>,
+    ) {
+        let Some(target) = self.scroller.monitors.iter().position(|monitor| {
+            monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.to_f64().contains(pointer))
+        }) else {
+            return;
+        };
+        if self.scroller.monitors[target].active().fullscreen.is_some() {
+            return;
+        }
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            if index != target {
+                monitor.space.unmap_elem(window);
+            }
+        }
+        let monitor = &mut self.scroller.monitors[target];
+        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let location = constrain_window(area, size, (pointer - grab_offset).to_i32_round());
+        monitor.space.map_element(window.clone(), location, true);
+        monitor.space.raise_element(window, false);
+    }
+
+    pub(crate) fn finish_mouse_operation(
+        &mut self,
+        operation: &MouseOperation,
+        pointer: Point<f64, Logical>,
+    ) {
+        let MouseOperation::MoveTiled {
+            window,
+            origin_output,
+            origin_workspace,
+            origin_geometry,
+            ..
+        } = operation
+        else {
+            return;
+        };
+        let Some(source) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.output.name() == *origin_output)
+        else {
+            self.scroller.drag_preview = None;
+            return;
+        };
+        let Some(target) = self.scroller.monitors.iter().position(|monitor| {
+            monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.to_f64().contains(pointer))
+        }) else {
+            self.restore_tiled_drag(window, source);
+            return;
+        };
+        let same_origin = source == target
+            && self.scroller.monitors[source].active_workspace == *origin_workspace;
+        let target_window = if same_origin && origin_geometry.to_f64().contains(pointer) {
+            None
+        } else {
+            tiled_drop_target(
+                self.scroller.monitors[target].active(),
+                &self.scroller.monitors[target].space,
+                window,
+                pointer,
+            )
+        };
+        let mut displaced = None;
+        if let Some(target_window) = target_window {
+            if same_origin {
+                let workspace = &mut self.scroller.monitors[source].workspaces[*origin_workspace];
+                if let Some(index) = workspace.tiled_slots().iter().position(|&(column, row)| {
+                    workspace.columns[column].windows[row] == target_window
+                }) {
+                    workspace.swap_tiled_at(index);
+                }
+            } else {
+                let source_workspace =
+                    &mut self.scroller.monitors[source].workspaces[*origin_workspace];
+                if source_workspace.replace_tiled_window(window, target_window.clone()) {
+                    let target_workspace = self.scroller.monitors[target].active_mut();
+                    if target_workspace.replace_tiled_window(&target_window, window.clone()) {
+                        target_workspace.focus_window(window);
+                        displaced = Some(target_window);
+                        self.scroller.focused_output =
+                            Some(self.scroller.monitors[target].output.name());
+                    }
+                }
+            }
+        } else if !same_origin {
+            let moved = self.scroller.monitors[source].workspaces[*origin_workspace]
+                .remove_where(|candidate| candidate == window);
+            if let Some(window) = moved {
+                self.scroller.monitors[target]
+                    .active_mut()
+                    .add(window, false);
+                self.scroller.focused_output = Some(self.scroller.monitors[target].output.name());
+            }
+        }
+        self.scroller.drag_preview = None;
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            if index != target {
+                monitor.space.unmap_elem(window);
+            }
+            if let Some(displaced) = &displaced {
+                monitor.space.unmap_elem(displaced);
+            }
+        }
+        self.relayout(true);
+        self.sync_focus();
+    }
+
+    fn restore_tiled_drag(&mut self, window: &Window, source: usize) {
+        self.scroller.drag_preview = None;
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            if index != source {
+                monitor.space.unmap_elem(window);
+            }
+        }
+        self.relayout(true);
         self.sync_focus();
     }
 
@@ -1154,6 +1757,71 @@ impl Paw2 {
         self.relayout_with_animation(false, false);
     }
 
+    fn drag_layout_split(
+        &mut self,
+        window: &Window,
+        target: LayoutResizeTarget,
+        initial_ratio: f64,
+        delta: f64,
+        length: i32,
+    ) {
+        let Some(workspace) = self.scroller.monitors.iter_mut().find_map(|monitor| {
+            monitor
+                .active()
+                .windows
+                .contains(window)
+                .then(|| monitor.active_mut())
+        }) else {
+            return;
+        };
+        let ratio = adjusted_split_ratio(initial_ratio, delta / f64::from(length.max(1)));
+        match target {
+            LayoutResizeTarget::Master if workspace.layout == LayoutMode::MasterStack => {
+                workspace.master_ratio = Some(ratio);
+            }
+            LayoutResizeTarget::Dwindle(split) if workspace.layout == LayoutMode::Dwindle => {
+                let tiled = workspace.tiled_slots().len();
+                workspace.sync_layout_sizes(tiled);
+                let Some(target) = workspace.dwindle_ratios.get_mut(split) else {
+                    return;
+                };
+                *target = ratio;
+            }
+            _ => return,
+        }
+        self.relayout_with_animation(false, false);
+    }
+
+    fn drag_master_row_boundary(
+        &mut self,
+        window: &Window,
+        start: usize,
+        boundary: usize,
+        initial_heights: &[f64],
+        delta: f64,
+    ) {
+        let Some(workspace) = self.scroller.monitors.iter_mut().find_map(|monitor| {
+            let workspace = monitor.active_mut();
+            (workspace.layout == LayoutMode::MasterStack && workspace.windows.contains(window))
+                .then_some(workspace)
+        }) else {
+            return;
+        };
+        let Some(weights) = resized_row_weights(initial_heights, boundary, delta, MIN_ROW_HEIGHT)
+        else {
+            return;
+        };
+        workspace.sync_layout_sizes(workspace.tiled_slots().len());
+        let Some(target) = workspace
+            .master_weights
+            .get_mut(start..start + weights.len())
+        else {
+            return;
+        };
+        target.copy_from_slice(&weights);
+        self.relayout_with_animation(false, false);
+    }
+
     pub fn apply_startup_monitor(&mut self) {
         let Some(name) = self.config.startup_monitor().map(str::to_owned) else {
             return;
@@ -1187,6 +1855,9 @@ impl Paw2 {
         }
         let mut monitor = Scroller::new(output.clone(), position);
         for (index, parked) in self.scroller.parked.iter_mut().enumerate() {
+            if monitor.workspaces[index].windows.is_empty() {
+                monitor.workspaces[index].adopt_layout_state(parked);
+            }
             for group in parked.drain_groups() {
                 monitor.workspaces[index].add_group(group);
             }
@@ -1224,6 +1895,9 @@ impl Paw2 {
         {
             let target_output = target.output.clone();
             for (index, workspace) in removed.workspaces.iter_mut().enumerate() {
+                if target.workspaces[index].windows.is_empty() {
+                    target.workspaces[index].adopt_layout_state(workspace);
+                }
                 for mut group in workspace.drain_groups() {
                     if let Some(window) = group.fullscreen.clone() {
                         if target.workspaces[index].fullscreen.is_none() {
@@ -1241,6 +1915,9 @@ impl Paw2 {
             }
         } else {
             for (index, workspace) in removed.workspaces.iter_mut().enumerate() {
+                if self.scroller.parked[index].windows.is_empty() {
+                    self.scroller.parked[index].adopt_layout_state(workspace);
+                }
                 for mut group in workspace.drain_groups() {
                     if let Some(window) = group.fullscreen.take() {
                         restore_tiled.push(window);
@@ -1713,20 +2390,33 @@ impl Paw2 {
             .get(&window.id())
             .and_then(|override_| override_.width);
         let monitor = &mut self.scroller.monitors[monitor_index];
-        let width = if floating {
+        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            return false;
+        };
+        let area = work_area(
+            output,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let (width, size, location) = if floating {
             let index = column_insertion_at(monitor.active(), &monitor.space, pointer_x);
             monitor
                 .active_mut()
                 .tile_at(window.clone(), index, remembered_width);
-            remembered_width
+            (remembered_width, None, None)
         } else {
-            monitor.active_mut().remove_from_column(&window).flatten()
+            let width = monitor.active_mut().remove_from_column(&window).flatten();
+            let size = (!window_is_fixed_size(&window)).then_some(default_floating_size(area.size));
+            let location =
+                centered_rectangle(area, size.unwrap_or_else(|| floating_size(&window))).loc;
+            (width, size, Some(location))
         };
         self.scroller.manual_floating.insert(
             window.id(),
             ManualFloating {
                 floating: !floating,
                 width,
+                size,
+                location,
             },
         );
         true
@@ -1734,26 +2424,46 @@ impl Paw2 {
 
     pub fn run_action(&mut self, action: Action) {
         let changed = match action {
-            Action::FocusLeft => self.layout_action(|workspace| workspace.focus_horizontal(-1)),
-            Action::FocusRight => self.layout_action(|workspace| workspace.focus_horizontal(1)),
-            Action::FocusUp => self.layout_action(|workspace| workspace.focus_vertical(-1)),
-            Action::FocusDown => self.layout_action(|workspace| workspace.focus_vertical(1)),
-            Action::SwapLeft => self.layout_action(|workspace| workspace.swap(-1)),
-            Action::SwapRight => self.layout_action(|workspace| workspace.swap(1)),
-            Action::SwapUp => self.layout_action(|workspace| workspace.swap_vertical(-1)),
-            Action::SwapDown => self.layout_action(|workspace| workspace.swap_vertical(1)),
-            Action::ConsumeOrExpelLeft => {
-                self.layout_action(|workspace| workspace.consume_or_expel(-1))
-            }
-            Action::ConsumeOrExpelRight => {
-                self.layout_action(|workspace| workspace.consume_or_expel(1))
-            }
+            Action::FocusLeft => self.directional_layout_action(true, -1, false),
+            Action::FocusRight => self.directional_layout_action(true, 1, false),
+            Action::FocusUp => self.directional_layout_action(false, -1, false),
+            Action::FocusDown => self.directional_layout_action(false, 1, false),
+            Action::SwapLeft => self.directional_layout_action(true, -1, true),
+            Action::SwapRight => self.directional_layout_action(true, 1, true),
+            Action::SwapUp => self.directional_layout_action(false, -1, true),
+            Action::SwapDown => self.directional_layout_action(false, 1, true),
+            Action::ConsumeOrExpelLeft => self.layout_action(|workspace| {
+                if workspace.layout == LayoutMode::MasterStack {
+                    workspace.adjust_master_count(-1)
+                } else {
+                    workspace.layout == LayoutMode::Scrolling && workspace.consume_or_expel(-1)
+                }
+            }),
+            Action::ConsumeOrExpelRight => self.layout_action(|workspace| {
+                if workspace.layout == LayoutMode::MasterStack {
+                    workspace.adjust_master_count(1)
+                } else {
+                    workspace.layout == LayoutMode::Scrolling && workspace.consume_or_expel(1)
+                }
+            }),
             Action::CycleColumnWidth => {
                 let default = self.config.layout.column_width;
                 let presets = &self.config.layout.preset_column_widths;
                 self.scroller
                     .active_workspace()
                     .is_some_and(|workspace| workspace.cycle_column_width(default, presets))
+            }
+            Action::CycleLayout => {
+                let enabled = &self.config.layout.enabled_layouts;
+                self.scroller
+                    .active_workspace()
+                    .is_some_and(|workspace| workspace.cycle_layout(enabled))
+            }
+            Action::SwitchLayout(layout) => {
+                let enabled = &self.config.layout.enabled_layouts;
+                self.scroller
+                    .active_workspace()
+                    .is_some_and(|workspace| workspace.switch_layout(layout, enabled))
             }
             Action::DecreaseColumnWidth => {
                 let default = self.config.layout.column_width;
@@ -1826,6 +2536,73 @@ impl Paw2 {
 
     fn layout_action(&mut self, action: impl FnOnce(&mut Workspace) -> bool) -> bool {
         self.scroller.active_workspace().is_some_and(action)
+    }
+
+    fn directional_layout_action(&mut self, horizontal: bool, delta: i32, swap: bool) -> bool {
+        let Some(output) = self.scroller.focused_output.clone() else {
+            return false;
+        };
+        let Some(monitor_index) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.output.name() == output)
+        else {
+            return false;
+        };
+        let layout = self.scroller.monitors[monitor_index].active().layout;
+        if !matches!(layout, LayoutMode::MasterStack | LayoutMode::Dwindle) {
+            return self.layout_action(|workspace| {
+                if swap {
+                    workspace.swap_direction(horizontal, delta)
+                } else {
+                    workspace.focus_direction(horizontal, delta)
+                }
+            });
+        }
+        let monitor = &self.scroller.monitors[monitor_index];
+        let workspace = monitor.active();
+        if layout == LayoutMode::MasterStack && workspace.fullscreen.is_some() {
+            return false;
+        }
+        let tiled = workspace
+            .columns
+            .iter()
+            .flat_map(|column| column.windows.iter())
+            .collect::<Vec<_>>();
+        let Some(focused) = workspace.focused_tiled_index() else {
+            return false;
+        };
+        let geometries = tiled
+            .iter()
+            .map(|window| monitor.space.element_geometry(window))
+            .collect::<Option<Vec<_>>>();
+        let direction = match (horizontal, delta.signum()) {
+            (true, -1) => Direction::Left,
+            (true, 1) => Direction::Right,
+            (false, -1) => Direction::Up,
+            (false, 1) => Direction::Down,
+            _ => return false,
+        };
+        let Some(target) = geometries.and_then(|geometries| match layout {
+            LayoutMode::MasterStack => master_neighbor(
+                focused,
+                workspace.effective_master_count(tiled.len()),
+                horizontal,
+                delta,
+                &geometries,
+            ),
+            LayoutMode::Dwindle => directional_index(focused, direction, &geometries, true),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let workspace = self.scroller.monitors[monitor_index].active_mut();
+        if swap {
+            workspace.swap_tiled_at(target)
+        } else {
+            workspace.focus_tiled_at(target)
+        }
     }
 
     fn change_monitor(&mut self, direction: Direction, move_window: bool) -> bool {
@@ -2075,10 +2852,19 @@ impl Paw2 {
         element: &Id,
     ) -> Option<(Rectangle<i32, Logical>, f32)> {
         let monitor = self.scroller.monitor(&output.name())?;
-        let window = monitor.active().windows.iter().find(|window| {
-            window_surface(window)
-                .is_some_and(|surface| Id::from_wayland_resource(&surface) == *element)
-        })?;
+        let window = self
+            .scroller
+            .workspaces()
+            .flat_map(|workspace| &workspace.windows)
+            .find(|window| {
+                window_surface(window)
+                    .is_some_and(|surface| Id::from_wayland_resource(&surface) == *element)
+            })?;
+        if self.scroller.drag_preview != Some(window.id())
+            && !monitor.active().windows.contains(window)
+        {
+            return None;
+        }
         let mut geometry = monitor.space.element_geometry(window)?;
         geometry.loc -= monitor.space.output_geometry(output)?.loc;
         let fade = self
@@ -2409,6 +3195,19 @@ impl Paw2 {
     }
 
     fn relayout_with_animation(&mut self, reveal_focus: bool, animate: bool) {
+        let enabled_layouts = &self.config.layout.enabled_layouts;
+        for workspace in self
+            .scroller
+            .monitors
+            .iter_mut()
+            .flat_map(|monitor| &mut monitor.workspaces)
+            .chain(&mut self.scroller.parked)
+        {
+            if !enabled_layouts.contains(&workspace.layout) {
+                workspace.layout = enabled_layouts[0];
+                workspace.offset = 0;
+            }
+        }
         let work_areas = self
             .scroller
             .monitors
@@ -2419,6 +3218,7 @@ impl Paw2 {
                 Some((monitor.output.name(), output, work_area(output, zone)))
             })
             .collect::<Vec<_>>();
+        let manual_floating = &self.scroller.manual_floating;
         let animations = &mut self.scroller.animations;
         let monitors = &mut self.scroller.monitors;
         let now = self.start_time.elapsed();
@@ -2438,32 +3238,6 @@ impl Paw2 {
                 ..
             } = monitor;
             let workspace = &mut workspaces[*active_workspace];
-            let fractions = workspace
-                .columns
-                .iter()
-                .map(|column| column.width.unwrap_or(self.config.layout.column_width))
-                .collect::<Vec<_>>();
-            let requested_width = fractions
-                .iter()
-                .map(|fraction| (geometry.size.w as f64 * fraction).round() as i32)
-                .min()
-                .unwrap_or(geometry.size.w);
-            let gap = effective_gap(self.config.appearance.gaps, requested_width, geometry.size);
-            let widths = fractions
-                .iter()
-                .map(|fraction| column_width(geometry.size.w, *fraction, gap))
-                .collect::<Vec<_>>();
-            let focused_column = workspace.focused_column();
-            workspace.offset = viewport_offset(
-                workspace.offset,
-                focused_column,
-                &widths,
-                geometry.size.w,
-                gap,
-                self.config.layout.center_focused_column && animate,
-                reveal_focus,
-            );
-            let offset = workspace.offset;
             let floating_locations = workspace
                 .windows
                 .iter()
@@ -2474,64 +3248,147 @@ impl Paw2 {
                         .map(|location| (window.id(), location))
                 })
                 .collect::<HashMap<_, _>>();
-            // Sizes the window, then glides it from wherever it currently sits.
-            let mut place =
-                |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
-                    configure_window(window, rectangle, client_sized);
-                    let current = space.element_location(window);
-                    let position = start_motion(
-                        animations,
-                        window.id(),
-                        current,
-                        rectangle.loc,
-                        now,
-                        duration,
-                    );
-                    space.map_element(window.clone(), position, false);
-                };
-
-            let mut column_x = geometry.loc.x + gap - offset;
-            for (column, width) in workspace.columns.iter().zip(widths) {
-                let rows = stacked_rows(
-                    geometry.loc.y,
-                    geometry.size.h,
-                    &column.row_weights,
+            let tiled = workspace
+                .columns
+                .iter()
+                .flat_map(|column| column.windows.iter().cloned())
+                .collect::<Vec<_>>();
+            workspace.sync_layout_sizes(tiled.len());
+            let placements = if workspace.layout == LayoutMode::Scrolling {
+                let fractions = workspace
+                    .columns
+                    .iter()
+                    .map(|column| column.width.unwrap_or(self.config.layout.column_width))
+                    .collect::<Vec<_>>();
+                let requested_width = fractions
+                    .iter()
+                    .map(|fraction| (geometry.size.w as f64 * fraction).round() as i32)
+                    .min()
+                    .unwrap_or(geometry.size.w);
+                let gap =
+                    effective_gap(self.config.appearance.gaps, requested_width, geometry.size);
+                let widths = fractions
+                    .iter()
+                    .map(|fraction| column_width(geometry.size.w, *fraction, gap))
+                    .collect::<Vec<_>>();
+                workspace.offset = viewport_offset(
+                    workspace.offset,
+                    workspace.focused_column(),
+                    &widths,
+                    geometry.size.w,
                     gap,
-                    MIN_ROW_HEIGHT,
+                    self.config.layout.center_focused_column && animate,
+                    reveal_focus,
                 );
-                for (window, row) in column.windows.iter().zip(rows) {
-                    let fullscreen = workspace.fullscreen.as_ref() == Some(window);
-                    let rectangle = if fullscreen {
-                        output_geometry
-                    } else {
-                        Rectangle::new(
-                            (column_x, row.loc.y).into(),
-                            (width - gap, row.size.h).into(),
+                let mut column_x = geometry.loc.x + gap - workspace.offset;
+                let mut placements = Vec::with_capacity(tiled.len());
+                for (column, width) in workspace.columns.iter().zip(widths) {
+                    let rows = stacked_rows(
+                        geometry.loc.y,
+                        geometry.size.h,
+                        &column.row_weights,
+                        gap,
+                        MIN_ROW_HEIGHT,
+                    );
+                    placements.extend(column.windows.iter().zip(rows).map(|(window, row)| {
+                        (
+                            window.clone(),
+                            Rectangle::new(
+                                (column_x, row.loc.y).into(),
+                                (width - gap, row.size.h).into(),
+                            ),
                         )
-                    };
-                    place(window, rectangle, false);
+                    }));
+                    column_x += width;
                 }
-                column_x += width;
-            }
-            for window in workspace
+                placements
+            } else {
+                workspace.offset = 0;
+                layout_rectangles(
+                    workspace.layout,
+                    geometry,
+                    tiled.len(),
+                    self.config.appearance.gaps,
+                    workspace.effective_master_count(tiled.len()),
+                    workspace
+                        .master_ratio
+                        .unwrap_or(self.config.layout.column_width),
+                    &workspace.master_weights,
+                    &workspace.dwindle_ratios,
+                )
+                .into_iter()
+                .zip(tiled.iter().cloned())
+                .map(|(rectangle, window)| (window, rectangle))
+                .collect()
+            };
+            let floating = workspace
                 .windows
                 .iter()
                 .filter(|window| workspace.is_floating(window))
+                .cloned()
+                .collect::<Vec<_>>();
             {
-                let fullscreen = workspace.fullscreen.as_ref() == Some(window);
-                let rectangle = if fullscreen {
-                    output_geometry
-                } else {
-                    let size = floating_size(window);
-                    Rectangle::new(
-                        floating_locations.get(&window.id()).copied().map_or_else(
-                            || centered_rectangle(geometry, size).loc,
-                            |location| constrain_window(geometry, size, location),
-                        ),
-                        size,
-                    )
-                };
-                place(window, rectangle, !fullscreen);
+                // Sizes the window, then glides it from wherever it currently sits.
+                let mut place =
+                    |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
+                        configure_window(window, rectangle, client_sized);
+                        let current = space.element_location(window);
+                        let position = start_motion(
+                            animations,
+                            window.id(),
+                            current,
+                            rectangle.loc,
+                            now,
+                            duration,
+                        );
+                        space.map_element(window.clone(), position, false);
+                    };
+
+                for (window, rectangle) in &placements {
+                    let rectangle = if workspace.fullscreen.as_ref() == Some(window) {
+                        output_geometry
+                    } else {
+                        *rectangle
+                    };
+                    place(window, rectangle, false);
+                }
+                for window in &floating {
+                    let fullscreen = workspace.fullscreen.as_ref() == Some(window);
+                    let override_ = manual_floating.get(&window.id());
+                    let rectangle = if fullscreen {
+                        output_geometry
+                    } else {
+                        let size = override_
+                            .and_then(|override_| override_.size)
+                            .unwrap_or_else(|| floating_size(window));
+                        Rectangle::new(
+                            override_
+                                .and_then(|override_| override_.location)
+                                .or_else(|| floating_locations.get(&window.id()).copied())
+                                .map_or_else(
+                                    || centered_rectangle(geometry, size).loc,
+                                    |location| constrain_window(geometry, size, location),
+                                ),
+                            size,
+                        )
+                    };
+                    place(
+                        window,
+                        rectangle,
+                        !fullscreen && override_.is_none_or(|override_| override_.size.is_none()),
+                    );
+                }
+            }
+            if workspace.layout == LayoutMode::Monocle
+                && let Some(window) = workspace
+                    .focused
+                    .and_then(|index| workspace.windows.get(index))
+                    .filter(|window| !workspace.is_floating(window))
+            {
+                space.raise_element(window, false);
+            }
+            for window in floating {
+                space.raise_element(&window, false);
             }
         }
     }
@@ -2710,6 +3567,22 @@ fn floating_size(window: &Window) -> Size<i32, Logical> {
         .unwrap_or_else(|| window.geometry().size)
 }
 
+fn window_is_fixed_size(window: &Window) -> bool {
+    if let Some(surface) = window.toplevel() {
+        return with_states(surface.wl_surface(), |states| {
+            let mut cached = states.cached_state.get::<SurfaceCachedState>();
+            let cached = cached.current();
+            fixed_size(cached.min_size, cached.max_size)
+        });
+    }
+    window.x11_surface().is_some_and(|surface| {
+        surface
+            .min_size()
+            .zip(surface.max_size())
+            .is_some_and(|(minimum, maximum)| fixed_size(minimum, maximum))
+    })
+}
+
 fn configure_window(window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool) {
     if let Some(surface) = window.toplevel() {
         surface.with_pending_state(|state| state.size = (!client_sized).then_some(rectangle.size));
@@ -2782,11 +3655,28 @@ fn directional_neighbor(
     direction: Direction,
     geometries: &[(String, Rectangle<i32, Logical>)],
 ) -> Option<String> {
-    let source = center(geometries.iter().find(|(name, _)| name == current)?.1);
+    let current = geometries.iter().position(|(name, _)| name == current)?;
+    let rectangles = geometries
+        .iter()
+        .map(|(_, geometry)| *geometry)
+        .collect::<Vec<_>>();
+    directional_index(current, direction, &rectangles, false)
+        .map(|index| geometries[index].0.clone())
+}
+
+fn directional_index(
+    current: usize,
+    direction: Direction,
+    geometries: &[Rectangle<i32, Logical>],
+    prefer_aligned: bool,
+) -> Option<usize> {
+    let source_geometry = *geometries.get(current)?;
+    let source = center(source_geometry);
     geometries
         .iter()
-        .filter(|(name, _)| name != current)
-        .filter_map(|(name, geometry)| {
+        .enumerate()
+        .filter(|(index, _)| *index != current)
+        .filter_map(|(index, geometry)| {
             let target = center(*geometry);
             let (primary, secondary) = match direction {
                 Direction::Left => (source.x - target.x, (source.y - target.y).abs()),
@@ -2794,17 +3684,183 @@ fn directional_neighbor(
                 Direction::Up => (source.y - target.y, (source.x - target.x).abs()),
                 Direction::Down => (target.y - source.y, (source.x - target.x).abs()),
             };
+            let aligned = match direction {
+                Direction::Left | Direction::Right => {
+                    geometry.loc.y < source_geometry.loc.y + source_geometry.size.h
+                        && source_geometry.loc.y < geometry.loc.y + geometry.size.h
+                }
+                Direction::Up | Direction::Down => {
+                    geometry.loc.x < source_geometry.loc.x + source_geometry.size.w
+                        && source_geometry.loc.x < geometry.loc.x + geometry.size.w
+                }
+            };
             (primary > 0).then_some((
+                usize::from(prefer_aligned && !aligned),
                 primary as i64 * primary as i64 + secondary as i64 * secondary as i64,
-                name,
+                index,
             ))
         })
-        .min_by_key(|(score, _)| *score)
-        .map(|(_, name)| name.clone())
+        .min_by_key(|(alignment, score, _)| (*alignment, *score))
+        .map(|(_, _, index)| index)
 }
 
 fn center(rectangle: Rectangle<i32, Logical>) -> Point<i32, Logical> {
     rectangle.loc + rectangle.size / 2
+}
+
+fn drag_preview_size(size: Size<i32, Logical>) -> Size<i32, Logical> {
+    ((size.w * 3 / 4).max(1), (size.h * 3 / 4).max(1)).into()
+}
+
+fn default_floating_size(size: Size<i32, Logical>) -> Size<i32, Logical> {
+    ((size.w / 2).max(1), (size.h / 2).max(1)).into()
+}
+
+fn drag_grab_offset(
+    pointer: Point<f64, Logical>,
+    geometry: Rectangle<i32, Logical>,
+) -> Point<f64, Logical> {
+    let offset = pointer - geometry.loc.to_f64();
+    (offset.x * 0.75, offset.y * 0.75).into()
+}
+
+fn floating_resize_edges(
+    pointer: Point<f64, Logical>,
+    geometry: Rectangle<i32, Logical>,
+    margin: i32,
+) -> (Option<FloatingEdge>, Option<FloatingEdge>) {
+    let edge = |position: f64, start: i32, length: i32| {
+        let start_distance = (position - f64::from(start)).abs();
+        let end_distance = (position - f64::from(start + length)).abs();
+        match (
+            start_distance <= f64::from(margin),
+            end_distance <= f64::from(margin),
+        ) {
+            (true, true) if start_distance <= end_distance => Some(FloatingEdge::Start),
+            (true, false) => Some(FloatingEdge::Start),
+            (_, true) => Some(FloatingEdge::End),
+            _ => None,
+        }
+    };
+    (
+        edge(pointer.x, geometry.loc.x, geometry.size.w),
+        edge(pointer.y, geometry.loc.y, geometry.size.h),
+    )
+}
+
+fn resized_floating_rectangle(
+    initial: Rectangle<i32, Logical>,
+    x: Option<FloatingEdge>,
+    y: Option<FloatingEdge>,
+    delta: Point<f64, Logical>,
+    area: Rectangle<i32, Logical>,
+    requested_minimum: i32,
+) -> Rectangle<i32, Logical> {
+    let resize_axis = |start: i32,
+                       length: i32,
+                       area_start: i32,
+                       area_length: i32,
+                       edge: Option<FloatingEdge>,
+                       delta: f64| {
+        let maximum = area_length.max(1);
+        let minimum = requested_minimum.clamp(1, maximum);
+        let length = length.clamp(minimum, maximum);
+        let start = start.clamp(area_start, area_start + maximum - length);
+        let end = start + length;
+        match edge {
+            Some(FloatingEdge::Start) => {
+                let resized = (start + delta.round() as i32).clamp(area_start, end - minimum);
+                (resized, end - resized)
+            }
+            Some(FloatingEdge::End) => {
+                let resized =
+                    (end + delta.round() as i32).clamp(start + minimum, area_start + maximum);
+                (start, resized - start)
+            }
+            None => (start, length),
+        }
+    };
+    let (x, width) = resize_axis(
+        initial.loc.x,
+        initial.size.w,
+        area.loc.x,
+        area.size.w,
+        x,
+        delta.x,
+    );
+    let (y, height) = resize_axis(
+        initial.loc.y,
+        initial.size.h,
+        area.loc.y,
+        area.size.h,
+        y,
+        delta.y,
+    );
+    Rectangle::new((x, y).into(), (width, height).into())
+}
+
+fn tiled_drop_target(
+    workspace: &Workspace,
+    space: &Space<Window>,
+    dragged: &Window,
+    pointer: Point<f64, Logical>,
+) -> Option<Window> {
+    let candidates = workspace
+        .columns
+        .iter()
+        .flat_map(|column| &column.windows)
+        .filter(|window| *window != dragged)
+        .filter_map(|window| {
+            space
+                .element_geometry(window)
+                .map(|geometry| (window, geometry))
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|(_, geometry)| geometry.to_f64().contains(pointer))
+        .or_else(|| {
+            candidates.iter().min_by_key(|(_, geometry)| {
+                let target = center(*geometry).to_f64();
+                let delta = target - pointer;
+                (delta.x * delta.x + delta.y * delta.y) as i64
+            })
+        })
+        .map(|(window, _)| (*window).clone())
+}
+
+fn master_neighbor(
+    focused: usize,
+    master_count: usize,
+    horizontal: bool,
+    delta: i32,
+    geometries: &[Rectangle<i32, Logical>],
+) -> Option<usize> {
+    let source = center(*geometries.get(focused)?);
+    let master_count = master_count.min(geometries.len());
+    let in_master = focused < master_count;
+    let range = if horizontal {
+        match (in_master, delta.signum()) {
+            (true, 1) => master_count..geometries.len(),
+            (false, -1) => 0..master_count,
+            _ => return None,
+        }
+    } else if in_master {
+        0..master_count
+    } else {
+        master_count..geometries.len()
+    };
+    range
+        .filter(|index| *index != focused)
+        .filter_map(|index| {
+            let target = center(geometries[index]);
+            if !horizontal && (target.y - source.y).signum() != delta.signum() {
+                return None;
+            }
+            Some((index, (target.y - source.y).abs()))
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(index, _)| index)
 }
 
 fn centered_rectangle(
@@ -2833,20 +3889,6 @@ fn insertion_index(centers: &[i32], x: f64) -> usize {
         .iter()
         .position(|center| x < f64::from(*center))
         .unwrap_or(centers.len())
-}
-
-fn row_insertion_at(column: &Column, space: &Space<Window>, y: f64) -> usize {
-    let centers = column
-        .windows
-        .iter()
-        .map(|window| {
-            space
-                .element_geometry(window)
-                .map(|geometry| geometry.loc.y + geometry.size.h / 2)
-                .unwrap_or(i32::MAX)
-        })
-        .collect::<Vec<_>>();
-    insertion_index(&centers, y)
 }
 
 fn constrain_window(
@@ -2927,11 +3969,15 @@ fn average_weight(weights: &[f64]) -> f64 {
 
 fn cycle_column_width<T>(column: &mut Column<T>, default: f64, presets: &[f64]) {
     let current = column.width.unwrap_or(default);
+    column.width = Some(next_preset(current, presets));
+}
+
+fn next_preset(current: f64, presets: &[f64]) -> f64 {
     let next = presets
         .iter()
         .position(|width| (*width - current).abs() < f64::EPSILON)
         .map_or(0, |index| (index + 1) % presets.len());
-    column.width = Some(presets[next]);
+    presets[next]
 }
 
 fn workspace_neighbor(current: usize, delta: i32) -> usize {
@@ -2997,6 +4043,263 @@ fn effective_gap(
         .min((column_width - 1).max(0))
         .min(((output_size.w - 1) / 2).max(0))
         .min(((output_size.h - 1) / 2).max(0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_rectangles(
+    layout: LayoutMode,
+    area: Rectangle<i32, Logical>,
+    count: usize,
+    requested_gap: i32,
+    master_count: usize,
+    master_ratio: f64,
+    master_weights: &[f64],
+    dwindle_ratios: &[f64],
+) -> Vec<Rectangle<i32, Logical>> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let gap = effective_gap(requested_gap, area.size.w, area.size);
+    let inner = inset_rectangle(area, gap);
+    match layout {
+        LayoutMode::Scrolling => Vec::new(),
+        LayoutMode::Monocle => vec![inner; count],
+        LayoutMode::MasterStack => {
+            let master_count = master_count.clamp(1, count);
+            if master_count == count {
+                return weighted_rows(
+                    inner,
+                    count,
+                    gap,
+                    &master_weights[..count.min(master_weights.len())],
+                );
+            }
+            let (master, stack) = split_rectangle(inner, true, master_ratio, gap);
+            let mut rectangles = weighted_rows(
+                master,
+                master_count,
+                gap,
+                &master_weights[..master_count.min(master_weights.len())],
+            );
+            rectangles.extend(weighted_rows(
+                stack,
+                count - master_count,
+                gap,
+                master_weights.get(master_count..).unwrap_or_default(),
+            ));
+            rectangles
+        }
+        LayoutMode::Dwindle => {
+            let mut remaining = inner;
+            let mut rectangles = Vec::with_capacity(count);
+            for index in 0..count {
+                if index + 1 == count {
+                    rectangles.push(remaining);
+                } else {
+                    let ratio = dwindle_ratios.get(index).copied().unwrap_or(0.5);
+                    let (window, rest) = split_rectangle(remaining, index % 2 == 0, ratio, gap);
+                    rectangles.push(window);
+                    remaining = rest;
+                }
+            }
+            rectangles
+        }
+    }
+}
+
+fn inset_rectangle(rectangle: Rectangle<i32, Logical>, amount: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (rectangle.loc.x + amount, rectangle.loc.y + amount).into(),
+        (rectangle.size.w - amount * 2, rectangle.size.h - amount * 2).into(),
+    )
+}
+
+fn split_length(rectangle: Rectangle<i32, Logical>, vertical: bool, requested_gap: i32) -> i32 {
+    let length = if vertical {
+        rectangle.size.w
+    } else {
+        rectangle.size.h
+    };
+    length - requested_gap.min((length - 2).max(0))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DividerHit {
+    split: usize,
+    vertical: bool,
+    length: i32,
+    distance: f64,
+}
+
+fn divider_distance(
+    pointer: Point<f64, Logical>,
+    first: Rectangle<i32, Logical>,
+    rest: Rectangle<i32, Logical>,
+    vertical: bool,
+    margin: i32,
+) -> Option<f64> {
+    let (position, first_edge, rest_edge, cross, cross_start, cross_end) = if vertical {
+        (
+            pointer.x,
+            first.loc.x + first.size.w,
+            rest.loc.x,
+            pointer.y,
+            first.loc.y,
+            first.loc.y + first.size.h,
+        )
+    } else {
+        (
+            pointer.y,
+            first.loc.y + first.size.h,
+            rest.loc.y,
+            pointer.x,
+            first.loc.x,
+            first.loc.x + first.size.w,
+        )
+    };
+    if cross < f64::from(cross_start) || cross >= f64::from(cross_end) {
+        return None;
+    }
+    let distance = (position - f64::from(first_edge))
+        .abs()
+        .min((position - f64::from(rest_edge)).abs());
+    (distance <= f64::from(margin)).then_some(distance)
+}
+
+#[cfg(test)]
+fn dwindle_divider_at(
+    inner: Rectangle<i32, Logical>,
+    count: usize,
+    gap: i32,
+    ratios: &[f64],
+    pointer: Point<f64, Logical>,
+    margin: i32,
+) -> Option<DividerHit> {
+    let (vertical, horizontal) = dwindle_dividers_at(inner, count, gap, ratios, pointer, margin);
+    [vertical, horizontal]
+        .into_iter()
+        .flatten()
+        .min_by(|left, right| left.distance.total_cmp(&right.distance))
+}
+
+fn dwindle_dividers_at(
+    inner: Rectangle<i32, Logical>,
+    count: usize,
+    gap: i32,
+    ratios: &[f64],
+    pointer: Point<f64, Logical>,
+    margin: i32,
+) -> (Option<DividerHit>, Option<DividerHit>) {
+    let mut remaining = inner;
+    let mut vertical_hit = None::<DividerHit>;
+    let mut horizontal_hit = None::<DividerHit>;
+    for split in 0..count.saturating_sub(1) {
+        let vertical = split % 2 == 0;
+        let ratio = ratios.get(split).copied().unwrap_or(0.5);
+        let (first, rest) = split_rectangle(remaining, vertical, ratio, gap);
+        if let Some(distance) = divider_distance(pointer, first, rest, vertical, margin) {
+            let hit = DividerHit {
+                split,
+                vertical,
+                length: split_length(remaining, vertical, gap),
+                distance,
+            };
+            let closest = if vertical {
+                &mut vertical_hit
+            } else {
+                &mut horizontal_hit
+            };
+            if closest.is_none_or(|current| distance < current.distance) {
+                *closest = Some(hit);
+            }
+        }
+        remaining = rest;
+    }
+    (vertical_hit, horizontal_hit)
+}
+
+fn split_rectangle(
+    rectangle: Rectangle<i32, Logical>,
+    vertical: bool,
+    ratio: f64,
+    requested_gap: i32,
+) -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
+    let length = if vertical {
+        rectangle.size.w
+    } else {
+        rectangle.size.h
+    };
+    if length <= 1 {
+        return (rectangle, rectangle);
+    }
+    let gap = requested_gap.min((length - 2).max(0));
+    let available = length - gap;
+    let first =
+        ((f64::from(available) * ratio.clamp(0.1, 0.9)).round() as i32).clamp(1, available - 1);
+    if vertical {
+        (
+            Rectangle::new(rectangle.loc, (first, rectangle.size.h).into()),
+            Rectangle::new(
+                (rectangle.loc.x + first + gap, rectangle.loc.y).into(),
+                (available - first, rectangle.size.h).into(),
+            ),
+        )
+    } else {
+        (
+            Rectangle::new(rectangle.loc, (rectangle.size.w, first).into()),
+            Rectangle::new(
+                (rectangle.loc.x, rectangle.loc.y + first + gap).into(),
+                (rectangle.size.w, available - first).into(),
+            ),
+        )
+    }
+}
+
+fn weighted_rows(
+    rectangle: Rectangle<i32, Logical>,
+    count: usize,
+    requested_gap: i32,
+    weights: &[f64],
+) -> Vec<Rectangle<i32, Logical>> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let count = count as i32;
+    let gap = if count == 1 {
+        0
+    } else {
+        requested_gap.min(((rectangle.size.h - count) / (count - 1)).max(0))
+    };
+    let available = (rectangle.size.h - gap * (count - 1)).max(count);
+    let minimum = MIN_ROW_HEIGHT.min(available / count).max(1);
+    let distributable = available - minimum * count;
+    let weights = (0..count as usize)
+        .map(|index| weights.get(index).copied().unwrap_or(1.0).max(0.0))
+        .collect::<Vec<_>>();
+    let total = weights.iter().sum::<f64>();
+    let equal = total <= 0.0;
+    let total = if equal { f64::from(count) } else { total };
+    let mut y = rectangle.loc.y;
+    let mut cumulative = 0.0;
+    let mut distributed = 0;
+    (0..count)
+        .map(|row| {
+            cumulative += if equal { 1.0 } else { weights[row as usize] };
+            let target = if row + 1 == count {
+                distributable
+            } else {
+                (f64::from(distributable) * cumulative / total).round() as i32
+            };
+            let height = minimum + target - distributed;
+            distributed = target;
+            let result = Rectangle::new(
+                (rectangle.loc.x, y).into(),
+                (rectangle.size.w, height).into(),
+            );
+            y += height + gap;
+            result
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3231,6 +4534,287 @@ mod tests {
             directional_neighbor("left", Direction::Down, &geometries).as_deref(),
             Some("down")
         );
+    }
+
+    #[test]
+    fn layouts_cycle_per_workspace_and_honor_enabled_list() {
+        let enabled = [
+            LayoutMode::Scrolling,
+            LayoutMode::Dwindle,
+            LayoutMode::Monocle,
+        ];
+        let mut first = Workspace::default();
+        let second = Workspace::default();
+        assert!(first.cycle_layout(&enabled));
+        assert_eq!(first.layout, LayoutMode::Dwindle);
+        assert_eq!(second.layout, LayoutMode::Scrolling);
+        assert!(!first.switch_layout(LayoutMode::MasterStack, &enabled));
+        assert!(first.switch_layout(LayoutMode::Monocle, &enabled));
+        assert!(first.cycle_layout(&enabled));
+        assert_eq!(first.layout, LayoutMode::Scrolling);
+    }
+
+    #[test]
+    fn alternate_layout_rectangles_are_stable_and_positive() {
+        let area = Rectangle::new((0, 0).into(), (1000, 800).into());
+        let monocle = layout_rectangles(LayoutMode::Monocle, area, 3, 10, 1, 0.6, &[], &[]);
+        assert_eq!(
+            monocle,
+            vec![Rectangle::new((10, 10).into(), (980, 780).into()); 3]
+        );
+
+        let master = layout_rectangles(LayoutMode::MasterStack, area, 3, 10, 1, 0.6, &[], &[]);
+        assert_eq!(
+            master[0],
+            Rectangle::new((10, 10).into(), (582, 780).into())
+        );
+        assert_eq!(
+            master[1],
+            Rectangle::new((602, 10).into(), (388, 385).into())
+        );
+        assert_eq!(
+            master[2],
+            Rectangle::new((602, 405).into(), (388, 385).into())
+        );
+
+        let dwindle = layout_rectangles(LayoutMode::Dwindle, area, 4, 10, 1, 0.6, &[], &[]);
+        assert_eq!(
+            dwindle[0],
+            Rectangle::new((10, 10).into(), (485, 780).into())
+        );
+        assert_eq!(
+            dwindle[1],
+            Rectangle::new((505, 10).into(), (485, 385).into())
+        );
+        assert_eq!(
+            dwindle[2],
+            Rectangle::new((505, 405).into(), (238, 385).into())
+        );
+        assert_eq!(
+            dwindle[3],
+            Rectangle::new((753, 405).into(), (237, 385).into())
+        );
+
+        let tiny = layout_rectangles(
+            LayoutMode::Dwindle,
+            Rectangle::new((0, 0).into(), (2, 2).into()),
+            8,
+            15,
+            1,
+            0.6,
+            &[],
+            &[],
+        );
+        assert!(
+            tiny.iter()
+                .all(|rectangle| rectangle.size.w > 0 && rectangle.size.h > 0)
+        );
+    }
+
+    #[test]
+    fn dwindle_navigation_follows_geometry() {
+        let geometries = layout_rectangles(
+            LayoutMode::Dwindle,
+            Rectangle::new((0, 0).into(), (1000, 800).into()),
+            4,
+            10,
+            1,
+            0.6,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            directional_index(0, Direction::Left, &geometries, true),
+            None
+        );
+        assert_eq!(
+            directional_index(0, Direction::Right, &geometries, true),
+            Some(2)
+        );
+        assert_eq!(
+            directional_index(0, Direction::Up, &geometries, true),
+            Some(1)
+        );
+        assert_eq!(
+            directional_index(0, Direction::Down, &geometries, true),
+            Some(2)
+        );
+        assert_eq!(
+            directional_index(1, Direction::Left, &geometries, true),
+            Some(0)
+        );
+        assert_eq!(
+            directional_index(2, Direction::Left, &geometries, true),
+            Some(0)
+        );
+        assert_eq!(
+            directional_index(2, Direction::Right, &geometries, true),
+            Some(3)
+        );
+        assert_eq!(
+            directional_index(2, Direction::Up, &geometries, true),
+            Some(1)
+        );
+        assert_eq!(
+            directional_index(2, Direction::Down, &geometries, true),
+            None
+        );
+
+        let diagonal = [
+            Rectangle::new((100, 100).into(), (50, 50).into()),
+            Rectangle::new((0, 0).into(), (50, 50).into()),
+        ];
+        assert_eq!(
+            directional_index(0, Direction::Left, &diagonal, true),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn alternate_layout_ratios_resize_expected_splits() {
+        let area = Rectangle::new((0, 0).into(), (1000, 800).into());
+        let master = layout_rectangles(
+            LayoutMode::MasterStack,
+            area,
+            3,
+            10,
+            1,
+            0.6,
+            &[1.0, 3.0, 1.0],
+            &[],
+        );
+        assert_eq!(
+            master[1],
+            Rectangle::new((602, 10).into(), (388, 554).into())
+        );
+        assert_eq!(
+            master[2],
+            Rectangle::new((602, 574).into(), (388, 216).into())
+        );
+
+        let dwindle = layout_rectangles(
+            LayoutMode::Dwindle,
+            area,
+            4,
+            10,
+            1,
+            0.6,
+            &[],
+            &[0.7, 0.25, 0.6],
+        );
+        assert_eq!(
+            dwindle[0],
+            Rectangle::new((10, 10).into(), (679, 780).into())
+        );
+        assert_eq!(
+            dwindle[1],
+            Rectangle::new((699, 10).into(), (291, 193).into())
+        );
+        assert_eq!(
+            dwindle[2],
+            Rectangle::new((699, 213).into(), (169, 577).into())
+        );
+        assert_eq!(
+            dwindle[3],
+            Rectangle::new((878, 213).into(), (112, 577).into())
+        );
+
+        assert_eq!(adjusted_split_ratio(0.5, 1.0), 0.9);
+        assert_eq!(adjusted_split_ratio(0.5, -1.0), 0.1);
+        assert_eq!(dwindle_split(0, 4, true), Some(0));
+        assert_eq!(dwindle_split(0, 4, false), None);
+        assert_eq!(dwindle_split(3, 4, true), Some(2));
+        assert_eq!(dwindle_split(3, 4, false), Some(1));
+    }
+
+    #[test]
+    fn mouse_hits_only_internal_layout_dividers() {
+        let inner = Rectangle::new((10, 10).into(), (980, 780).into());
+        let ratios = [0.7, 0.25, 0.6];
+        assert_eq!(
+            dwindle_divider_at(inner, 4, 10, &ratios, (689.0, 100.0).into(), 8),
+            Some(DividerHit {
+                split: 0,
+                vertical: true,
+                length: 970,
+                distance: 0.0,
+            })
+        );
+        assert_eq!(
+            dwindle_divider_at(inner, 4, 10, &ratios, (800.0, 203.0).into(), 8)
+                .map(|hit| hit.split),
+            Some(1)
+        );
+        assert_eq!(
+            dwindle_divider_at(inner, 4, 10, &ratios, (10.0, 100.0).into(), 8),
+            None
+        );
+        let (vertical, horizontal) =
+            dwindle_dividers_at(inner, 4, 10, &[0.5; 3], (505.0, 405.0).into(), 8);
+        assert!(vertical.is_some() && horizontal.is_some());
+        let (master, stack) = split_rectangle(inner, true, 0.6, 10);
+        assert_eq!(
+            divider_distance((592.0, 100.0).into(), master, stack, true, 8),
+            Some(0.0)
+        );
+        assert_eq!(
+            divider_distance((10.0, 100.0).into(), master, stack, true, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_resize_state_is_per_workspace_and_tracks_tile_count() {
+        let mut first = Workspace::default();
+        let second = Workspace::default();
+        first.master_count = 2;
+        first.master_ratio = Some(0.7);
+        first.dwindle_ratios = vec![0.6, 0.4];
+        first.sync_layout_sizes(4);
+        assert_eq!(first.master_ratio, Some(0.7));
+        assert_eq!(first.dwindle_ratios, [0.6, 0.4, 0.5]);
+        assert_eq!(first.master_weights, [1.0, 1.0, 1.0, 1.0]);
+        first.sync_layout_sizes(2);
+        assert_eq!(first.dwindle_ratios, [0.6]);
+        assert_eq!(second.master_ratio, None);
+        assert!(second.dwindle_ratios.is_empty());
+        let mut restored = Workspace::default();
+        restored.adopt_layout_state(&first);
+        assert_eq!(restored.master_count, 2);
+        assert_eq!(restored.master_ratio, Some(0.7));
+        assert_eq!(restored.dwindle_ratios, [0.6]);
+    }
+
+    #[test]
+    fn master_count_and_spatial_neighbors_are_bounded() {
+        let area = Rectangle::new((0, 0).into(), (1000, 800).into());
+        let split = layout_rectangles(LayoutMode::MasterStack, area, 4, 10, 2, 0.6, &[], &[]);
+        assert_eq!(split[0], Rectangle::new((10, 10).into(), (582, 385).into()));
+        assert_eq!(
+            split[1],
+            Rectangle::new((10, 405).into(), (582, 385).into())
+        );
+        assert_eq!(
+            split[2],
+            Rectangle::new((602, 10).into(), (388, 385).into())
+        );
+
+        let all_master = layout_rectangles(LayoutMode::MasterStack, area, 4, 10, 4, 0.6, &[], &[]);
+        assert!(all_master.iter().all(|rectangle| rectangle.loc.x == 10));
+        assert!(all_master.iter().all(|rectangle| rectangle.size.w == 980));
+
+        let geometries = [
+            Rectangle::new((0, 0).into(), (600, 100).into()),
+            Rectangle::new((0, 100).into(), (600, 100).into()),
+            Rectangle::new((600, 0).into(), (400, 60).into()),
+            Rectangle::new((600, 60).into(), (400, 60).into()),
+            Rectangle::new((600, 120).into(), (400, 60).into()),
+        ];
+        assert_eq!(master_neighbor(1, 2, true, 1, &geometries), Some(4));
+        assert_eq!(master_neighbor(3, 2, true, -1, &geometries), Some(0));
+        assert_eq!(master_neighbor(0, 2, true, -1, &geometries), None);
+        assert_eq!(master_neighbor(2, 2, true, 1, &geometries), None);
+        assert_eq!(master_neighbor(2, 2, false, 1, &geometries), Some(3));
     }
 
     #[test]
@@ -3532,6 +5116,70 @@ mod tests {
         assert_eq!(four_three.target.loc, (240.0, 0.0).into());
         assert_eq!(four_three.target.size, (1440.0, 1080.0).into());
         assert!(aspect_fit(Rectangle::default(), (1920, 1080).into()).is_none());
+    }
+
+    #[test]
+    fn tiled_drag_preview_scales_around_the_grab_point() {
+        let geometry = Rectangle::new((100, 50).into(), (800, 600).into());
+        assert_eq!(drag_preview_size(geometry.size), (600, 450).into());
+        assert_eq!(
+            drag_grab_offset((300.0, 200.0).into(), geometry),
+            (150.0, 112.5).into()
+        );
+        assert_eq!(drag_preview_size((1, 1).into()), (1, 1).into());
+    }
+
+    #[test]
+    fn floating_resize_tracks_edges_and_stays_in_work_area() {
+        let area = Rectangle::new((0, 0).into(), (1000, 800).into());
+        let initial = Rectangle::new((250, 200).into(), (500, 400).into());
+        assert_eq!(default_floating_size(area.size), (500, 400).into());
+        assert_eq!(
+            floating_resize_edges((250.0, 200.0).into(), initial, 8),
+            (Some(FloatingEdge::Start), Some(FloatingEdge::Start))
+        );
+        assert_eq!(
+            floating_resize_edges((500.0, 400.0).into(), initial, 8),
+            (None, None)
+        );
+        assert_eq!(
+            floating_resize_edges((750.0, 600.0).into(), initial, 8),
+            (Some(FloatingEdge::End), Some(FloatingEdge::End))
+        );
+
+        assert_eq!(
+            resized_floating_rectangle(
+                initial,
+                Some(FloatingEdge::Start),
+                Some(FloatingEdge::Start),
+                (100.0, 50.0).into(),
+                area,
+                MIN_ROW_HEIGHT,
+            ),
+            Rectangle::new((350, 250).into(), (400, 350).into())
+        );
+        assert_eq!(
+            resized_floating_rectangle(
+                initial,
+                Some(FloatingEdge::End),
+                Some(FloatingEdge::End),
+                (1000.0, 1000.0).into(),
+                area,
+                MIN_ROW_HEIGHT,
+            ),
+            Rectangle::new((250, 200).into(), (750, 600).into())
+        );
+        assert_eq!(
+            resized_floating_rectangle(
+                initial,
+                Some(FloatingEdge::Start),
+                Some(FloatingEdge::Start),
+                (1000.0, 1000.0).into(),
+                area,
+                MIN_ROW_HEIGHT,
+            ),
+            Rectangle::new((702, 552).into(), (48, 48).into())
+        );
     }
 
     #[test]

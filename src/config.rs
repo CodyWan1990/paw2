@@ -16,6 +16,8 @@ use smithay::{
 const DEFAULT_CONFIG: &str = r##"# Paw2 configuration
 
 [layout]
+# Layouts available to cycling, in cycle order.
+enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
 # Default fraction of the output width used by each column.
 column_width = 0.6
 # Widths cycled on the focused column.
@@ -96,10 +98,15 @@ swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
 cycle_column_width = ["Super+backslash"]
+cycle_layout = ["Super+Tab"]
+switch_layout_scrolling = []
+switch_layout_dwindle = []
+switch_layout_master_stack = []
+switch_layout_monocle = []
 decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
 increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
-decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Down"]
-increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Up"]
+decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
+increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
 toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
@@ -148,6 +155,8 @@ pub enum Action {
     ConsumeOrExpelLeft,
     ConsumeOrExpelRight,
     CycleColumnWidth,
+    CycleLayout,
+    SwitchLayout(LayoutMode),
     DecreaseColumnWidth,
     IncreaseColumnWidth,
     DecreaseRowHeight,
@@ -173,9 +182,21 @@ pub enum Action {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutMode {
+    #[default]
+    Scrolling,
+    Dwindle,
+    MasterStack,
+    Monocle,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutConfig {
+    #[serde(default = "default_enabled_layouts")]
+    pub enabled_layouts: Vec<LayoutMode>,
     pub column_width: f64,
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
@@ -546,6 +567,11 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("consume_or_expel_left",  Action::ConsumeOrExpelLeft,   "Super+bracketleft"),
     ("consume_or_expel_right", Action::ConsumeOrExpelRight,  "Super+bracketright"),
     ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
+    ("cycle_layout",           Action::CycleLayout,          "Super+Tab"),
+    ("switch_layout_scrolling", Action::SwitchLayout(LayoutMode::Scrolling), ""),
+    ("switch_layout_dwindle", Action::SwitchLayout(LayoutMode::Dwindle), ""),
+    ("switch_layout_master_stack", Action::SwitchLayout(LayoutMode::MasterStack), ""),
+    ("switch_layout_monocle", Action::SwitchLayout(LayoutMode::Monocle), ""),
     ("decrease_column_width",  Action::DecreaseColumnWidth,  ""),
     ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
     ("decrease_row_height",    Action::DecreaseRowHeight,    ""),
@@ -618,6 +644,15 @@ fn default_preset_column_widths() -> Vec<f64> {
     vec![0.33333, 0.5, 0.66667]
 }
 
+fn default_enabled_layouts() -> Vec<LayoutMode> {
+    vec![
+        LayoutMode::Scrolling,
+        LayoutMode::Dwindle,
+        LayoutMode::MasterStack,
+        LayoutMode::Monocle,
+    ]
+}
+
 fn default_transform() -> String {
     "normal".into()
 }
@@ -672,6 +707,18 @@ fn create_default(path: &Path) -> io::Result<()> {
 
 fn parse(source: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(source).map_err(|error| error.to_string())?;
+    if raw.layout.enabled_layouts.is_empty() {
+        return Err("layout.enabled_layouts must not be empty".into());
+    }
+    if raw
+        .layout
+        .enabled_layouts
+        .iter()
+        .enumerate()
+        .any(|(index, layout)| raw.layout.enabled_layouts[..index].contains(layout))
+    {
+        return Err("layout.enabled_layouts must not contain duplicates".into());
+    }
     if !raw.layout.column_width.is_finite() || !(0.1..=1.0).contains(&raw.layout.column_width) {
         return Err("layout.column_width must be between 0.1 and 1.0".into());
     }
@@ -984,7 +1031,7 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 61);
+        assert_eq!(config.bindings.len(), 62);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -1038,7 +1085,18 @@ mod tests {
         assert!(config.input.middle_click_paste);
         assert_eq!(config.theme, ThemeConfig::default());
         assert_eq!(config.layout.column_width, 0.6);
+        assert_eq!(config.layout.enabled_layouts, default_enabled_layouts());
         assert_eq!(config.layout.preset_column_widths, [0.33333, 0.5, 0.66667]);
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("Tab", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::CycleLayout)
+        );
         assert_eq!(config.appearance.gaps, 15);
         assert_eq!(config.appearance.focus_ring_width, 1);
         assert_eq!(
@@ -1102,6 +1160,27 @@ mod tests {
             parse(&invalid_width)
                 .unwrap_err()
                 .contains("between 0.1 and 1.0")
+        );
+
+        let no_layouts = DEFAULT_CONFIG.replace(
+            "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
+            "enabled_layouts = []",
+        );
+        assert!(
+            parse(&no_layouts)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
+        let duplicate_layout = DEFAULT_CONFIG.replace(
+            "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
+            "enabled_layouts = [\"scrolling\", \"scrolling\"]",
+        );
+        assert!(parse(&duplicate_layout).unwrap_err().contains("duplicates"));
+        let unknown_layout = DEFAULT_CONFIG.replace("\"dwindle\"", "\"grid\"");
+        assert!(
+            parse(&unknown_layout)
+                .unwrap_err()
+                .contains("unknown variant")
         );
 
         let invalid_presets = DEFAULT_CONFIG.replace(
@@ -1300,7 +1379,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 61);
+        assert_eq!(legacy.bindings.len(), 62);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -1332,7 +1411,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 48);
+        assert_eq!(config.bindings.len(), 49);
 
         let old_monitor_bindings = DEFAULT_CONFIG
             .replace(
