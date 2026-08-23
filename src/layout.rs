@@ -176,22 +176,6 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    fn replace_tiled_window(&mut self, old: &Window, new: Window) -> bool {
-        let Some((column, row)) = self
-            .tiled_slots()
-            .into_iter()
-            .find(|&(column, row)| &self.columns[column].windows[row] == old)
-        else {
-            return false;
-        };
-        let Some(index) = self.window_index(old) else {
-            return false;
-        };
-        self.columns[column].windows[row] = new.clone();
-        self.windows[index] = new;
-        true
-    }
-
     fn adopt_layout_state(&mut self, source: &Self) {
         self.layout = source.layout;
         self.master_count = source.master_count;
@@ -906,6 +890,23 @@ impl Scroller {
         &self.workspaces[self.active_workspace]
     }
 
+    /// The display's advertised modes, newest-API-first order preserved, with
+    /// the active one flagged. Refresh is millihertz in smithay and Hz in the
+    /// config, so it is converted here rather than at every reader.
+    fn modes(&self) -> Vec<crate::ipc::ModeState> {
+        let current = self.output.current_mode();
+        self.output
+            .modes()
+            .into_iter()
+            .map(|mode| crate::ipc::ModeState {
+                width: mode.size.w,
+                height: mode.size.h,
+                refresh: f64::from(mode.refresh) / 1000.0,
+                current: Some(mode) == current,
+            })
+            .collect()
+    }
+
     fn active_mut(&mut self) -> &mut Workspace {
         &mut self.workspaces[self.active_workspace]
     }
@@ -931,6 +932,53 @@ impl Scroller {
         };
         self.workspaces[workspace].add_group(group);
         true
+    }
+}
+
+impl Scrollers {
+    /// Everything a panel draws: the monitors with their workspace strips, and
+    /// every window with the workspace it sits on.
+    ///
+    /// Built here rather than in `ipc` because the workspace fields are private
+    /// to this module, and one method beats the five accessors it would take to
+    /// assemble this from outside.
+    pub fn ipc_state(&self) -> (Vec<crate::ipc::OutputState>, Vec<crate::ipc::WindowState>) {
+        let mut outputs = Vec::with_capacity(self.monitors.len());
+        let mut windows = Vec::new();
+        for monitor in &self.monitors {
+            let focused_output = self.focused_output.as_deref() == Some(monitor.name.as_str());
+            let active = &monitor.workspaces[monitor.active_workspace];
+            outputs.push(crate::ipc::OutputState {
+                name: monitor.name.clone(),
+                focused: focused_output,
+                active: monitor.active_workspace,
+                occupied: monitor
+                    .workspaces
+                    .iter()
+                    .map(|workspace| !workspace.windows.is_empty())
+                    .collect(),
+                layout: active.layout.name().into(),
+                modes: monitor.modes(),
+            });
+            for (index, workspace) in monitor.workspaces.iter().enumerate() {
+                for (position, window) in workspace.windows.iter().enumerate() {
+                    let (title, app_id) = crate::screencopy::window_metadata(window);
+                    windows.push(crate::ipc::WindowState {
+                        id: window.id(),
+                        title,
+                        app_id,
+                        output: monitor.name.clone(),
+                        workspace: index,
+                        // Only the focused monitor's active workspace can hold
+                        // the window that actually has focus.
+                        focused: focused_output
+                            && index == monitor.active_workspace
+                            && workspace.focused == Some(position),
+                    });
+                }
+            }
+        }
+        (outputs, windows)
     }
 }
 
@@ -1593,35 +1641,49 @@ impl Paw2 {
                 pointer,
             )
         };
-        let mut displaced = None;
-        if let Some(target_window) = target_window {
-            if same_origin {
+        if same_origin {
+            // Dropping onto another window on the screen you are already on is a
+            // reorder, and trading places is what that should do.
+            if let Some(target_window) = target_window {
                 let workspace = &mut self.scroller.monitors[source].workspaces[*origin_workspace];
                 if let Some(index) = workspace.tiled_slots().iter().position(|&(column, row)| {
                     workspace.columns[column].windows[row] == target_window
                 }) {
                     workspace.swap_tiled_at(index);
                 }
-            } else {
-                let source_workspace =
-                    &mut self.scroller.monitors[source].workspaces[*origin_workspace];
-                if source_workspace.replace_tiled_window(window, target_window.clone()) {
-                    let target_workspace = self.scroller.monitors[target].active_mut();
-                    if target_workspace.replace_tiled_window(&target_window, window.clone()) {
-                        target_workspace.focus_window(window);
-                        displaced = Some(target_window);
-                        self.scroller.focused_output =
-                            Some(self.scroller.monitors[target].name.clone());
-                    }
-                }
             }
-        } else if !same_origin {
+        } else {
+            // Onto another monitor it is a move, never a trade: nothing comes
+            // back the other way. `target_window` only says *where* to land -
+            // `tiled_drop_target` falls back to the nearest window by centre, so
+            // it is set for any drop onto a workspace that is not empty, and
+            // treating it as a swap partner is what made every drag exchange.
             let moved = self.scroller.monitors[source].workspaces[*origin_workspace]
                 .remove_where(|candidate| candidate == window);
             if let Some(window) = moved {
-                self.scroller.monitors[target]
-                    .active_mut()
-                    .add(window, false);
+                let target_workspace = self.scroller.monitors[target].active_mut();
+                let column = target_window.and_then(|target| {
+                    target_workspace
+                        .columns
+                        .iter()
+                        .position(|column| column.windows.contains(&target))
+                });
+                match column {
+                    Some(index) => target_workspace.add_group_at(
+                        WindowGroup {
+                            windows: vec![window],
+                            row_weights: vec![1.0],
+                            focused: 0,
+                            width: None,
+                            fullscreen: None,
+                            floating: false,
+                        },
+                        index,
+                    ),
+                    // Nothing under the pointer to land beside: the workspace is
+                    // empty, so the usual placement is the only placement.
+                    None => target_workspace.add(window, false),
+                }
                 self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
             }
         }
@@ -1629,9 +1691,6 @@ impl Paw2 {
         for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
             if index != target {
                 monitor.space.unmap_elem(window);
-            }
-            if let Some(displaced) = &displaced {
-                monitor.space.unmap_elem(displaced);
             }
         }
         self.relayout(true);
@@ -1921,9 +1980,23 @@ impl Paw2 {
         else {
             return;
         };
-        if self.scroller.set_focused_output(&name) {
+        self.focus_output_by_name(&name);
+    }
+
+    pub fn focus_output_by_name(&mut self, name: &str) {
+        if self.scroller.set_focused_output(name) {
             self.sync_focus();
         }
+    }
+
+    /// Focus a window by the id `ext-foreign-toplevel-list-v1` and the control
+    /// socket both use. Reuses the toplevel table rather than walking every
+    /// workspace, since that table exists precisely to map ids to windows.
+    pub fn focus_window_by_id(&mut self, id: usize) {
+        let Some(window) = self.toplevel_window(id) else {
+            return;
+        };
+        self.focus_window(&window);
     }
 
     pub fn add_window(&mut self, surface: ToplevelSurface) {
@@ -2634,6 +2707,7 @@ impl Paw2 {
     }
 
     fn sync_workspace_protocol(&mut self) {
+        self.ipc.touch();
         let active = self
             .scroller
             .monitors

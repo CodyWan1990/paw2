@@ -6,6 +6,7 @@ mod cursor;
 mod drm;
 mod handlers;
 mod input;
+mod ipc;
 mod layout;
 mod render;
 mod screencopy;
@@ -40,11 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         return Ok(());
     };
-    let (config, mut config_watcher) = config::load()?;
+    let (config, mut config_watcher, config_error) = config::load()?;
     apply_theme(&config.theme);
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
     let mut state = Paw2::new(&mut event_loop, display, config);
+    state.ipc.publish_config(config_watcher.document(), config_error);
+    ipc::init(&event_loop.handle(), &mut state);
     install_signal_handlers(event_loop.get_signal());
 
     event_loop.handle().insert_source(
@@ -55,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let restart_required = state.config.apply_runtime(config);
                     state.relayout(true);
                     drm::redraw(state);
+                    state.ipc.publish_config(config_watcher.document(), None);
                     tracing::info!("reloaded configuration");
                     if restart_required {
                         tracing::warn!(
@@ -63,7 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => tracing::warn!(%error, "could not reload configuration"),
+                Err(error) => {
+                    tracing::warn!(%error, "could not reload configuration");
+                    // The document is still the config Paw2 is running; a shell
+                    // needs both that and the reason its edit did not take.
+                    state
+                        .ipc
+                        .publish_config(config_watcher.document(), Some(error.to_string()));
+                }
             }
             TimeoutAction::ToDuration(Duration::from_millis(500))
         },
@@ -118,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let result = event_loop.run(None, &mut state, |state| {
+        ipc::flush(state);
         let _ = state.display_handle.flush_clients();
     });
     shutdown(state, event_loop, &mode);
@@ -161,6 +173,9 @@ fn activation_environment() -> Vec<&'static str> {
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",
     ];
+    if std::env::var_os("PAW2_SOCKET").is_some() {
+        variables.push("PAW2_SOCKET");
+    }
     for name in [
         "DISPLAY",
         "GNOME_KEYRING_CONTROL",
@@ -414,7 +429,14 @@ fn print_usage() {
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // stderr, not the default stdout: a display manager keeps the session's
+    // stderr (SDDM's `SessionLogFile`) and sends its stdout to /dev/null, so
+    // this is the difference between a startup failure being diagnosable and
+    // being invisible.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .init();
 }
 
 #[cfg(test)]

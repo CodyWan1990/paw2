@@ -1,8 +1,12 @@
 # Paw2
 
 Paw2 is an early standalone Wayland compositor written in Rust with Smithay.
-It is designed to stay lightweight and gaming-focused, with Quickshell planned
-as the shell layer.
+It is designed to stay lightweight and gaming-focused.
+
+It is complete on its own — workspaces, windows and screen capture all go
+through standard protocols, so Waybar, grim and the wlroots portal work with no
+setup. [paw2-shell](../paw2-shell/) is an *optional* Quickshell desktop on top
+of it, and Paw2 neither needs nor waits for it.
 
 ## Current features
 
@@ -22,7 +26,9 @@ as the shell layer.
 - Configurable focus, swapping, application launch, terminal, and quit controls
 - Keyboard, pointer, focus, clipboard, primary selection, and drag-and-drop plumbing
 - Standard monitor/window screenshots and DMA-BUF OBS capture through PipeWire
+- Clipboard manager support through ext-data-control
 - Application secret storage through GNOME Keyring's Secret Service
+- A control socket for a shell that wants more than the protocols expose
 
 ## Install
 
@@ -84,6 +90,11 @@ paw2
 On first run, Paw2 creates `paw2/config.toml` under `$XDG_CONFIG_HOME`, or
 `~/.config` when `XDG_CONFIG_HOME` is unset. Invalid settings are reported and
 never replaced silently.
+
+Every `*.toml` in `config.d/` beside it applies over `config.toml` in filename
+order and is watched the same way. A drop-in takes over each section it names
+whole, so deleting `config.d/` returns everything to your file — see
+[configuration drop-ins](#configuration-drop-ins).
 
 ```toml
 [layout]
@@ -205,8 +216,11 @@ widths must be between `0.1` and `1.0`. A lone window is consumed into the
 neighboring column with `consume_or_expel_left` or `consume_or_expel_right`;
 a window already sharing a column is expelled in that direction. Away from a
 resize edge, `Super+left-drag` lifts a tiled window at 75% size in every layout.
-Releasing over another tile swaps their positions; releasing on an empty output
-moves it there. Existing floating windows can also be dragged between monitors.
+Releasing over another tile on the same workspace swaps their positions.
+Releasing on a different monitor **moves** the window there — nothing comes back
+the other way — landing in the column you dropped on, or in the usual place when
+that workspace is empty. Existing floating windows can also be dragged between
+monitors.
 `toggle_floating` detaches only the focused window from a stack, sizes it to
 half the usable monitor width and height, and centers it. On floating windows,
 `Super+left-drag` within 8 logical pixels of an edge resizes that edge; corners
@@ -249,7 +263,11 @@ Wheel shortcuts run once per physical detent and consume matching mouse-wheel
 events; touchpad and unmatched scrolling continue to applications.
 Bindings, commands, layout, appearance, and `focus_follows_mouse` update within
 about half a second after saving the file. Invalid saves leave the last working
-settings active. Disabling a layout currently in use moves that workspace to
+settings active. At startup Paw2 keeps as much as it can rather than exiting: it
+logs the reason, then falls back to `config.toml` on its own — ignoring the
+generated `config.d/` drop-ins — and only to the built-in defaults if
+`config.toml` is itself invalid. A mistake never costs a session, and fixing the
+file repairs the running one. Disabling a layout currently in use moves that workspace to
 the first enabled layout. Focus follows mouse never scrolls the workspace
 viewport or raises floating windows. Backend, monitor, autostart, and `middle_click_paste`
 changes take effect after restarting Paw2. Theme settings are optional and also
@@ -318,11 +336,77 @@ swaybg -i /absolute/path/to/wallpaper.png -m fill
 
 The wallpaper makes application transparency and background blur visible.
 
+## Optional shell
+
+[paw2-shell](../paw2-shell/) is a Quickshell desktop — bar, launcher,
+notifications, settings — that talks to Paw2 two ways. Neither is required, and
+Paw2 behaves identically with nothing connected.
+
+### Configuration drop-ins
+
+Every `*.toml` in `~/.config/paw2/config.d/` applies over `config.toml`, in
+filename order, and the directory is watched exactly like `config.toml` is.
+
+**A drop-in takes over each section it names, whole.** Naming one key of
+`[appearance]` means the drop-in now supplies that entire section; the keys it
+leaves out fall back to Paw2's built-in defaults, and `config.toml`'s
+`[appearance]` is ignored until the drop-in stops naming it:
+
+```toml
+# ~/.config/paw2/config.d/shell.toml
+[appearance]
+gaps = 12          # this section is now the drop-in's — corner_radius,
+                   # blur and the rest revert to their built-in values
+```
+
+Sections no drop-in names are untouched, and two drop-ins naming the same
+section resolve by filename: the later one owns it.
+
+Section ownership is what lets a settings GUI keep coupled values consistent —
+`focus_ring_width` cannot exceed `gaps`, and a rule like that is unkeepable when
+one writer holds each side. It is equally useful without a GUI: keep
+machine-specific monitor layout in a drop-in and the rest in `config.toml`, or
+drop a file in to try something.
+
+**`rm -r ~/.config/paw2/config.d` reverts every change made through the settings
+UI**, returning each section to `config.toml` exactly as you wrote it. That is
+the supported way to hand the compositor back to your own file.
+
+If a drop-in is invalid, Paw2 keeps the config it is running and names every
+file in the merge, since a type error surfaces on the merged document and
+cannot be blamed on one of them.
+
+### Control socket
+
+Paw2 listens on `$PAW2_SOCKET` (in `$XDG_RUNTIME_DIR`, alongside the Wayland
+socket, and no more privileged than it). JSON, one message per line.
+
+It sends a `snapshot` — outputs with their workspace occupancy, active layout
+and display modes; windows with their title, app id, output and workspace — and
+a `config` message carrying the merged configuration and any error from the last
+load. Both arrive on connect, and afterwards whenever something changes,
+coalesced to at most one per event-loop iteration.
+
+It accepts four commands:
+
+```json
+{"cmd": "focus-workspace", "output": "DP-1", "index": 2}
+{"cmd": "focus-window", "id": 7}
+{"cmd": "set-layout", "layout": "dwindle"}
+{"cmd": "quit"}
+```
+
+Deliberately no "set config" command: settings go through `config.d/` above, so
+there is one path into the configuration and one thing deciding what is valid.
+
+Watch it with `socat -u UNIX-CONNECT:$PAW2_SOCKET -`.
+
 ## Roadmap
 
 - Tearing control once Smithay's async page-flip support is stable
 - Hardware-safe fullscreen direct scanout
-- Quickshell integration
+- Wlr-output-management, so monitor changes apply without a restart
+- Session lock and idle notification
 - Distribution packages
 
 ## Licensing

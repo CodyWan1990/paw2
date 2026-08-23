@@ -37,13 +37,18 @@ use smithay::{
         pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
-        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        selection::{
+            data_device::DataDeviceState, ext_data_control::DataControlState,
+            primary_selection::PrimarySelectionState,
+        },
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{XdgShellState, dialog::XdgDialogState},
         },
         shm::ShmState,
+        single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
     xwayland::X11Wm,
@@ -51,6 +56,7 @@ use smithay::{
 
 use crate::{
     config::{Action, Config},
+    ipc::IpcState,
     layout::Scrollers,
     screencopy::ScreencopyState,
     workspace::WorkspaceState,
@@ -82,6 +88,9 @@ pub struct Paw2 {
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub data_control_state: DataControlState,
+    pub _viewporter_state: ViewporterState,
+    pub _single_pixel_buffer_state: SinglePixelBufferState,
     pub dmabuf_state: DmabufState,
     pub _alpha_modifier_state: AlphaModifierState,
     pub _background_effect_state: Option<BackgroundEffectState>,
@@ -96,6 +105,7 @@ pub struct Paw2 {
     pub pending_wheel_action: Option<Action>,
     pub workspace_state: WorkspaceState,
     pub screencopy_state: ScreencopyState,
+    pub ipc: IpcState,
 }
 
 /// Whether the compositor is on its way out.
@@ -146,6 +156,19 @@ impl Paw2 {
             PrimarySelectionState::new_with_filter::<Self, _>(&display_handle, move |_| {
                 middle_click_paste
             });
+        // Clipboard managers read every copy the moment it happens, so this sits
+        // behind the same allowlist as the window list rather than being there
+        // for the taking. The default allowlist covers the usual wl-clipboard
+        // pairing; another manager needs its own entry in [security].
+        let data_control_state = DataControlState::new::<Self, _>(
+            &display_handle,
+            middle_click_paste.then_some(&primary_selection_state),
+            is_privileged,
+        );
+        // Both are handled entirely inside smithay's surface renderer, which
+        // Paw2 already goes through; neither needs anything of its own here.
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
         let alpha_modifier_state = AlphaModifierState::new::<Self>(&display_handle);
         let workspace_state = WorkspaceState::new(&display_handle);
         let screencopy_state = ScreencopyState::new(&display_handle);
@@ -183,6 +206,9 @@ impl Paw2 {
             seat_state,
             data_device_state,
             primary_selection_state,
+            data_control_state,
+            _viewporter_state: viewporter_state,
+            _single_pixel_buffer_state: single_pixel_buffer_state,
             dmabuf_state: DmabufState::new(),
             _alpha_modifier_state: alpha_modifier_state,
             _background_effect_state: None,
@@ -197,6 +223,7 @@ impl Paw2 {
             pending_wheel_action: None,
             workspace_state,
             screencopy_state,
+            ipc: IpcState::default(),
         }
     }
 

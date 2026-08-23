@@ -13,6 +13,15 @@ use smithay::{
     utils::Transform,
 };
 
+/// Drop-in directory beside `config.toml`. Every `*.toml` in it applies over the
+/// user's config in filename order, which is how a settings GUI changes values
+/// without ever writing - or reformatting - a hand-edited file.
+///
+/// A drop-in takes over each section it names *whole* (see [`replace_sections`]),
+/// so deleting this directory returns every section to `config.toml` exactly as
+/// its author left it.
+const OVERLAY_DIR: &str = "config.d";
+
 const DEFAULT_CONFIG: &str = r##"# Paw2 configuration
 
 [layout]
@@ -61,6 +70,8 @@ middle_click_paste = true
 #qt_style = "Breeze"
 #font = "Monofur Nerd Font Propo 12"
 
+# Hand-edited only. paw2-shell never writes this section, so drm_device and
+# connector stay yours for fixing a machine that will not start.
 [backend]
 # Automatically scan out compatible fullscreen buffers on the DRM primary plane.
 direct_scanout = true
@@ -81,10 +92,18 @@ direct_scanout = true
 
 [security]
 # Clients allowed to bind the privileged globals: the window list
-# (ext-foreign-toplevel-list-v1) and per-window capture. Everything else can
-# still capture whole outputs, so grim and wf-recorder work without an entry.
-# Matched against the basename of the connecting process's executable.
-privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
+# (ext-foreign-toplevel-list-v1), per-window capture, and the clipboard manager
+# interface (ext-data-control-v1, which sees every copy as it happens).
+# Everything else can still capture whole outputs, so grim and wf-recorder work
+# without an entry. Matched against the basename of the connecting process's
+# executable, so a clipboard history tool needs whatever binary actually
+# connects - for `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
+privileged_clients = [
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal",
+  "wl-paste",
+  "wl-copy",
+]
 
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
@@ -199,15 +218,40 @@ pub enum LayoutMode {
     Monocle,
 }
 
+impl LayoutMode {
+    /// The name this layout is written as in the config, which is also the name
+    /// the control socket reports and accepts.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Scrolling => "scrolling",
+            Self::Dwindle => "dwindle",
+            Self::MasterStack => "master_stack",
+            Self::Monocle => "monocle",
+        }
+    }
+}
+
+/// Every field defaults, so a `config.d/` drop-in that owns `[layout]` may name
+/// only the keys it has a control for. The values match `DEFAULT_CONFIG`, which
+/// `parses_the_default_config` holds them to.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LayoutConfig {
-    #[serde(default = "default_enabled_layouts")]
     pub enabled_layouts: Vec<LayoutMode>,
     pub column_width: f64,
-    #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
     pub center_focused_column: bool,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled_layouts: default_enabled_layouts(),
+            column_width: 0.6,
+            preset_column_widths: default_preset_column_widths(),
+            center_focused_column: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -275,7 +319,12 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            privileged_clients: vec!["xdg-desktop-portal-wlr".into(), "xdg-desktop-portal".into()],
+            privileged_clients: vec![
+                "xdg-desktop-portal-wlr".into(),
+                "xdg-desktop-portal".into(),
+                "wl-paste".into(),
+                "wl-copy".into(),
+            ],
         }
     }
 }
@@ -397,44 +446,191 @@ impl Config {
     }
 }
 
+/// Merge `overlay` into `base`, key by key.
+///
+/// This is how `config.toml` lands on the compiled defaults: tables merge, so a
+/// hand-written section only has to name what it changes. Everything else
+/// replaces, arrays included: `enabled_layouts`, `preset_column_widths`, the
+/// keybind lists and `[[monitors]]` are complete statements rather than
+/// additions, and appending to them would produce configs nobody asked for.
+///
+/// `config.d/` drop-ins do not come through here - see [`replace_sections`].
+fn merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+/// Overlay a `config.d/` drop-in onto `base`, replacing each section it names
+/// whole rather than merging into it key by key.
+///
+/// A drop-in is generated by a settings UI, and a section it writes is a section
+/// it owns. Mixing its `[appearance]` into the user's key by key leaves a
+/// coupled rule like `focus_ring_width <= gaps` with two writers and no single
+/// one able to keep it - which is exactly how a settings slider once refused
+/// every later edit. One section, one owner. It also means deleting `config.d/`
+/// hands every section back to `config.toml` precisely as its author left it.
+fn replace_sections(base: &mut toml::Value, drop_in: toml::Value) {
+    if let (toml::Value::Table(base), toml::Value::Table(drop_in)) = (base, drop_in) {
+        for (section, value) in drop_in {
+            base.insert(section, value);
+        }
+    }
+}
+
+/// Watches every file feeding the merged config and re-reads them as a set.
 pub struct ConfigWatcher {
     path: PathBuf,
-    source: String,
-    modified: Option<std::time::SystemTime>,
+    /// Each layer's text in merge order. Compared verbatim so that saving a
+    /// file without changing it does not churn the compositor.
+    sources: Vec<String>,
+    /// Layer count and newest mtime. The cheap gate the twice-a-second poll
+    /// stops at when nothing changed; the count is what catches a drop-in being
+    /// added or deleted without any surviving file being touched.
+    stamp: Option<(usize, std::time::SystemTime)>,
+    /// The merged document behind the live `Config`. Kept so the IPC layer can
+    /// hand a shell the effective config without a second copy of the defaults.
+    document: toml::Value,
 }
 
 impl ConfigWatcher {
-    /// Polled twice a second for the life of the session, so the common case -
-    /// nothing changed - stops at the metadata check rather than reading and
-    /// comparing the whole file. An unreadable mtime just falls through to the
-    /// read, which is the behaviour this had before.
-    fn unchanged_since_last_read(&mut self) -> bool {
-        let Ok(modified) = fs::metadata(&self.path).and_then(|data| data.modified()) else {
-            self.modified = None;
-            return false;
+    /// The files that feed the merge, lowest precedence first: `config.toml`,
+    /// then every `config.d/*.toml` in filename order.
+    ///
+    /// The drop-in directory is what lets a settings GUI own one generated file
+    /// without ever writing the config a user hand-edits.
+    fn layers(&self) -> Vec<PathBuf> {
+        let mut layers = vec![self.path.clone()];
+        let Some(directory) = self.path.parent().map(|parent| parent.join(OVERLAY_DIR)) else {
+            return layers;
         };
-        if self.modified == Some(modified) {
-            return true;
+        // A missing drop-in directory is the normal case, not an error.
+        let Ok(entries) = fs::read_dir(directory) else {
+            return layers;
+        };
+        let mut overlays = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "toml"))
+            .collect::<Vec<_>>();
+        overlays.sort();
+        layers.extend(overlays);
+        layers
+    }
+
+    /// `None` when any layer's metadata is unreadable, which falls through to
+    /// the full read rather than guessing - the behaviour this had before.
+    fn stamp(layers: &[PathBuf]) -> Option<(usize, std::time::SystemTime)> {
+        let mut newest = std::time::SystemTime::UNIX_EPOCH;
+        for layer in layers {
+            let modified = fs::metadata(layer).and_then(|data| data.modified()).ok()?;
+            newest = newest.max(modified);
         }
-        self.modified = Some(modified);
-        false
+        Some((layers.len(), newest))
+    }
+
+    /// Read every layer and merge it over the compiled defaults.
+    ///
+    /// Starting from `DEFAULT_CONFIG` rather than an empty document is what
+    /// makes a partial drop-in legal: `RawConfig` denies unknown fields and
+    /// requires `layout` and `bindings`, and the base layer always supplies
+    /// them. It also means the merged document is the complete effective
+    /// config, with no second copy of the defaults anywhere.
+    fn read(layers: &[PathBuf]) -> io::Result<(toml::Value, Vec<String>)> {
+        let mut document = toml::from_str(DEFAULT_CONFIG)
+            .expect("the compiled default config is valid TOML");
+        let mut sources = Vec::with_capacity(layers.len());
+        for (index, layer) in layers.iter().enumerate() {
+            let source = fs::read_to_string(layer)
+                .map_err(|error| invalid_data(layer, format!("could not read config: {error}")))?;
+            let overlay = toml::from_str(&source).map_err(|error: toml::de::Error| {
+                invalid_data(layer, error.to_string())
+            })?;
+            // `config.toml` is the base layer and merges key by key, so a partial
+            // hand-written section still inherits the compiled defaults around it.
+            // Everything after it is a `config.d/` drop-in, which owns whole
+            // sections - see `replace_sections`.
+            if index == 0 {
+                merge(&mut document, overlay);
+            } else {
+                replace_sections(&mut document, overlay);
+            }
+            sources.push(source);
+        }
+        Ok((document, sources))
+    }
+
+    /// The merged config as it was last parsed successfully.
+    pub fn document(&self) -> &toml::Value {
+        &self.document
     }
 
     pub fn reload(&mut self) -> io::Result<Option<Config>> {
-        if self.unchanged_since_last_read() {
+        let layers = self.layers();
+        let stamp = Self::stamp(&layers);
+        if stamp.is_some() && stamp == self.stamp {
             return Ok(None);
         }
-        let source = fs::read_to_string(&self.path)
-            .map_err(|error| invalid_data(&self.path, format!("could not read config: {error}")))?;
-        if source == self.source {
-            return Ok(None);
-        }
+        self.stamp = stamp;
 
-        self.source = source;
-        parse(&self.source)
-            .map(Some)
-            .map_err(|error| invalid_data(&self.path, error))
+        let (document, sources) = Self::read(&layers)?;
+        if sources == self.sources {
+            return Ok(None);
+        }
+        self.sources = sources;
+        let config = parse_value(document.clone()).map_err(|error| blame(&layers, error))?;
+        // Only now: `document()` is what Paw2 is running, and a rejected save
+        // must leave the last config that parsed on show, not its own values
+        // under a banner saying they were refused.
+        self.document = document;
+        Ok(Some(config))
     }
+
+    /// Parse `config.toml` alone, ignoring `config.d/`.
+    ///
+    /// A drop-in is generated by the shell's settings UI. A value it rejects
+    /// would otherwise cost the session the whole config, `autostart` included,
+    /// so the shell that would show the error is the one thing that cannot
+    /// start. Keeping the hand-written layer breaks that circle.
+    ///
+    /// `stamp` and `sources` stay as the failed [`Self::reload`] left them, so
+    /// the next edit to the drop-in retries the full merge.
+    fn base_only(&mut self) -> io::Result<Config> {
+        let layers = [self.path.clone()];
+        let (document, _) = Self::read(&layers)?;
+        let config = parse_value(document.clone()).map_err(|error| blame(&layers, error))?;
+        self.document = document;
+        Ok(config)
+    }
+}
+
+/// Name every layer that fed a merge in the error from validating it.
+///
+/// Validation runs on the merged document, which carries no record of which
+/// layer supplied a given key. Naming them all beats confidently blaming
+/// config.toml for a drop-in's typo.
+fn blame(layers: &[PathBuf], error: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: {error}",
+            layers
+                .iter()
+                .map(|layer| layer.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -703,7 +899,21 @@ fn default_transform() -> String {
     "normal".into()
 }
 
-pub fn load() -> io::Result<(Config, ConfigWatcher)> {
+/// Load the config, plus the watcher that keeps it current and the reason the
+/// user's config was not fully used, if it was not.
+///
+/// A broken config is not fatal. At runtime an invalid save already leaves the
+/// last working settings active; at startup there are no working settings to
+/// keep, so Paw2 drops layers instead. Exiting here would mean a display
+/// manager returns the user to the greeter with the reason on a stderr nobody
+/// will read - a whole session lost to a typo. Starting means they get a
+/// desktop, the error reaches the log and the shell, and the watcher picks up
+/// the fix within half a second.
+///
+/// Layers are dropped in the order that keeps the most of what a person wrote:
+/// the full merge, then `config.toml` alone without the shell's generated
+/// `config.d/`, then the compiled defaults.
+pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
     let path = config_path()?;
     create_default(&path).map_err(|error| {
         io::Error::new(
@@ -714,17 +924,45 @@ pub fn load() -> io::Result<(Config, ConfigWatcher)> {
             ),
         )
     })?;
-    let source = fs::read_to_string(&path)
-        .map_err(|error| invalid_data(&path, format!("could not read config: {error}")))?;
-    let config = parse(&source).map_err(|error| invalid_data(&path, error))?;
     let mut watcher = ConfigWatcher {
         path,
-        source,
-        modified: None,
+        sources: Vec::new(),
+        stamp: None,
+        document: toml::Value::Table(toml::Table::new()),
     };
-    // Seed the stamp so the first tick does not re-read what load just read.
-    watcher.unchanged_since_last_read();
-    Ok((config, watcher))
+    // A fresh watcher has no stamp and no cached sources, so neither change
+    // gate can short-circuit here; this reads, and seeds both for the poll.
+    let error = match watcher.reload() {
+        Ok(config) => {
+            return Ok((
+                config.expect("a fresh watcher always reports the config as changed"),
+                watcher,
+                None,
+            ));
+        }
+        Err(error) => error.to_string(),
+    };
+    match watcher.base_only() {
+        Ok(config) => {
+            tracing::error!(%error, "ignoring config.d/ and starting from config.toml");
+            Ok((config, watcher, Some(error)))
+        }
+        Err(_) => {
+            tracing::error!(%error, "starting with the default configuration");
+            // What Paw2 is running, so a shell has something to show beside the
+            // error rather than an empty document.
+            watcher.document =
+                toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML");
+            Ok((defaults(), watcher, Some(error)))
+        }
+    }
+}
+
+/// The compiled defaults, as a `Config`. Also the base layer of every merge,
+/// so `parse(DEFAULT_CONFIG)` is already covered by the tests.
+fn defaults() -> Config {
+    parse_value(toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML"))
+        .expect("the compiled default config is valid")
 }
 
 fn config_path() -> io::Result<PathBuf> {
@@ -746,11 +984,14 @@ fn config_path() -> io::Result<PathBuf> {
 }
 
 fn create_default(path: &Path) -> io::Result<()> {
+    let directory = path.parent().unwrap();
+    // Created even when the config already exists, so a settings GUI always has
+    // somewhere to write and the drop-in mechanism is visible in a file manager.
+    fs::create_dir_all(directory.join(OVERLAY_DIR))?;
     if path.exists() {
         return Ok(());
     }
 
-    fs::create_dir_all(path.parent().unwrap())?;
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => file.write_all(DEFAULT_CONFIG.as_bytes()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -758,8 +999,18 @@ fn create_default(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Parse a single config document. Production goes through `ConfigWatcher`,
+/// which merges several; this is the one-document form the tests are written
+/// against.
+#[cfg(test)]
 fn parse(source: &str) -> Result<Config, String> {
-    let raw: RawConfig = toml::from_str(source).map_err(|error| error.to_string())?;
+    parse_value(toml::from_str(source).map_err(|error: toml::de::Error| error.to_string())?)
+}
+
+fn parse_value(document: toml::Value) -> Result<Config, String> {
+    let raw: RawConfig = document
+        .try_into()
+        .map_err(|error: toml::de::Error| error.to_string())?;
     if raw.layout.enabled_layouts.is_empty() {
         return Err("layout.enabled_layouts must not be empty".into());
     }
@@ -1055,6 +1306,15 @@ fn invalid_data(path: &Path, message: impl std::fmt::Display) -> io::Error {
     )
 }
 
+/// The shipped allowlist, verbatim, for the tests that swap it out.
+#[cfg(test)]
+const PRIVILEGED: &str = r#"privileged_clients = [
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal",
+  "wl-paste",
+  "wl-copy",
+]"#;
+
 /// Appended to `DEFAULT_CONFIG` by the tests that need configured monitors.
 #[cfg(test)]
 const MONITORS: &str = r#"
@@ -1175,13 +1435,15 @@ mod tests {
         assert_eq!(config.security, SecurityConfig::default());
         assert_eq!(
             config.security.privileged_clients,
-            ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
+            [
+                "xdg-desktop-portal-wlr",
+                "xdg-desktop-portal",
+                "wl-paste",
+                "wl-copy"
+            ]
         );
         assert!(
-            parse(&DEFAULT_CONFIG.replace(
-                r#"privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]"#,
-                r#"privileged_clients = ["  "]"#,
-            ))
+            parse(&DEFAULT_CONFIG.replace(PRIVILEGED, r#"privileged_clients = ["  "]"#))
             .unwrap_err()
             .contains("cannot be empty")
         );
@@ -1610,6 +1872,224 @@ swap_right = ["Super+Shift+l"]
         );
     }
 
+    /// A scratch config tree with `config.toml` and a `config.d/` beside it.
+    fn config_tree(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("paw2-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(root.join(OVERLAY_DIR)).unwrap();
+        fs::write(root.join("config.toml"), DEFAULT_CONFIG).unwrap();
+        root
+    }
+
+    fn watcher_at(root: &Path) -> ConfigWatcher {
+        ConfigWatcher {
+            path: root.join("config.toml"),
+            sources: Vec::new(),
+            stamp: None,
+            document: toml::Value::Table(toml::Table::new()),
+        }
+    }
+
+    #[test]
+    fn layout_names_round_trip_through_the_config_spelling() {
+        // `name` is what the control socket reports and accepts, so it has to
+        // stay the spelling serde reads back - including the underscore.
+        for layout in [
+            LayoutMode::Scrolling,
+            LayoutMode::Dwindle,
+            LayoutMode::MasterStack,
+            LayoutMode::Monocle,
+        ] {
+            let quoted = format!("\"{}\"", layout.name());
+            assert_eq!(
+                serde_json::from_str::<LayoutMode>(&quoted).unwrap(),
+                layout,
+                "{}",
+                layout.name()
+            );
+        }
+    }
+
+    #[test]
+    fn merges_tables_and_replaces_arrays() {
+        let mut base = toml::from_str::<toml::Value>(
+            "[a]\nkept = 1\nreplaced = 2\n[a.deep]\nkept = 3\nreplaced = 4\nlist = [1, 2, 3]\n",
+        )
+        .unwrap();
+        let overlay = toml::from_str::<toml::Value>(
+            "[a]\nreplaced = 20\nadded = 30\n[a.deep]\nreplaced = 40\nlist = [9]\n",
+        )
+        .unwrap();
+        merge(&mut base, overlay);
+
+        let a = base.get("a").unwrap();
+        assert_eq!(a.get("kept").unwrap().as_integer(), Some(1));
+        assert_eq!(a.get("replaced").unwrap().as_integer(), Some(20));
+        assert_eq!(a.get("added").unwrap().as_integer(), Some(30));
+        let deep = a.get("deep").unwrap();
+        assert_eq!(deep.get("kept").unwrap().as_integer(), Some(3));
+        assert_eq!(deep.get("replaced").unwrap().as_integer(), Some(40));
+        // Arrays are complete statements: the overlay's list wins outright
+        // rather than appending to the three entries underneath it.
+        assert_eq!(deep.get("list").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_last_drop_in_to_name_a_section_owns_it_whole() {
+        let root = config_tree("overlay-order");
+        // Neither drop-in carries `layout` or `bindings`, which `RawConfig`
+        // requires: this only parses because the compiled defaults are the
+        // bottom layer.
+        fs::write(
+            root.join(OVERLAY_DIR).join("10-first.toml"),
+            "[appearance]\ngaps = 40\ncorner_radius = 3\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(OVERLAY_DIR).join("20-second.toml"),
+            "[appearance]\ngaps = 41\n",
+        )
+        .unwrap();
+
+        let config = watcher_at(&root).reload().unwrap().unwrap();
+        // Later filename wins the section ...
+        assert_eq!(config.appearance.gaps, 41);
+        // ... whole: the earlier drop-in's corner_radius goes with it, back to
+        // the compiled default rather than lingering under the new owner.
+        assert_eq!(config.appearance.corner_radius, 8);
+        // A section nobody claimed is still config.toml's.
+        assert_eq!(config.layout.column_width, 0.6);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_drop_in_section_replaces_config_toml_rather_than_merging_into_it() {
+        let root = config_tree("overlay-owns");
+        // config.toml sets both halves of the section, as a hand-written one does.
+        fs::write(
+            root.join("config.toml"),
+            DEFAULT_CONFIG
+                .replace("gaps = 15", "gaps = 40")
+                .replace("focus_follows_mouse = false", "focus_follows_mouse = true")
+                .replace("center_focused_column = false", "center_focused_column = true"),
+        )
+        .unwrap();
+        // The drop-in claims [layout] while naming only the one key it has a
+        // control for. Partial sections are legal because every field defaults.
+        fs::write(
+            root.join(OVERLAY_DIR).join("shell.toml"),
+            "[layout]\ncolumn_width = 0.35\n",
+        )
+        .unwrap();
+
+        let config = watcher_at(&root).reload().unwrap().unwrap();
+        assert_eq!(config.layout.column_width, 0.35);
+        // The claimed section comes from the drop-in entirely: config.toml's
+        // `center_focused_column` is inert, not merged underneath.
+        assert!(!config.layout.center_focused_column);
+        // ... and the keys it never named fall back to the compiled defaults.
+        assert_eq!(config.layout.enabled_layouts, default_enabled_layouts());
+        // Sections the drop-in did not claim are untouched.
+        assert_eq!(config.appearance.gaps, 40);
+        assert!(config.input.focus_follows_mouse);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watches_drop_ins_being_added_edited_and_removed() {
+        let root = config_tree("overlay-watch");
+        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        let mut watcher = watcher_at(&root);
+        assert_eq!(
+            watcher.reload().unwrap().unwrap().appearance.gaps,
+            15,
+            "the default config alone"
+        );
+        assert!(watcher.reload().unwrap().is_none());
+
+        // Added. The file count moved even though config.toml did not.
+        fs::write(&drop_in, "[appearance]\ngaps = 40\n").unwrap();
+        assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 40);
+
+        // Edited.
+        fs::write(&drop_in, "[appearance]\ngaps = 41\n").unwrap();
+        assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 41);
+
+        // Rewritten with identical bytes: a save that changed nothing must not
+        // churn the compositor, even though the mtime moved.
+        fs::write(&drop_in, "[appearance]\ngaps = 41\n").unwrap();
+        assert!(watcher.reload().unwrap().is_none());
+
+        // Removed - back to what config.toml says.
+        fs::remove_file(&drop_in).unwrap();
+        assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 15);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_drop_in_names_itself_and_leaves_the_config_alone() {
+        let root = config_tree("overlay-broken");
+        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        let mut watcher = watcher_at(&root);
+        watcher.reload().unwrap().unwrap();
+
+        fs::write(&drop_in, "[appearance]\ngaps = \"forty\"\n").unwrap();
+        let error = watcher.reload().unwrap_err().to_string();
+        assert!(error.contains("shell.toml"), "{error}");
+
+        // The caller keeps the last good config, and a fixed file recovers
+        // without needing config.toml to be touched.
+        fs::write(&drop_in, "[appearance]\ngaps = 40\n").unwrap();
+        assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 40);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_drop_in_falls_back_to_config_toml_at_startup() {
+        // The real failure this exists for: the settings UI wrote a focus ring
+        // wider than the user's gaps, and dropping the whole config took
+        // `autostart` with it - so the shell that would have shown the error
+        // was the one thing that could not start.
+        let root = config_tree("overlay-rejected");
+        // A fragment, not a whole config: every layer merges over DEFAULT_CONFIG.
+        fs::write(
+            root.join("config.toml"),
+            "[autostart]\ncommands = [[\"qs\", \"-c\", \"paw2-shell\"]]\n",
+        )
+        .unwrap();
+        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        fs::write(&drop_in, "[appearance]\nfocus_ring_width = 17\n").unwrap();
+        let mut watcher = watcher_at(&root);
+
+        let error = watcher.reload().unwrap_err().to_string();
+        assert!(error.contains("focus_ring_width"), "{error}");
+
+        // config.toml alone still parses, autostart included, and that document
+        // is what a shell is shown.
+        let config = watcher.base_only().unwrap();
+        assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
+        assert_eq!(config.appearance.focus_ring_width, 1);
+        assert_eq!(
+            watcher.document()["appearance"]["focus_ring_width"].as_integer(),
+            Some(1)
+        );
+
+        // Fixing the drop-in recovers the full merge, with config.toml untouched.
+        fs::write(&drop_in, "[appearance]\nfocus_ring_width = 3\n").unwrap();
+        let config = watcher.reload().unwrap().unwrap();
+        assert_eq!(config.appearance.focus_ring_width, 3);
+        assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn creates_default_without_overwriting() {
         let nonce = std::time::SystemTime::now()
@@ -1643,16 +2123,17 @@ swap_right = ["Super+Shift+l"]
 
         let mut watcher = ConfigWatcher {
             path: path.clone(),
-            source: with_monitors.clone(),
-            modified: None,
+            sources: vec![with_monitors.clone()],
+            stamp: None,
+            document: toml::Value::Table(toml::Table::new()),
         };
         assert!(watcher.reload().unwrap().is_none());
 
         // Prove the mtime gate short-circuits rather than re-reading: the cached
         // source is now a lie, and an untouched file must still report no change.
-        watcher.source = "stale".into();
+        watcher.sources = vec!["stale".into()];
         assert!(watcher.reload().unwrap().is_none());
-        watcher.source = with_monitors.clone();
+        watcher.sources = vec![with_monitors.clone()];
 
         let changed = with_monitors
             .replace("column_width = 0.6", "column_width = 0.7")
@@ -1679,11 +2160,8 @@ swap_right = ["Super+Shift+l"]
                 .any(|command| command[0] == "fuzzel")
         );
 
-        let updated = parse(&with_monitors.replace(
-            r#"privileged_clients = ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]"#,
-            r#"privileged_clients = ["waybar"]"#,
-        ))
-        .unwrap();
+        let updated =
+            parse(&with_monitors.replace(PRIVILEGED, r#"privileged_clients = ["waybar"]"#)).unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.security, SecurityConfig::default());
 

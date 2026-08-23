@@ -41,6 +41,7 @@ use smithay::{
             data_device::{
                 DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
             },
+            ext_data_control::{DataControlHandler, DataControlState},
             primary_selection::{
                 PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
             },
@@ -536,6 +537,11 @@ impl DataDeviceHandler for Paw2 {
 impl PrimarySelectionHandler for Paw2 {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
+    }
+}
+impl DataControlHandler for Paw2 {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
     }
 }
 impl DndGrabHandler for Paw2 {}

@@ -115,6 +115,7 @@ impl ScreencopyState {
 
 impl Paw2 {
     pub(crate) fn capture_window_added(&mut self, window: &Window) {
+        self.ipc.touch();
         let (title, app_id) = window_metadata(window);
         let handle = self
             .screencopy_state
@@ -126,6 +127,7 @@ impl Paw2 {
     }
 
     pub(crate) fn capture_window_removed(&mut self, window: &Window) {
+        self.ipc.touch();
         if let Some((_, handle)) = self.screencopy_state.toplevels.remove(&window.id()) {
             self.screencopy_state
                 .foreign_toplevel_list
@@ -147,7 +149,16 @@ impl Paw2 {
         }
     }
 
+    /// The window behind a foreign-toplevel id, if it is still mapped.
+    pub(crate) fn toplevel_window(&self, id: usize) -> Option<Window> {
+        self.screencopy_state
+            .toplevels
+            .get(&id)
+            .and_then(|(window, _)| window.upgrade())
+    }
+
     pub(crate) fn capture_window_metadata_changed(&mut self, window: &Window) {
+        self.ipc.touch();
         let Some((_, handle)) = self.screencopy_state.toplevels.get(&window.id()) else {
             return;
         };
@@ -198,7 +209,7 @@ fn capture_shm_formats() -> Vec<wl_shm::Format> {
     vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]
 }
 
-fn window_metadata(window: &Window) -> (String, String) {
+pub(crate) fn window_metadata(window: &Window) -> (String, String) {
     if let Some(surface) = window.toplevel() {
         return with_states(surface.wl_surface(), |states| {
             let attributes = states

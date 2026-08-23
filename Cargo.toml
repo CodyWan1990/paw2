@@ -11,6 +11,7 @@ codegen-units = 1
 # Only for installing the SIGTERM/SIGINT handlers; rustix has no stable sigaction.
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
