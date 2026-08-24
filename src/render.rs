@@ -1,4 +1,7 @@
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+};
 
 use smithay::{
     backend::{
@@ -228,6 +231,43 @@ void main() {
 }
 "#;
 
+/// Drawn behind a window: the same rounded rectangle, blurred outwards and
+/// shifted by the configured offset. The element covers the window grown by
+/// `spread` on every side and moved by that offset, so the shadow's own shape
+/// sits dead centre and the window it belongs to sits `window_offset` away.
+/// Logical pixels throughout, like the ring.
+const SHADOW_SHADER: &str = r#"
+precision highp float;
+
+uniform vec2 size;
+uniform float alpha;
+uniform float corner_radius;
+uniform float spread;
+uniform vec4 shadow_color;
+uniform vec2 window_offset;
+varying vec2 v_coords;
+
+float rounded_box(vec2 point, vec2 half_size, float radius) {
+    vec2 q = abs(point) - half_size + radius;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+
+void main() {
+    vec2 half_size = max(size * 0.5 - spread, vec2(0.0, 0.0));
+    float radius = min(corner_radius, min(half_size.x, half_size.y));
+    vec2 point = v_coords * size - size * 0.5;
+
+    // Half the falloff falls inside the shape and half outside, which is what
+    // makes the edge read as blurred rather than as a bigger rectangle.
+    float coverage = 1.0 - smoothstep(-spread, spread, rounded_box(point, half_size, radius));
+    // Punch the window back out. Windows are usually translucent here, and a
+    // shadow left underneath one would darken the window itself.
+    coverage *= smoothstep(-1.0, 0.0, rounded_box(point + window_offset, half_size, radius));
+
+    gl_FragColor = shadow_color * coverage * alpha;
+}
+"#;
+
 /// Space elements as this compositor builds them.
 type SpaceElements = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
 
@@ -236,7 +276,7 @@ smithay::backend::renderer::element::render_elements! {
     Space=SpaceElements,
     Window=WindowShaderElement,
     Blur=BlurElement,
-    Ring=PixelShaderElement,
+    Shader=PixelShaderElement,
     Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Fullscreen=FullscreenElement,
@@ -261,6 +301,11 @@ pub struct Effects {
     /// would never idle.
     ring: Option<PixelShaderElement>,
     ring_program: Option<GlesPixelProgram>,
+    shadow_program: Option<GlesPixelProgram>,
+    /// One cached shadow per window per output, kept for the same reason the
+    /// ring is: a fresh `PixelShaderElement` takes a fresh id every frame, and
+    /// the damage tracker would then repaint it forever.
+    shadows: HashMap<(String, Id), PixelShaderElement>,
     blur_programs: Option<BlurPrograms>,
     blur_commit: CommitCounter,
     window_program: Option<GlesTexProgram>,
@@ -279,12 +324,18 @@ impl Effects {
         let ring_program = (appearance.focus_ring_width > 0)
             .then(|| compile_ring(renderer))
             .flatten();
+        let shadow_program = appearance
+            .shadow_enabled()
+            .then(|| compile_shadow(renderer))
+            .flatten();
         let window_program = window_effects(&appearance)
             .then(|| compile_window(renderer))
             .flatten();
         Self {
             ring: None,
             ring_program,
+            shadow_program,
+            shadows: HashMap::new(),
             blur_programs,
             blur_commit: CommitCounter::default(),
             window_program,
@@ -316,6 +367,16 @@ impl Effects {
             }
             if self.ring_program.is_none() && appearance.focus_ring_width > 0 {
                 self.ring_program = compile_ring(renderer);
+            }
+            if self.shadow_program.is_none() && appearance.shadow_enabled() {
+                self.shadow_program = compile_shadow(renderer);
+            }
+            if appearance.shadow_enabled() {
+                for shadow in self.shadows.values_mut() {
+                    shadow.update_uniforms(shadow_uniforms(&appearance));
+                }
+            } else {
+                self.shadows.clear();
             }
             self.generation = self.generation.wrapping_add(1);
             if let Some(ring) = &mut self.ring {
@@ -401,16 +462,32 @@ impl Effects {
                 .transform_size(output.current_mode().unwrap().size),
         );
         let mut elements = Vec::with_capacity(space_elements.len() + 4);
-        elements.extend(self.focus_ring(state, output).map(PawRenderElements::Ring));
+        elements.extend(
+            self.focus_ring(state, output)
+                .map(PawRenderElements::Shader),
+        );
 
+        let output_name = output.name();
+        let mut shadowed = Vec::new();
         for element in space_elements {
             // Resolved once per element: the lookup walks every window on every
-            // workspace, and both consumers below want the same answer.
+            // workspace, and all three consumers below want the same answer.
             let window_state = state.window_render_state(output, element.id());
             let blur = self.blur_elements(state, &element, scale, output_bounds, window_state);
+            let shadow = self.shadow_element(&output_name, element.id(), window_state);
+            if shadow.is_some() {
+                shadowed.push(element.id().clone());
+            }
             elements.push(self.window_element(element, scale, window_state));
             elements.extend(blur.into_iter().map(PawRenderElements::Blur));
+            // Last, so it draws first and everything else lands on top of it.
+            elements.extend(shadow.map(PawRenderElements::Shader));
         }
+        // Windows on other outputs keep their shadows; this one's are gone as
+        // soon as the window is.
+        // ponytail: linear lookup, bounded by the windows on one workspace.
+        self.shadows
+            .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
         Ok(elements)
     }
 
@@ -542,10 +619,56 @@ impl Effects {
         ring.resize(area, None);
         Some(ring.clone())
     }
+
+    /// The shadow for one window, or `None` for anything that is not a window's
+    /// root surface. Uniforms depend only on the appearance config, so the
+    /// cached element only ever has to be moved.
+    fn shadow_element(
+        &mut self,
+        output_name: &str,
+        element: &Id,
+        window_state: Option<(Rectangle<i32, Logical>, f32)>,
+    ) -> Option<PixelShaderElement> {
+        let appearance = self.appearance;
+        if !appearance.shadow_enabled() {
+            return None;
+        }
+        let program = self.shadow_program.clone()?;
+        let (window, _) = window_state?;
+        let area = shadow_area(window, &appearance);
+        let shadow = self
+            .shadows
+            .entry((output_name.to_owned(), element.clone()))
+            .or_insert_with(|| {
+                PixelShaderElement::new(
+                    program,
+                    area,
+                    None,
+                    1.0,
+                    shadow_uniforms(&appearance),
+                    Kind::Unspecified,
+                )
+            });
+        shadow.resize(area, None);
+        Some(shadow.clone())
+    }
 }
 
 fn layer_visible_over_fullscreen(layer: Layer, interactivity: KeyboardInteractivity) -> bool {
     layer == Layer::Overlay || is_exclusive_keyboard_layer(layer, interactivity)
+}
+
+fn compile_shadow(renderer: &mut GlesRenderer) -> Option<GlesPixelProgram> {
+    let uniforms = [
+        UniformName::new("corner_radius", UniformType::_1f),
+        UniformName::new("spread", UniformType::_1f),
+        UniformName::new("shadow_color", UniformType::_4f),
+        UniformName::new("window_offset", UniformType::_2f),
+    ];
+    renderer
+        .compile_custom_pixel_shader(SHADOW_SHADER, &uniforms)
+        .map_err(|error: GlesError| tracing::warn!(?error, "window shadow shader unavailable"))
+        .ok()
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +913,39 @@ fn ring_uniforms(appearance: &AppearanceConfig) -> Vec<Uniform<'static>> {
         Uniform::new("corner_radius", appearance.corner_radius as f32),
         Uniform::new("ring_width", appearance.focus_ring_width as f32),
         Uniform::new("ring_color", appearance.focus_ring_color),
+    ]
+}
+
+/// The window rectangle grown by the shadow radius on every side, then moved by
+/// the shadow offset. Everything the shader needs about where the window sits
+/// follows from that, which is why the offset is not applied twice.
+fn shadow_area(
+    window: Rectangle<i32, Logical>,
+    appearance: &AppearanceConfig,
+) -> Rectangle<i32, Logical> {
+    let radius = appearance.shadow_radius;
+    Rectangle::new(
+        (
+            window.loc.x - radius + appearance.shadow_offset_x,
+            window.loc.y - radius + appearance.shadow_offset_y,
+        )
+            .into(),
+        window.size + (radius * 2, radius * 2).into(),
+    )
+}
+
+fn shadow_uniforms(appearance: &AppearanceConfig) -> Vec<Uniform<'static>> {
+    vec![
+        Uniform::new("corner_radius", appearance.corner_radius as f32),
+        Uniform::new("spread", appearance.shadow_radius as f32),
+        Uniform::new("shadow_color", appearance.shadow_color),
+        Uniform::new(
+            "window_offset",
+            [
+                appearance.shadow_offset_x as f32,
+                appearance.shadow_offset_y as f32,
+            ],
+        ),
     ]
 }
 
@@ -1145,6 +1301,10 @@ mod tests {
             focus_ring_width: 1,
             focus_ring_color: [0.0, 0.0, 0.0, 1.0],
             corner_radius: 0,
+            shadow_radius: 0,
+            shadow_color: [0.0, 0.0, 0.0, 0.0],
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
             blur: false,
             blur_radius: 0,
             transparency: false,
@@ -1162,6 +1322,66 @@ mod tests {
 
         appearance.opacity = 1.0;
         assert!(!window_effects(&appearance));
+    }
+
+    #[test]
+    fn a_shadow_needs_both_reach_and_colour() {
+        let mut appearance = AppearanceConfig {
+            gaps: 15,
+            focus_ring_width: 1,
+            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
+            corner_radius: 0,
+            shadow_radius: 0,
+            shadow_color: [0.0, 0.0, 0.0, 0.5],
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
+            blur: false,
+            blur_radius: 0,
+            transparency: false,
+            opacity: 1.0,
+        };
+        assert!(!appearance.shadow_enabled());
+
+        appearance.shadow_radius = 12;
+        assert!(appearance.shadow_enabled());
+
+        // A radius with nothing to draw in it is off, not an invisible cost.
+        appearance.shadow_color = [0.0, 0.0, 0.0, 0.0];
+        assert!(!appearance.shadow_enabled());
+    }
+
+    #[test]
+    fn the_shadow_area_centres_on_the_window_plus_the_offset() {
+        let window = Rectangle::new((100, 100).into(), (200, 160).into());
+        let mut appearance = AppearanceConfig {
+            gaps: 15,
+            focus_ring_width: 1,
+            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
+            corner_radius: 8,
+            shadow_radius: 12,
+            shadow_color: [0.0, 0.0, 0.0, 0.45],
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
+            blur: false,
+            blur_radius: 0,
+            transparency: false,
+            opacity: 1.0,
+        };
+
+        // Without an offset the shadow is an even collar around the window,
+        // which is what lets the shader treat its own centre as the window's.
+        let area = shadow_area(window, &appearance);
+        assert_eq!(area, Rectangle::new((88, 88).into(), (224, 184).into()));
+        assert!(area.contains_rect(window));
+
+        // With one, the area moves by exactly the offset and nothing else - the
+        // shader derives the window's position from that same offset, so any
+        // second application here would double it.
+        appearance.shadow_offset_x = 3;
+        appearance.shadow_offset_y = 4;
+        let shifted = shadow_area(window, &appearance);
+        assert_eq!(shifted.size, area.size);
+        assert_eq!(shifted.loc - area.loc, (3, 4).into());
     }
 
     #[test]

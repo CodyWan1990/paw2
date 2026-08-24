@@ -41,6 +41,13 @@ focus_ring_width = 1
 focus_ring_color = "#0b3d91"
 # Rounded window corners in logical pixels; zero disables them.
 corner_radius = 8
+# Drop shadow behind windows. The radius is how far it reaches past the window
+# in logical pixels; zero, or a fully transparent shadow, disables it.
+shadow_radius = 12
+shadow_color = "#000000"
+shadow_opacity = 0.45
+shadow_offset_x = 0
+shadow_offset_y = 4
 # Smooth backdrop blur behind translucent windows.
 blur = true
 blur_radius = 8
@@ -260,6 +267,11 @@ pub struct AppearanceConfig {
     pub focus_ring_width: i32,
     pub focus_ring_color: [f32; 4],
     pub corner_radius: i32,
+    pub shadow_radius: i32,
+    /// Premultiplied, so the shader can blend it without a second multiply.
+    pub shadow_color: [f32; 4],
+    pub shadow_offset_x: i32,
+    pub shadow_offset_y: i32,
     pub blur: bool,
     pub blur_radius: i32,
     pub transparency: bool,
@@ -270,6 +282,11 @@ impl AppearanceConfig {
     /// Blur needs both the switch and a non-zero radius to be worth compiling.
     pub fn blur_enabled(&self) -> bool {
         self.blur && self.blur_radius > 0
+    }
+
+    /// A shadow needs somewhere to fall and something to fall in.
+    pub fn shadow_enabled(&self) -> bool {
+        self.shadow_radius > 0 && self.shadow_color[3] > 0.0
     }
 
     /// Window opacity actually in effect; exactly 1.0 while transparency is off.
@@ -521,7 +538,10 @@ impl ConfigWatcher {
         let mut overlays = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "toml"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "toml")
+            })
             .collect::<Vec<_>>();
         overlays.sort();
         layers.extend(overlays);
@@ -547,15 +567,14 @@ impl ConfigWatcher {
     /// them. It also means the merged document is the complete effective
     /// config, with no second copy of the defaults anywhere.
     fn read(layers: &[PathBuf]) -> io::Result<(toml::Value, Vec<String>)> {
-        let mut document = toml::from_str(DEFAULT_CONFIG)
-            .expect("the compiled default config is valid TOML");
+        let mut document =
+            toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML");
         let mut sources = Vec::with_capacity(layers.len());
         for (index, layer) in layers.iter().enumerate() {
             let source = fs::read_to_string(layer)
                 .map_err(|error| invalid_data(layer, format!("could not read config: {error}")))?;
-            let overlay = toml::from_str(&source).map_err(|error: toml::de::Error| {
-                invalid_data(layer, error.to_string())
-            })?;
+            let overlay = toml::from_str(&source)
+                .map_err(|error: toml::de::Error| invalid_data(layer, error.to_string()))?;
             // `config.toml` is the base layer and merges key by key, so a partial
             // hand-written section still inherits the compiled defaults around it.
             // Everything after it is a `config.d/` drop-in, which owns whole
@@ -744,6 +763,11 @@ struct RawAppearance {
     focus_ring_width: u16,
     focus_ring_color: String,
     corner_radius: u16,
+    shadow_radius: u16,
+    shadow_color: String,
+    shadow_opacity: f64,
+    shadow_offset_x: i16,
+    shadow_offset_y: i16,
     blur: bool,
     blur_radius: u16,
     transparency: bool,
@@ -757,6 +781,11 @@ impl Default for RawAppearance {
             focus_ring_width: 1,
             focus_ring_color: "#0b3d91".into(),
             corner_radius: 8,
+            shadow_radius: 12,
+            shadow_color: "#000000".into(),
+            shadow_opacity: 0.45,
+            shadow_offset_x: 0,
+            shadow_offset_y: 4,
             blur: true,
             blur_radius: 8,
             transparency: true,
@@ -1047,6 +1076,22 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     if raw.appearance.corner_radius > 64 {
         return Err("appearance.corner_radius must be at most 64".into());
     }
+    if raw.appearance.shadow_radius > 64 {
+        return Err("appearance.shadow_radius must be at most 64".into());
+    }
+    if !raw.appearance.shadow_opacity.is_finite()
+        || !(0.0..=1.0).contains(&raw.appearance.shadow_opacity)
+    {
+        return Err("appearance.shadow_opacity must be between 0.0 and 1.0".into());
+    }
+    for (name, offset) in [
+        ("shadow_offset_x", raw.appearance.shadow_offset_x),
+        ("shadow_offset_y", raw.appearance.shadow_offset_y),
+    ] {
+        if !(-64..=64).contains(&offset) {
+            return Err(format!("appearance.{name} must be between -64 and 64"));
+        }
+    }
     if !raw.appearance.opacity.is_finite() || !(0.1..=1.0).contains(&raw.appearance.opacity) {
         return Err("appearance.opacity must be between 0.1 and 1.0".into());
     }
@@ -1074,7 +1119,11 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     {
         return Err("theme.cursor_size must be between 1 and 256".into());
     }
-    let focus_ring_color = parse_color(&raw.appearance.focus_ring_color)?;
+    let focus_ring_color = parse_color(&raw.appearance.focus_ring_color, "focus_ring_color")?;
+    let shadow_color = premultiply(
+        parse_color(&raw.appearance.shadow_color, "shadow_color")?,
+        raw.appearance.shadow_opacity as f32,
+    );
     if let Some(path) = &raw.backend.drm_device
         && !path.is_absolute()
     {
@@ -1230,6 +1279,10 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
             focus_ring_width: raw.appearance.focus_ring_width.into(),
             focus_ring_color,
             corner_radius: raw.appearance.corner_radius.into(),
+            shadow_radius: raw.appearance.shadow_radius.into(),
+            shadow_color,
+            shadow_offset_x: raw.appearance.shadow_offset_x.into(),
+            shadow_offset_y: raw.appearance.shadow_offset_y.into(),
             blur: raw.appearance.blur,
             blur_radius: raw.appearance.blur_radius.into(),
             transparency: raw.appearance.transparency,
@@ -1270,19 +1323,25 @@ fn add_binding(
     Ok(())
 }
 
-fn parse_color(value: &str) -> Result<[f32; 4], String> {
+fn parse_color(value: &str, field: &str) -> Result<[f32; 4], String> {
+    let complain = || format!("appearance.{field} must use #RRGGBB");
     let hex = value
         .strip_prefix('#')
         .filter(|hex| hex.len() == 6)
-        .ok_or_else(|| "appearance.focus_ring_color must use #RRGGBB".to_string())?;
-    let color = u32::from_str_radix(hex, 16)
-        .map_err(|_| "appearance.focus_ring_color must use #RRGGBB".to_string())?;
+        .ok_or_else(complain)?;
+    let color = u32::from_str_radix(hex, 16).map_err(|_| complain())?;
     Ok([
         ((color >> 16) & 0xff) as f32 / 255.0,
         ((color >> 8) & 0xff) as f32 / 255.0,
         (color & 0xff) as f32 / 255.0,
         1.0,
     ])
+}
+
+/// Fold an alpha into an opaque colour. Render blending expects premultiplied
+/// components, so a half-transparent red is `[0.5, 0.0, 0.0, 0.5]`.
+fn premultiply(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0] * alpha, color[1] * alpha, color[2] * alpha, alpha]
 }
 
 fn parse_transform(value: &str) -> Result<Transform, String> {
@@ -1427,6 +1486,11 @@ mod tests {
         );
         assert_eq!(config.appearance.blur_radius, 8);
         assert_eq!(config.appearance.corner_radius, 8);
+        assert_eq!(config.appearance.shadow_radius, 12);
+        assert_eq!(config.appearance.shadow_offset_y, 4);
+        // Black at 45%: premultiplied, so only the alpha carries the opacity.
+        assert_eq!(config.appearance.shadow_color, [0.0, 0.0, 0.0, 0.45]);
+        assert!(config.appearance.shadow_enabled());
         assert!(config.appearance.blur_enabled());
         assert_eq!(config.appearance.window_opacity(), 0.95);
         assert!(config.animations.active());
@@ -1444,8 +1508,8 @@ mod tests {
         );
         assert!(
             parse(&DEFAULT_CONFIG.replace(PRIVILEGED, r#"privileged_clients = ["  "]"#))
-            .unwrap_err()
-            .contains("cannot be empty")
+                .unwrap_err()
+                .contains("cannot be empty")
         );
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         // The shipped config configures no monitors; they are auto-detected.
@@ -1542,6 +1606,30 @@ mod tests {
             parse(&invalid_corner)
                 .unwrap_err()
                 .contains("corner_radius")
+        );
+
+        let invalid_shadow = DEFAULT_CONFIG.replace("shadow_radius = 12", "shadow_radius = 65");
+        assert!(
+            parse(&invalid_shadow)
+                .unwrap_err()
+                .contains("shadow_radius")
+        );
+
+        let invalid_offset = DEFAULT_CONFIG.replace("shadow_offset_y = 4", "shadow_offset_y = -65");
+        assert!(
+            parse(&invalid_offset)
+                .unwrap_err()
+                .contains("shadow_offset_y")
+        );
+
+        // The colour error has to name the key that is wrong, not the first key
+        // that happens to be a colour.
+        let invalid_shadow_color =
+            DEFAULT_CONFIG.replace(r##"shadow_color = "#000000""##, r#"shadow_color = "black""#);
+        assert!(
+            parse(&invalid_shadow_color)
+                .unwrap_err()
+                .contains("shadow_color")
         );
 
         let invalid_opacity = DEFAULT_CONFIG.replace("opacity = 0.95", "opacity = 1.5");
@@ -1975,7 +2063,10 @@ swap_right = ["Super+Shift+l"]
             DEFAULT_CONFIG
                 .replace("gaps = 15", "gaps = 40")
                 .replace("focus_follows_mouse = false", "focus_follows_mouse = true")
-                .replace("center_focused_column = false", "center_focused_column = true"),
+                .replace(
+                    "center_focused_column = false",
+                    "center_focused_column = true",
+                ),
         )
         .unwrap();
         // The drop-in claims [layout] while naming only the one key it has a
@@ -2161,7 +2252,8 @@ swap_right = ["Super+Shift+l"]
         );
 
         let updated =
-            parse(&with_monitors.replace(PRIVILEGED, r#"privileged_clients = ["waybar"]"#)).unwrap();
+            parse(&with_monitors.replace(PRIVILEGED, r#"privileged_clients = ["waybar"]"#))
+                .unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.security, SecurityConfig::default());
 

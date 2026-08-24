@@ -23,9 +23,7 @@ use std::{
 };
 
 use serde::Serialize;
-use smithay::reexports::calloop::{
-    Interest, LoopHandle, Mode, PostAction, generic::Generic,
-};
+use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
 
 use crate::{
     config::{Action, LayoutMode},
@@ -167,10 +165,8 @@ pub fn init(handle: &LoopHandle<'static, Paw2>, state: &mut Paw2) {
         tracing::warn!("XDG_RUNTIME_DIR is unset; the control socket is unavailable");
         return;
     };
-    let path = PathBuf::from(runtime_dir).join(format!(
-        "paw2-{}.sock",
-        state.socket_name.to_string_lossy()
-    ));
+    let path = PathBuf::from(runtime_dir)
+        .join(format!("paw2-{}.sock", state.socket_name.to_string_lossy()));
     // A socket left behind by a crash would refuse the bind; nothing can be
     // listening on it, because the Wayland socket it is named after was free.
     let _ = std::fs::remove_file(&path);
@@ -398,7 +394,10 @@ pub fn flush(state: &mut Paw2) {
             }
         }
     }
-    state.ipc.clients.retain(|client| !dropped.contains(&client.id));
+    state
+        .ipc
+        .clients
+        .retain(|client| !dropped.contains(&client.id));
 }
 
 fn serialize<T: Serialize>(message: &T) -> String {
@@ -448,7 +447,10 @@ mod tests {
         pending.extend_from_slice(br#"{"cmd":"qu"#);
         assert!(take_lines(&mut pending).is_empty());
         pending.extend_from_slice(b"it\"}\n");
-        assert_eq!(take_lines(&mut pending), [r#"{"cmd":"quit"}"#.to_string() + "\n"]);
+        assert_eq!(
+            take_lines(&mut pending),
+            [r#"{"cmd":"quit"}"#.to_string() + "\n"]
+        );
         assert!(pending.is_empty());
 
         // Several commands in one read all run, and a trailing fragment stays.
