@@ -19,6 +19,7 @@ of it, and Paw2 neither needs nor waits for it.
 - Centered client-sized launcher and dialog windows
 - Dedicated fullscreen path with scanout-friendly rendering and presentation timing
 - Automatic per-monitor VRR for fullscreen games
+- Live per-monitor fractional scaling
 - Nine independent workspaces per monitor with Waybar integration
 - Configurable gaps and focused-window ring
 - Client-controlled transparency and background blur protocols
@@ -132,6 +133,7 @@ focus_at_startup = true
 resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
+scale = 1.0
 transform = "normal"
 vrr = "automatic"
 
@@ -140,6 +142,7 @@ connector = "DP-1"
 resolution = [2560, 1440]
 refresh = 199.999
 position = [2560, 0]
+scale = 1.0
 transform = "normal"
 
 [autostart]
@@ -246,7 +249,8 @@ applied automatically to normal window areas that clients do not declare
 opaque. The smooth multi-pass effect is clipped to the XDG window geometry;
 protocol-aware clients may request a specific blur region. Monitor fields are
 optional; unlisted displays use their preferred mode and are placed to the
-right. Supported transforms are `normal`, `90`, `180`, `270`,
+right. Scale is a positive number where `1.0` is 100% and `1.25` is 125%.
+Supported transforms are `normal`, `90`, `180`, `270`,
 `flipped`, and their rotated variants. Empty binding lists disable an action.
 Binding strings also accept `WheelScrollUp` and `WheelScrollDown`, so optional
 mouse-wheel shortcuts can sit beside keyboard shortcuts. For example:
@@ -261,21 +265,29 @@ increase_column_width = ["Ctrl+Alt+WheelScrollUp"]
 
 Wheel shortcuts run once per physical detent and consume matching mouse-wheel
 events; touchpad and unmatched scrolling continue to applications.
-Bindings, commands, layout, appearance, and `focus_follows_mouse` update within
-about half a second after saving the file. Invalid saves leave the last working
-settings active. At startup Paw2 keeps as much as it can rather than exiting: it
+Bindings, commands, layout, appearance, `focus_follows_mouse`, monitor
+resolution, refresh, scale, and transform update within about half a second after
+saving the file. Invalid saves leave the last working settings active.
+Unavailable monitor modes leave the working mode active and report the error
+through the control socket. At startup Paw2 keeps as much as it can rather than
+exiting: it
 logs the reason, then falls back to `config.toml` on its own — ignoring the
 generated `config.d/` drop-ins — and only to the built-in defaults if
 `config.toml` is itself invalid. A mistake never costs a session, and fixing the
 file repairs the running one. Disabling a layout currently in use moves that workspace to
 the first enabled layout. Focus follows mouse never scrolls the workspace
-viewport or raises floating windows. Backend, monitor, autostart, and `middle_click_paste`
-changes take effect after restarting Paw2. Theme settings are optional and also
-take effect after a restart. Paw2 synchronizes configured cursor, icon, GTK, and
-font values through GSettings, and exports the GTK and Qt settings to launched
-applications. Shared Qt icon and font settings require the Qt GTK platform-theme
-plugin supplied by your distribution. Disabling middle-click paste hides Wayland
-and X11 primary selection; it does not consume ordinary middle-button clicks.
+viewport or raises floating windows. Backend, monitor position, VRR, startup
+focus, autostart, and `middle_click_paste` changes take effect after
+restarting Paw2. Cursor changes apply live to the compositor and applications
+using Wayland's cursor-shape protocol, while GTK and icon changes are broadcast
+through GSettings. Legacy applications that cache them may need to be reopened.
+Qt style and font changes take effect after a restart. Palette-generated
+`gtk.css` also needs applications to be reopened. Paw2 synchronizes configured
+cursor, icon, GTK, and font values through GSettings and exports Qt settings to
+launched applications. Shared Qt icon and font settings require the Qt GTK
+platform-theme plugin supplied by your distribution. Disabling middle-click
+paste hides Wayland and X11 primary selection; it does not consume ordinary
+middle-button clicks.
 Autostart and binding commands are executable-and-argument arrays; use an
 explicit shell entry such as `["sh", "-c", "command"]` only when shell syntax is
 needed. Autostart entries run once in order when the compositor starts.
@@ -405,7 +417,7 @@ Watch it with `socat -u UNIX-CONNECT:$PAW2_SOCKET -`.
 
 - Tearing control once Smithay's async page-flip support is stable
 - Hardware-safe fullscreen direct scanout
-- Wlr-output-management, so monitor changes apply without a restart
+- Wlr-output-management for external display configuration tools
 - Session lock and idle notification
 - Distribution packages
 

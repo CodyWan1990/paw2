@@ -4,13 +4,15 @@ use smithay::{
         renderer::{ImportDma, element::Id, utils::on_commit_buffer_handler},
     },
     desktop::{
-        LayerSurface, PopupKind, WindowSurfaceType, find_popup_root_surface,
-        get_popup_toplevel_coords, layer_map_for_output,
+        LayerSurface, PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy,
+        WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords,
+        layer_map_for_output, utils::surface_primary_scanout_output,
     },
     input::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, GrabType, Source},
         pointer::{Focus, PointerHandle},
+        tablet::TabletSeatHandler,
     },
     output::Output,
     reexports::{
@@ -31,6 +33,7 @@ use smithay::{
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
+        fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         idle_inhibit::IdleInhibitHandler,
         output::OutputHandler,
         pointer_constraints::{
@@ -189,6 +192,30 @@ impl CompositorHandler for Paw2 {
             self.sync_focus();
         }
         crate::drm::redraw(self);
+    }
+}
+
+impl FractionalScaleHandler for Paw2 {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let output = with_states(&surface, |states| {
+            surface_primary_scanout_output(&surface, states)
+        })
+        .or_else(|| {
+            self.window_for_surface(&root)
+                .and_then(|window| self.capture_output_for_window(window))
+        })
+        .or_else(|| self.default_output());
+        if let Some(output) = output {
+            with_states(&surface, |states| {
+                with_fractional_scale(states, |fractional_scale| {
+                    fractional_scale.set_preferred_scale(output.current_scale().fractional_scale());
+                });
+            });
+        }
     }
 }
 
@@ -379,7 +406,50 @@ impl XdgShellHandler for Paw2 {
         crate::drm::redraw(self);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    /// A popup asked for a grab: keep input on it until it is dismissed, so a
+    /// click or Escape anywhere else closes it instead of leaving it stranded.
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
+
+        if let Some(keyboard) = seat.get_keyboard() {
+            // Someone else already owns the keyboard through an unrelated grab.
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+    }
+
+    /// The popup grab hands the keyboard back to the grab root, which for a shell
+    /// popup is a layer surface that never asked for keys. Put focus where it
+    /// belongs instead.
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.sync_focus();
+    }
 }
 
 impl XdgDialogHandler for Paw2 {
@@ -402,6 +472,9 @@ impl SeatHandler for Paw2 {
         _seat: &Seat<Self>,
         image: smithay::input::pointer::CursorImageStatus,
     ) {
+        if let smithay::input::pointer::CursorImageStatus::Named(icon) = image {
+            crate::drm::select_cursor_icon(self, icon);
+        }
         self.cursor_status = image;
     }
 
@@ -410,6 +483,10 @@ impl SeatHandler for Paw2 {
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
     }
+}
+
+impl TabletSeatHandler for Paw2 {
+    type ToolFocus = WlSurface;
 }
 
 impl PointerConstraintsHandler for Paw2 {

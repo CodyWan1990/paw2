@@ -68,7 +68,8 @@ focus_follows_mouse = false
 # Expose Wayland primary selection for middle-click paste.
 middle_click_paste = true
 
-# Desktop theme values are optional. When set, Paw2 applies them at startup.
+# Desktop theme values are optional. Cursor, GTK and icon changes apply live;
+# Qt style and font changes apply at startup.
 #[theme]
 #cursor_theme = "Oxygen_Zion"
 #cursor_size = 24
@@ -86,7 +87,7 @@ direct_scanout = true
 # connector = "DP-1"
 
 # Monitors are auto-detected and placed left to right. Add a [[monitors]] entry
-# only to pin a connector's mode, position, rotation, or VRR policy; see the
+# only to pin a connector's mode, position, scale, rotation, or VRR policy; see the
 # README for the full example.
 #[[monitors]]
 #connector = "DP-1"
@@ -94,6 +95,7 @@ direct_scanout = true
 #resolution = [2560, 1440]
 #refresh = 120.0
 #position = [0, 0]
+#scale = 1.0
 #transform = "normal"
 #vrr = "automatic"
 
@@ -397,6 +399,7 @@ pub struct MonitorConfig {
     pub resolution: Option<[u16; 2]>,
     pub refresh: Option<f64>,
     pub position: Option<[i32; 2]>,
+    pub scale: f64,
     pub transform: Transform,
     pub vrr: VrrPolicy,
 }
@@ -448,19 +451,105 @@ impl Config {
 
     pub fn apply_runtime(&mut self, updated: Self) -> bool {
         let restart_required = self.backend != updated.backend
-            || self.monitors != updated.monitors
+            || monitors_require_restart(&self.monitors, &updated.monitors)
             || self.autostart != updated.autostart
             || self.input.middle_click_paste != updated.input.middle_click_paste
             || self.security != updated.security
-            || self.theme != updated.theme;
+            || theme_requires_restart(&self.theme, &updated.theme);
         self.layout = updated.layout;
         self.appearance = updated.appearance;
         self.animations = updated.animations;
         self.input.focus_follows_mouse = updated.input.focus_follows_mouse;
+        self.theme.cursor_theme = updated.theme.cursor_theme;
+        self.theme.cursor_size = updated.theme.cursor_size;
+        self.theme.icon_theme = updated.theme.icon_theme;
+        self.theme.gtk_theme = updated.theme.gtk_theme;
+        apply_live_monitor_fields(&mut self.monitors, &updated.monitors);
         self.binding_commands = updated.binding_commands;
         self.bindings = updated.bindings;
         restart_required
     }
+}
+
+fn theme_requires_restart(current: &ThemeConfig, updated: &ThemeConfig) -> bool {
+    current.qt_style != updated.qt_style || current.font != updated.font
+}
+
+fn monitors_require_restart(current: &[MonitorConfig], updated: &[MonitorConfig]) -> bool {
+    let common_order = |left: &[MonitorConfig], right: &[MonitorConfig]| {
+        left.iter()
+            .filter(|monitor| {
+                right
+                    .iter()
+                    .any(|candidate| candidate.connector == monitor.connector)
+            })
+            .map(|monitor| monitor.connector.clone())
+            .collect::<Vec<_>>()
+    };
+    if common_order(current, updated) != common_order(updated, current) {
+        return true;
+    }
+
+    current.iter().chain(updated).any(|monitor| {
+        let old = current
+            .iter()
+            .find(|candidate| candidate.connector == monitor.connector);
+        let new = updated
+            .iter()
+            .find(|candidate| candidate.connector == monitor.connector);
+        monitor_restart_fields(old) != monitor_restart_fields(new)
+    })
+}
+
+fn monitor_restart_fields(monitor: Option<&MonitorConfig>) -> (bool, Option<[i32; 2]>, VrrPolicy) {
+    monitor.map_or((false, None, VrrPolicy::Automatic), |monitor| {
+        (monitor.focus_at_startup, monitor.position, monitor.vrr)
+    })
+}
+
+/// Copy only the monitor fields supported at runtime. Existing entries retain
+/// restart-only state; a live-only entry can still be added for an active output.
+fn apply_live_monitor_fields(current: &mut Vec<MonitorConfig>, updated: &[MonitorConfig]) {
+    for monitor in current.iter_mut() {
+        if let Some(updated) = updated
+            .iter()
+            .find(|candidate| candidate.connector == monitor.connector)
+        {
+            monitor.resolution = updated.resolution;
+            monitor.refresh = updated.refresh;
+            monitor.scale = updated.scale;
+            monitor.transform = updated.transform;
+        } else {
+            monitor.resolution = None;
+            monitor.refresh = None;
+            monitor.scale = 1.0;
+            monitor.transform = Transform::Normal;
+        }
+    }
+    for monitor in updated {
+        if current
+            .iter()
+            .any(|candidate| candidate.connector == monitor.connector)
+        {
+            continue;
+        }
+        current.push(MonitorConfig {
+            connector: monitor.connector.clone(),
+            focus_at_startup: false,
+            resolution: monitor.resolution,
+            refresh: monitor.refresh,
+            position: None,
+            scale: monitor.scale,
+            transform: monitor.transform,
+            vrr: VrrPolicy::Automatic,
+        });
+    }
+    current.retain(|monitor| {
+        updated
+            .iter()
+            .any(|candidate| candidate.connector == monitor.connector)
+            || monitor_restart_fields(Some(monitor)) != monitor_restart_fields(None)
+    });
 }
 
 /// Merge `overlay` into `base`, key by key.
@@ -898,6 +987,8 @@ struct RawMonitor {
     resolution: Option<[u16; 2]>,
     refresh: Option<f64>,
     position: Option<[i32; 2]>,
+    #[serde(default = "default_monitor_scale")]
+    scale: f64,
     #[serde(default = "default_transform")]
     transform: String,
     #[serde(default)]
@@ -926,6 +1017,10 @@ fn default_enabled_layouts() -> Vec<LayoutMode> {
 
 fn default_transform() -> String {
     "normal".into()
+}
+
+fn default_monitor_scale() -> f64 {
+    1.0
 }
 
 /// Load the config, plus the watcher that keeps it current and the reason the
@@ -1195,12 +1290,19 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
                 monitor.connector
             ));
         }
+        if !monitor.scale.is_finite() || monitor.scale <= 0.0 {
+            return Err(format!(
+                "monitor `{}` scale must be positive",
+                monitor.connector
+            ));
+        }
         monitors.push(MonitorConfig {
             connector: monitor.connector,
             focus_at_startup: monitor.focus_at_startup,
             resolution: monitor.resolution,
             refresh: monitor.refresh,
             position: monitor.position,
+            scale: monitor.scale,
             transform: parse_transform(&monitor.transform)?,
             vrr: monitor.vrr,
         });
@@ -1383,6 +1485,7 @@ connector = "DP-2"
 resolution = [2560, 1440]
 refresh = 120.0
 position = [0, 0]
+scale = 1.0
 transform = "normal"
 vrr = "automatic"
 
@@ -1391,6 +1494,7 @@ connector = "DP-1"
 resolution = [2560, 1440]
 refresh = 199.999
 position = [2560, 0]
+scale = 1.0
 transform = "normal"
 vrr = "automatic"
 "#;
@@ -1524,7 +1628,14 @@ mod tests {
         assert!(!monitored.monitors[0].focus_at_startup);
         assert_eq!(monitored.startup_monitor(), None);
         assert_eq!(monitored.monitors[0].vrr, VrrPolicy::Automatic);
+        assert_eq!(monitored.monitors[0].scale, 1.0);
         assert_eq!(monitored.monitors[1].transform, Transform::Normal);
+        let default_scale = parse(&format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replace("scale = 1.0\n", "")
+        ))
+        .unwrap();
+        assert_eq!(default_scale.monitors[0].scale, 1.0);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -1767,6 +1878,17 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown monitor transform")
         );
+        for scale in ["0.0", "nan"] {
+            let invalid_scale = format!(
+                "{DEFAULT_CONFIG}{}",
+                MONITORS.replacen("scale = 1.0", &format!("scale = {scale}"), 1)
+            );
+            assert!(
+                parse(&invalid_scale)
+                    .unwrap_err()
+                    .contains("scale must be positive")
+            );
+        }
 
         let duplicate = format!(
             "{DEFAULT_CONFIG}{}",
@@ -2242,7 +2364,7 @@ swap_right = ["Super+Shift+l"]
         let mut active = parse(&with_monitors).unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.layout.column_width, 0.7);
-        assert_eq!(active.monitors[0].resolution, Some([2560, 1440]));
+        assert_eq!(active.monitors[0].resolution, Some([1920, 1080]));
         assert!(active.autostart.is_empty());
         assert!(
             active
@@ -2275,8 +2397,27 @@ swap_right = ["Super+Shift+l"]
             "{with_monitors}\n[theme]\ncursor_theme = \"Breeze\"\n"
         ))
         .unwrap();
+        assert!(!active.apply_runtime(updated));
+        assert_eq!(active.theme.cursor_theme.as_deref(), Some("Breeze"));
+
+        let updated = parse(&format!(
+            "{with_monitors}\n[theme]\nicon_theme = \"Papirus\"\ngtk_theme = \"Breeze\"\n"
+        ))
+        .unwrap();
+        assert!(!active.apply_runtime(updated));
+        assert_eq!(active.theme.icon_theme.as_deref(), Some("Papirus"));
+        assert_eq!(active.theme.gtk_theme.as_deref(), Some("Breeze"));
+
+        let updated = parse(&format!(
+            "{with_monitors}\n[theme]\nqt_style = \"Fusion\"\n"
+        ))
+        .unwrap();
         assert!(active.apply_runtime(updated));
-        assert_eq!(active.theme, ThemeConfig::default());
+        assert_eq!(active.theme.qt_style, None);
+
+        let updated = parse(&format!("{with_monitors}\n[theme]\nfont = \"Sans 12\"\n")).unwrap();
+        assert!(active.apply_runtime(updated));
+        assert_eq!(active.theme.font, None);
 
         fs::write(&path, "not toml").unwrap();
         assert!(watcher.reload().is_err());
@@ -2285,5 +2426,44 @@ swap_right = ["Super+Shift+l"]
         fs::write(&path, &with_monitors).unwrap();
         assert!(watcher.reload().unwrap().is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reloads_live_monitor_fields_but_preserves_restart_only_fields() {
+        let source = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let mut active = parse(&source).unwrap();
+        let updated = parse(&format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS
+                .replacen("resolution = [2560, 1440]", "resolution = [1920, 1080]", 1)
+                .replacen("refresh = 120.0", "refresh = 144.0", 1)
+                .replacen("scale = 1.0", "scale = 1.25", 1)
+                .replacen("transform = \"normal\"", "transform = \"90\"", 1)
+        ))
+        .unwrap();
+
+        assert!(!active.apply_runtime(updated));
+        assert_eq!(active.monitors[0].resolution, Some([1920, 1080]));
+        assert_eq!(active.monitors[0].refresh, Some(144.0));
+        assert_eq!(active.monitors[0].scale, 1.25);
+        assert_eq!(active.monitors[0].transform, Transform::_90);
+
+        let updated = parse(&format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replacen("position = [0, 0]", "position = [100, 0]", 1)
+        ))
+        .unwrap();
+        assert!(active.apply_runtime(updated));
+        assert_eq!(active.monitors[0].position, Some([0, 0]));
+        assert_eq!(active.monitors[0].scale, 1.0);
+        assert_eq!(active.monitors[0].transform, Transform::Normal);
+
+        let updated = parse(&format!(
+            "{DEFAULT_CONFIG}{}",
+            MONITORS.replacen("vrr = \"automatic\"", "vrr = \"always\"", 1)
+        ))
+        .unwrap();
+        assert!(active.apply_runtime(updated));
+        assert_eq!(active.monitors[0].vrr, VrrPolicy::Automatic);
     }
 }

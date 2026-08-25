@@ -41,11 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         return Ok(());
     };
+    let cursor_defaults = cursor::CursorSettings::environment();
     let (config, mut config_watcher, config_error) = config::load()?;
     apply_theme(&config.theme);
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
-    let mut state = Paw2::new(&mut event_loop, display, config);
+    let mut state = Paw2::new(&mut event_loop, display, config, cursor_defaults);
     state
         .ipc
         .publish_config(config_watcher.document(), config_error);
@@ -57,14 +58,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move |_, _, state| {
             match config_watcher.reload() {
                 Ok(Some(config)) => {
+                    let mut errors = drm::apply_monitor_changes(state, &config.monitors);
+                    let desktop_theme_changes =
+                        changed_desktop_gsettings(&state.config.theme, &config.theme);
+                    let cursor_changes =
+                        changed_cursor_gsettings(&state.config.theme, &config.theme);
+                    let cursor_changed = state.config.theme.cursor_theme
+                        != config.theme.cursor_theme
+                        || state.config.theme.cursor_size != config.theme.cursor_size;
+                    if cursor_changed {
+                        match drm::reload_cursor(state, &config.theme) {
+                            Ok(()) => {
+                                apply_gsettings_updates(cursor_changes);
+                                let settings = state.cursor_defaults.configured(
+                                    config.theme.cursor_theme.as_deref(),
+                                    config.theme.cursor_size,
+                                );
+                                if state.direct.is_some() {
+                                    update_cursor_activation_environment(&settings);
+                                }
+                            }
+                            Err(error) => errors.push(error),
+                        }
+                    }
+                    apply_gsettings_updates(desktop_theme_changes);
                     let restart_required = state.config.apply_runtime(config);
                     state.relayout(true);
                     drm::redraw(state);
-                    state.ipc.publish_config(config_watcher.document(), None);
+                    state.ipc.publish_config(
+                        config_watcher.document(),
+                        (!errors.is_empty()).then(|| errors.join("; ")),
+                    );
                     tracing::info!("reloaded configuration");
                     if restart_required {
                         tracing::warn!(
-                            "backend, monitor, autostart, input protocol, and theme changes require restarting Paw2"
+                            "backend, monitor placement, VRR, startup focus, autostart, input protocol, Qt style, and font changes require restarting Paw2"
                         );
                     }
                 }
@@ -114,8 +142,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         update_graphical_session("start");
     }
 
+    let cursor_settings = state.cursor_defaults.configured(
+        state.config.theme.cursor_theme.as_deref(),
+        state.config.theme.cursor_size,
+    );
     for command in &state.config.autostart {
-        if let Err(error) = spawn(command) {
+        if let Err(error) = spawn(command, &cursor_settings) {
             tracing::error!(
                 ?error,
                 program = command[0],
@@ -127,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Mode::Nested(command) = &mode
         && !command.is_empty()
     {
-        spawn(command)?;
+        spawn(command, &cursor_settings)?;
     }
 
     let result = event_loop.run(None, &mut state, |state| {
@@ -207,6 +239,21 @@ fn import_activation_environment() {
     }
 }
 
+fn update_cursor_activation_environment(settings: &cursor::CursorSettings) {
+    let variables = settings
+        .environment_values()
+        .map(|(name, value)| format!("{name}={value}"));
+    match std::process::Command::new("dbus-update-activation-environment")
+        .arg("--systemd")
+        .args(variables)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "could not update the cursor launch environment"),
+        Err(error) => tracing::warn!(?error, "could not update the cursor launch environment"),
+    }
+}
+
 /// Finish initializing the login daemon that `pam_gnome_keyring` unlocked.
 fn initialize_keyring() {
     let output = std::process::Command::new("gnome-keyring-daemon")
@@ -258,6 +305,11 @@ fn update_graphical_session(action: &str) {
 fn unset_activation_environment() {
     let mut variables = vec!["--user", "unset-environment"];
     variables.extend(activation_environment());
+    for name in ["XCURSOR_THEME", "XCURSOR_SIZE"] {
+        if !variables.contains(&name) {
+            variables.push(name);
+        }
+    }
     match std::process::Command::new("systemctl")
         .args(variables)
         .status()
@@ -276,11 +328,27 @@ fn apply_theme(theme: &config::ThemeConfig) {
         }
     }
 
-    for (key, value) in theme_gsettings(theme) {
-        match std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.desktop.interface", key, &value])
-            .status()
-        {
+    apply_gsettings(theme_gsettings(theme));
+}
+
+fn apply_gsettings(settings: Vec<(&'static str, String)>) {
+    apply_gsettings_updates(
+        settings
+            .into_iter()
+            .map(|(key, value)| (key, Some(value)))
+            .collect(),
+    );
+}
+
+fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
+    for (key, value) in settings {
+        let mut command = std::process::Command::new("gsettings");
+        command.arg(if value.is_some() { "set" } else { "reset" });
+        command.args(["org.gnome.desktop.interface", key]);
+        if let Some(value) = value {
+            command.arg(value);
+        }
+        match command.status() {
             Ok(status) if status.success() => {}
             Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
             Err(error) => {
@@ -302,9 +370,6 @@ fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)>
     if let Some(value) = theme.cursor_size {
         variables.push(("XCURSOR_SIZE", value.to_string()));
     }
-    if let Some(value) = &theme.gtk_theme {
-        variables.push(("GTK_THEME", value.clone()));
-    }
     if let Some(value) = &theme.qt_style {
         variables.push(("QT_STYLE_OVERRIDE", value.clone()));
     }
@@ -315,13 +380,7 @@ fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)>
 }
 
 fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
-    let mut settings = Vec::new();
-    if let Some(value) = &theme.cursor_theme {
-        settings.push(("cursor-theme", value.clone()));
-    }
-    if let Some(value) = theme.cursor_size {
-        settings.push(("cursor-size", value.to_string()));
-    }
+    let mut settings = cursor_gsettings(theme);
     if let Some(value) = &theme.icon_theme {
         settings.push(("icon-theme", value.clone()));
     }
@@ -330,6 +389,48 @@ fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
     }
     if let Some(value) = &theme.font {
         settings.push(("font-name", value.clone()));
+    }
+    settings
+}
+
+fn cursor_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
+    let mut settings = Vec::new();
+    if let Some(value) = &theme.cursor_theme {
+        settings.push(("cursor-theme", value.clone()));
+    }
+    if let Some(value) = theme.cursor_size {
+        settings.push(("cursor-size", value.to_string()));
+    }
+    settings
+}
+
+fn changed_cursor_gsettings(
+    current: &config::ThemeConfig,
+    updated: &config::ThemeConfig,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut settings = Vec::new();
+    if current.cursor_theme != updated.cursor_theme {
+        settings.push(("cursor-theme", updated.cursor_theme.clone()));
+    }
+    if current.cursor_size != updated.cursor_size {
+        settings.push((
+            "cursor-size",
+            updated.cursor_size.map(|size| size.to_string()),
+        ));
+    }
+    settings
+}
+
+fn changed_desktop_gsettings(
+    current: &config::ThemeConfig,
+    updated: &config::ThemeConfig,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut settings = Vec::new();
+    if current.icon_theme != updated.icon_theme {
+        settings.push(("icon-theme", updated.icon_theme.clone()));
+    }
+    if current.gtk_theme != updated.gtk_theme {
+        settings.push(("gtk-theme", updated.gtk_theme.clone()));
     }
     settings
 }
@@ -344,14 +445,20 @@ fn children() -> MutexGuard<'static, Vec<u32>> {
     CHILDREN.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-pub(crate) fn spawn<T: AsRef<OsStr>>(command: &[T]) -> io::Result<()> {
+pub(crate) fn spawn<T: AsRef<OsStr>>(
+    command: &[T],
+    cursor_settings: &cursor::CursorSettings,
+) -> io::Result<()> {
     let Some((program, args)) = command.split_first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "command cannot be empty",
         ));
     };
-    let mut child = std::process::Command::new(program).args(args).spawn()?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .envs(cursor_settings.environment_values())
+        .spawn()?;
     let pid = child.id();
     children().push(pid);
     // ponytail: one waiter per child; replace with session process supervision if launch volume grows.
@@ -447,7 +554,7 @@ mod tests {
 
     #[test]
     fn shutdown_terminates_tracked_children() {
-        spawn(&["sleep", "10"]).unwrap();
+        spawn(&["sleep", "10"], &cursor::CursorSettings::environment()).unwrap();
         assert!(!children().is_empty());
         terminate_children();
         assert!(children().is_empty());
@@ -491,11 +598,32 @@ mod tests {
             [
                 ("XCURSOR_THEME", "Cursor".into()),
                 ("XCURSOR_SIZE", "32".into()),
-                ("GTK_THEME", "Gtk".into()),
                 ("QT_STYLE_OVERRIDE", "Qt".into()),
                 ("QT_QPA_PLATFORMTHEME", "gtk3".into()),
             ]
         );
         assert_eq!(theme_gsettings(&theme).len(), 5);
+        assert_eq!(
+            changed_cursor_gsettings(&config::ThemeConfig::default(), &theme),
+            [
+                ("cursor-theme", Some("Cursor".into())),
+                ("cursor-size", Some("32".into())),
+            ]
+        );
+        assert_eq!(
+            changed_cursor_gsettings(&theme, &config::ThemeConfig::default()),
+            [("cursor-theme", None), ("cursor-size", None)]
+        );
+        assert_eq!(
+            changed_desktop_gsettings(&config::ThemeConfig::default(), &theme),
+            [
+                ("icon-theme", Some("Icons".into())),
+                ("gtk-theme", Some("Gtk".into())),
+            ]
+        );
+        assert_eq!(
+            changed_desktop_gsettings(&theme, &config::ThemeConfig::default()),
+            [("icon-theme", None), ("gtk-theme", None)]
+        );
     }
 }

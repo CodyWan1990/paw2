@@ -30,9 +30,9 @@ use smithay::{
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
-    desktop::{space::SurfaceTree, utils::OutputPresentationFeedback},
+    desktop::{layer_map_for_output, space::SurfaceTree, utils::OutputPresentationFeedback},
     input::pointer::{CursorImageStatus, CursorImageSurfaceData},
-    output::{Mode, Output, PhysicalProperties},
+    output::{Mode, Output, PhysicalProperties, Scale as OutputScale},
     reexports::{
         calloop::{
             EventLoop, LoopHandle,
@@ -60,7 +60,7 @@ use smithay_drm_extras::{display_info, drm_scanner::DrmScanner};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{MonitorConfig, VrrPolicy},
+    config::{MonitorConfig, ThemeConfig, VrrPolicy},
     render::{Effects, PawRenderElements, clear_color},
     screencopy::CaptureTarget,
     state::Paw2,
@@ -72,6 +72,15 @@ type FrameFeedback = OutputPresentationFeedback;
 type KmsOutput = DrmOutput<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
 type OutputManager = DrmOutputManager<Allocator, Exporter, FrameFeedback, DrmDeviceFd>;
 type CaptureRenderElement = RelocateRenderElement<CropRenderElement<PawRenderElements>>;
+type OutputPlacement = (Size<i32, Logical>, Option<Point<i32, Logical>>);
+
+fn logical_output_size(mode: Mode, transform: Transform, scale: f64) -> Size<i32, Logical> {
+    transform
+        .transform_size(mode.size)
+        .to_f64()
+        .to_logical(scale)
+        .to_i32_ceil()
+}
 
 struct CaptureScene {
     size: Size<i32, Physical>,
@@ -232,9 +241,16 @@ pub fn init(
         formats,
     );
 
-    let cursor = crate::cursor::Cursor::load()
-        .map_err(|error| warn!(?error, "could not load cursor theme; using fallback cursor"))
-        .ok();
+    let cursor_settings = state.cursor_defaults.configured(
+        state.config.theme.cursor_theme.as_deref(),
+        state.config.theme.cursor_size,
+    );
+    let cursor = crate::cursor::Cursor::load(
+        &cursor_settings,
+        smithay::input::pointer::CursorIcon::Default,
+    )
+    .map_err(|error| warn!(?error, "could not load cursor theme; using fallback cursor"))
+    .ok();
     let mut backend = DirectBackend {
         handle: event_loop.handle(),
         _session: session.clone(),
@@ -437,6 +453,45 @@ pub fn redraw(state: &mut Paw2) {
     with_backend(state, |backend, state| backend.render(state));
 }
 
+pub fn reload_cursor(state: &mut Paw2, theme: &ThemeConfig) -> Result<(), String> {
+    let mut result = Ok(());
+    with_backend(state, |backend, state| {
+        let settings = state
+            .cursor_defaults
+            .configured(theme.cursor_theme.as_deref(), theme.cursor_size);
+        let icon = match state.cursor_status {
+            CursorImageStatus::Named(icon) => icon,
+            _ => smithay::input::pointer::CursorIcon::Default,
+        };
+        match crate::cursor::Cursor::load(&settings, icon) {
+            Ok(cursor) => backend.cursor = Some(cursor),
+            Err(error) => result = Err(format!("could not load cursor theme: {error}")),
+        }
+    });
+    result
+}
+
+pub fn select_cursor_icon(state: &mut Paw2, icon: smithay::input::pointer::CursorIcon) {
+    with_backend(state, |backend, state| {
+        let settings = state.cursor_defaults.configured(
+            state.config.theme.cursor_theme.as_deref(),
+            state.config.theme.cursor_size,
+        );
+        match crate::cursor::Cursor::load(&settings, icon) {
+            Ok(cursor) => backend.cursor = Some(cursor),
+            Err(error) => warn!(?error, %icon, "could not load requested cursor shape"),
+        }
+    });
+}
+
+pub fn apply_monitor_changes(state: &mut Paw2, monitors: &[MonitorConfig]) -> Vec<String> {
+    let mut errors = Vec::new();
+    with_backend(state, |backend, state| {
+        errors = backend.apply_monitor_changes(state, monitors)
+    });
+    errors
+}
+
 /// One refresh interval; `refresh` is in mHz.
 fn frame_duration(output: &Output) -> Duration {
     output
@@ -530,6 +585,136 @@ impl DirectBackend {
         formats
     }
 
+    fn apply_monitor_changes(
+        &mut self,
+        state: &mut Paw2,
+        monitors: &[MonitorConfig],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut geometry_changed = false;
+        for active in &mut self.outputs {
+            let Some(connector) = self
+                .scanner
+                .connectors()
+                .values()
+                .find(|connector| connector.handle() == active.connector)
+            else {
+                continue;
+            };
+            let name = active.output.name();
+            let config = monitors.iter().find(|monitor| monitor.connector == name);
+            let transform = config.map_or(Transform::Normal, |monitor| monitor.transform);
+            let scale = config.map_or(1.0, |monitor| monitor.scale);
+            let current_mode = active.output.current_mode();
+            let current_transform = active.output.current_transform();
+            let current_scale = active.output.current_scale().fractional_scale();
+            let mut applied_mode = None;
+
+            match requested_mode(connector, config) {
+                Ok(target) if current_mode != Some(Mode::from(target)) => {
+                    let mode = Mode::from(target);
+                    let empty =
+                        DrmOutputRenderElements::<GlesRenderer, PawRenderElements>::default();
+                    let previous = active
+                        .kms
+                        .with_compositor(|compositor| compositor.current_mode());
+                    match active.kms.use_mode(target, &mut self.renderer, &empty) {
+                        Ok(()) => applied_mode = Some(mode),
+                        Err(error) => {
+                            warn!(connector = %name, ?error, "could not apply monitor mode");
+                            let changed = active
+                                .kms
+                                .with_compositor(|compositor| compositor.pending_mode())
+                                != previous;
+                            let rollback = changed
+                                .then(|| active.kms.use_mode(previous, &mut self.renderer, &empty))
+                                .and_then(Result::err);
+                            if let Some(rollback) = rollback {
+                                error!(connector = %name, ?rollback, "could not restore previous monitor mode");
+                                errors.push(format!(
+                                    "{name}: could not apply requested mode ({error}) or restore the previous mode ({rollback})"
+                                ));
+                            } else {
+                                errors.push(format!(
+                                    "{name}: could not apply requested mode: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(connector = %name, %error, "could not apply monitor mode");
+                    errors.push(format!("{name}: {error}"));
+                }
+            }
+
+            let transform_changed = transform != current_transform;
+            let scale_changed = scale != current_scale;
+            if applied_mode.is_none() && !transform_changed && !scale_changed {
+                continue;
+            }
+            let old_size = current_mode
+                .map(|mode| logical_output_size(mode, current_transform, current_scale));
+            let new_size = applied_mode
+                .or(current_mode)
+                .map(|mode| logical_output_size(mode, transform, scale));
+            geometry_changed |= old_size != new_size;
+            active.output.change_current_state(
+                applied_mode,
+                transform_changed.then_some(transform),
+                scale_changed.then_some(OutputScale::Fractional(scale)),
+                None,
+            );
+            info!(connector = %name, mode = ?active.output.current_mode(), ?scale, ?transform, "changed monitor configuration");
+        }
+
+        if geometry_changed {
+            self.reflow_automatic_outputs(state);
+            for output in &self.outputs {
+                layer_map_for_output(&output.output).arrange();
+            }
+        }
+        errors
+    }
+
+    fn reflow_automatic_outputs(&self, state: &mut Paw2) {
+        let specifications = self
+            .outputs
+            .iter()
+            .filter_map(|active| {
+                let mode = active.output.current_mode()?;
+                let name = active.output.name();
+                let scale = active.output.current_scale().fractional_scale();
+                let size = logical_output_size(mode, active.output.current_transform(), scale);
+                let position = state
+                    .config
+                    .monitors
+                    .iter()
+                    .find(|monitor| monitor.connector == name)
+                    .and_then(|monitor| monitor.position)
+                    .map(|[x, y]| (x, y).into());
+                Some((active.output.clone(), size, position))
+            })
+            .collect::<Vec<_>>();
+        let positions = automatic_positions(
+            &specifications
+                .iter()
+                .map(|(_, size, position)| (*size, *position))
+                .collect::<Vec<_>>(),
+        );
+        for ((output, _, _), position) in specifications.into_iter().zip(positions) {
+            state.reposition_output(&output, position);
+        }
+
+        let geometries = state.output_rects().collect::<Vec<_>>();
+        let pointer = state.seat.get_pointer().unwrap();
+        pointer.set_location(crate::input::constrain_pointer(
+            pointer.current_location(),
+            &geometries,
+        ));
+    }
+
     fn rescan(&mut self, state: &mut Paw2) -> Result<(), Box<dyn std::error::Error>> {
         let scan = self.scanner.scan_connectors(self.manager.device())?;
         // A changed connector keeps its layout; a disconnected one hands it over.
@@ -605,12 +790,13 @@ impl DirectBackend {
         let transform = config
             .as_ref()
             .map_or(Transform::Normal, |value| value.transform);
+        let scale = config.as_ref().map_or(1.0, |value| value.scale);
         let mut position: Point<i32, Logical> = config
             .as_ref()
             .and_then(|value| value.position)
             .map(|[x, y]| (x, y).into())
             .unwrap_or_else(|| self.automatic_position(state));
-        let size = transform.transform_size(mode.size).to_logical(1);
+        let size = logical_output_size(mode, transform, scale);
         if self.position_overlaps(state, Rectangle::new(position, size)) {
             warn!(connector = %name, ?position, "monitor placement overlaps; using automatic placement");
             position = self.automatic_position(state);
@@ -636,8 +822,16 @@ impl DirectBackend {
                     .unwrap_or_else(|| "Unknown".into()),
             },
         );
+        for advertised in connector.modes() {
+            output.add_mode(Mode::from(*advertised));
+        }
         output.set_preferred(preferred);
-        output.change_current_state(Some(mode), Some(transform), None, Some(position));
+        output.change_current_state(
+            Some(mode),
+            Some(transform),
+            Some(OutputScale::Fractional(scale)),
+            Some(position),
+        );
 
         let empty = DrmOutputRenderElements::<GlesRenderer, PawRenderElements>::default();
         let kms = self.manager.lock().initialize_output(
@@ -674,7 +868,7 @@ impl DirectBackend {
             vrr_requested: None,
             vrr_active: false,
         });
-        info!(connector = %name, size = ?mode.size, refresh = mode.refresh, ?position, ?transform, ?vrr_policy, ?vrr_support, "enabled output");
+        info!(connector = %name, size = ?mode.size, refresh = mode.refresh, ?position, ?scale, ?transform, ?vrr_policy, ?vrr_support, "enabled output");
         Ok(())
     }
 
@@ -1079,6 +1273,41 @@ fn frame_flags(fullscreen: bool, direct_scanout: bool) -> FrameFlags {
     }
 }
 
+fn automatic_positions(outputs: &[OutputPlacement]) -> Vec<Point<i32, Logical>> {
+    let mut positions = vec![Point::default(); outputs.len()];
+    let mut occupied = outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (size, position))| {
+            let position = (*position)?;
+            positions[index] = position;
+            Some(Rectangle::new(position, *size))
+        })
+        .collect::<Vec<_>>();
+
+    for (index, (size, position)) in outputs.iter().enumerate() {
+        if position.is_some() {
+            continue;
+        }
+        let mut x = 0;
+        loop {
+            let proposed = Rectangle::new((x, 0).into(), *size);
+            let Some(next_x) = occupied
+                .iter()
+                .filter(|geometry| geometry.overlaps(proposed))
+                .map(|geometry| geometry.loc.x + geometry.size.w)
+                .max()
+            else {
+                positions[index] = proposed.loc;
+                occupied.push(proposed);
+                break;
+            };
+            x = next_x;
+        }
+    }
+    positions
+}
+
 fn connector_name(connector: &connector::Info) -> String {
     format!(
         "{}-{}",
@@ -1101,9 +1330,23 @@ fn select_mode(
     connector: &connector::Info,
     config: Option<&MonitorConfig>,
 ) -> Result<DrmMode, io::Error> {
-    let name = connector_name(connector);
     let preferred = preferred_mode(connector)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} has no modes")))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connector has no modes"))?;
+    match requested_mode(connector, config) {
+        Ok(mode) => Ok(mode),
+        Err(error) => {
+            warn!(connector = %connector_name(connector), %error, "requested mode unavailable; using preferred mode");
+            Ok(preferred)
+        }
+    }
+}
+
+fn requested_mode(
+    connector: &connector::Info,
+    config: Option<&MonitorConfig>,
+) -> Result<DrmMode, io::Error> {
+    let preferred = preferred_mode(connector)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connector has no modes"))?;
     let Some(config) = config else {
         return Ok(preferred);
     };
@@ -1128,12 +1371,24 @@ fn select_mode(
     let selected =
         best_mode(&modes, target_size, target_refresh).map(|index| connector.modes()[index]);
     let Some(selected) = selected else {
-        warn!(connector = %name, ?target_size, "requested resolution unavailable; using preferred mode");
-        return Ok(preferred);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "requested resolution {}x{} is unavailable",
+                target_size.0, target_size.1
+            ),
+        ));
     };
     if config.refresh.is_some() && !refresh_matches(Mode::from(selected).refresh, target_refresh) {
-        warn!(connector = %name, refresh = target_refresh as f64 / 1000.0, "requested refresh unavailable; using preferred mode");
-        Ok(preferred)
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "requested refresh {:.3} Hz is unavailable at {}x{}",
+                target_refresh as f64 / 1000.0,
+                target_size.0,
+                target_size.1
+            ),
+        ))
     } else {
         Ok(selected)
     }
@@ -1179,7 +1434,36 @@ mod tests {
             ((1920, 1080), 240_000),
         ];
         assert_eq!(best_mode(&modes, (2560, 1440), 200_000), Some(1));
+        assert_eq!(best_mode(&modes, (3840, 2160), 120_000), None);
         assert!(refresh_matches(199_999, 200_000));
+        assert!(refresh_matches(199_500, 200_000));
         assert!(!refresh_matches(199_000, 200_000));
+    }
+
+    #[test]
+    fn packs_automatic_outputs_around_fixed_positions() {
+        let outputs = [
+            ((1920, 1080).into(), None),
+            ((2560, 1440).into(), Some((2560, 0).into())),
+            ((1920, 1080).into(), None),
+        ];
+
+        assert_eq!(
+            automatic_positions(&outputs),
+            [(0, 0).into(), (2560, 0).into(), (5120, 0).into()]
+        );
+    }
+
+    #[test]
+    fn computes_scaled_rotated_logical_size() {
+        let mode = Mode {
+            size: (2560, 1440).into(),
+            refresh: 60_000,
+        };
+
+        assert_eq!(
+            logical_output_size(mode, Transform::_90, 1.5),
+            (960, 1707).into()
+        );
     }
 }

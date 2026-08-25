@@ -64,9 +64,8 @@ pub struct OutputState {
     /// The active workspace's tiling layout.
     pub layout: String,
     /// Every mode the display advertises. Paw2 has no
-    /// wlr-output-management, so this is the only way a settings UI can offer
-    /// a resolution to pick; applying one means writing `[[monitors]]` and
-    /// restarting, which is what the config already documents.
+    /// wlr-output-management, so a settings UI writes `[[monitors]]`; the
+    /// config watcher applies resolution, refresh, scale, and transform live.
     pub modes: Vec<ModeState>,
 }
 
@@ -137,9 +136,9 @@ impl IpcState {
         self.dirty = true;
     }
 
-    /// Publish the merged config, or the error from a load that did not take.
-    /// On failure `document` is still the last config that parsed, which is
-    /// also the one the compositor is running.
+    /// Publish the merged config and any load or mode-application error. A load
+    /// failure keeps the last parsed document; for a rejected monitor mode the
+    /// document is the request and the output snapshot remains the actual state.
     pub fn publish_config(&mut self, document: &toml::Value, error: Option<String>) {
         self.config = serde_json::to_value(document).unwrap_or(serde_json::Value::Null);
         self.config_error = error;

@@ -17,8 +17,9 @@ use smithay::{
     utils::{Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Size, Time},
     wayland::{
         commit_timing::CommitTimerBarrierStateUserData,
-        compositor::{CompositorHandler, with_states},
+        compositor::{CompositorHandler, SurfaceData, with_states},
         fifo::FifoBarrierCachedState,
+        fractional_scale::with_fractional_scale,
         shell::wlr_layer::{KeyboardInteractivity, Layer},
         shell::xdg::{
             SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData, dialog::ToplevelDialogHint,
@@ -31,6 +32,14 @@ use crate::{
     config::{Action, LayoutMode},
     state::Paw2,
 };
+
+fn refresh_fractional_scale(surface: &WlSurface, states: &SurfaceData) {
+    if let Some(output) = surface_primary_scanout_output(surface, states) {
+        with_fractional_scale(states, |fractional_scale| {
+            fractional_scale.set_preferred_scale(output.current_scale().fractional_scale());
+        });
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -1986,6 +1995,9 @@ impl Paw2 {
     pub fn focus_output_by_name(&mut self, name: &str) {
         if self.scroller.set_focused_output(name) {
             self.sync_focus();
+            // The shell's panels place themselves on the focused output, and
+            // cannot follow a change nothing tells them about.
+            self.ipc.touch();
         }
     }
 
@@ -2556,7 +2568,13 @@ impl Paw2 {
             Action::MoveToNextWorkspace => self.change_workspace(1, true),
             Action::LaunchCommand(index) => {
                 if let Some(command) = self.config.binding_commands.get(index)
-                    && let Err(error) = crate::spawn(command)
+                    && let Err(error) = crate::spawn(
+                        command,
+                        &self.cursor_defaults.configured(
+                            self.config.theme.cursor_theme.as_deref(),
+                            self.config.theme.cursor_size,
+                        ),
+                    )
                 {
                     tracing::error!(?error, program = command[0], "failed to launch command");
                 }
@@ -2840,6 +2858,21 @@ impl Paw2 {
         monitor.space.output_geometry(&monitor.output)
     }
 
+    pub fn reposition_output(&mut self, output: &Output, position: Point<i32, Logical>) {
+        let Some(monitor) = self
+            .scroller
+            .monitors
+            .iter_mut()
+            .find(|monitor| monitor.output == *output)
+        else {
+            return;
+        };
+        monitor.space.map_output(&monitor.output, position);
+        monitor
+            .output
+            .change_current_state(None, None, None, Some(position));
+    }
+
     pub fn outputs(&self) -> Vec<Output> {
         self.scroller
             .monitors
@@ -3045,6 +3078,7 @@ impl Paw2 {
                         states,
                         default_primary_scanout_output_compare,
                     );
+                    refresh_fractional_scale(surface, data);
                 });
                 window.take_presentation_feedback(
                     &mut feedback,
@@ -3065,6 +3099,7 @@ impl Paw2 {
                     states,
                     default_primary_scanout_output_compare,
                 );
+                refresh_fractional_scale(surface, data);
             });
             layer.take_presentation_feedback(
                 &mut feedback,

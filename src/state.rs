@@ -29,9 +29,11 @@ use smithay::{
         commit_timing::CommitTimingManagerState,
         compositor::{CompositorClientState, CompositorState},
         content_type::ContentTypeState,
+        cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
         drm_syncobj::DrmSyncobjState,
         fifo::FifoManagerState,
+        fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
@@ -82,8 +84,10 @@ pub struct Paw2 {
     pub _idle_inhibit_state: IdleInhibitManagerState,
     pub _presentation_state: PresentationState,
     pub _fifo_manager_state: FifoManagerState,
+    pub _fractional_scale_manager_state: FractionalScaleManagerState,
     pub _commit_timing_manager_state: CommitTimingManagerState,
     pub _content_type_state: ContentTypeState,
+    pub _cursor_shape_manager_state: CursorShapeManagerState,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
@@ -97,6 +101,7 @@ pub struct Paw2 {
     pub blur_surfaces: Vec<WlSurface>,
     pub cursor_status: smithay::input::pointer::CursorImageStatus,
     pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
+    pub cursor_defaults: crate::cursor::CursorSettings,
     pub direct: Option<crate::drm::DirectBackend>,
     pub config: Config,
     pub scroller: Scrollers,
@@ -132,6 +137,7 @@ impl Paw2 {
         event_loop: &mut EventLoop<'static, Self>,
         display: Display<Self>,
         config: Config,
+        cursor_defaults: crate::cursor::CursorSettings,
     ) -> Self {
         let display_handle = display.handle();
         let clock = Clock::<Monotonic>::new();
@@ -146,8 +152,11 @@ impl Paw2 {
         let presentation_state =
             PresentationState::new::<Self>(&display_handle, Monotonic::ID as u32);
         let fifo_manager_state = FifoManagerState::new::<Self>(&display_handle);
+        let fractional_scale_manager_state =
+            FractionalScaleManagerState::new::<Self>(&display_handle);
         let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&display_handle);
         let content_type_state = ContentTypeState::new::<Self>(&display_handle);
+        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&display_handle);
         RelativePointerManagerState::new::<Self>(&display_handle);
         PointerConstraintsState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -200,8 +209,10 @@ impl Paw2 {
             _idle_inhibit_state: idle_inhibit_state,
             _presentation_state: presentation_state,
             _fifo_manager_state: fifo_manager_state,
+            _fractional_scale_manager_state: fractional_scale_manager_state,
             _commit_timing_manager_state: commit_timing_manager_state,
             _content_type_state: content_type_state,
+            _cursor_shape_manager_state: cursor_shape_manager_state,
             drm_syncobj_state: None,
             seat_state,
             data_device_state,
@@ -215,6 +226,7 @@ impl Paw2 {
             blur_surfaces: Vec::new(),
             cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
             cursor_position_hint: None,
+            cursor_defaults,
             direct: None,
             config,
             scroller: Scrollers::default(),

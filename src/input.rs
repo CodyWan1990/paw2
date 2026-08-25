@@ -470,7 +470,7 @@ fn wheel_detents(remainder: &mut f64, amount_v120: f64) -> u32 {
     detents
 }
 
-fn constrain_pointer(
+pub(crate) fn constrain_pointer(
     point: Point<f64, Logical>,
     geometries: &[Rectangle<i32, Logical>],
 ) -> Point<f64, Logical> {
