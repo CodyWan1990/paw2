@@ -3325,6 +3325,7 @@ impl Paw2 {
             .collect::<Vec<_>>();
         let manual_floating = &self.scroller.manual_floating;
         let animations = &mut self.scroller.animations;
+        let focused_output = self.scroller.focused_output.clone();
         let monitors = &mut self.scroller.monitors;
         let now = self.start_time.elapsed();
         let duration =
@@ -3333,6 +3334,8 @@ impl Paw2 {
             let Some(monitor) = monitors.get_mut(index) else {
                 continue;
             };
+            let reveal_output =
+                should_reveal_output(reveal_focus, focused_output.as_deref(), &monitor.name);
             let Scroller {
                 space,
                 workspaces,
@@ -3379,8 +3382,8 @@ impl Paw2 {
                     &widths,
                     geometry.size.w,
                     gap,
-                    self.config.layout.center_focused_column && animate,
-                    reveal_focus,
+                    self.config.layout.center_focused_column && animate && reveal_output,
+                    reveal_output,
                 );
                 let mut column_x = geometry.loc.x + gap - workspace.offset;
                 let mut placements = Vec::with_capacity(tiled.len());
@@ -4100,6 +4103,10 @@ fn focus_after_removal(focused: Option<usize>, removed: usize, remaining: usize)
     })
 }
 
+fn should_reveal_output(reveal_focus: bool, focused_output: Option<&str>, output: &str) -> bool {
+    reveal_focus && focused_output == Some(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn viewport_offset(
     current: i32,
@@ -4483,6 +4490,10 @@ mod tests {
 
     #[test]
     fn navigation_viewport_and_monitor_direction() {
+        assert!(should_reveal_output(true, Some("DP-1"), "DP-1"));
+        assert!(!should_reveal_output(true, Some("DP-1"), "HDMI-A-1"));
+        assert!(!should_reveal_output(false, Some("DP-1"), "DP-1"));
+        assert!(!should_reveal_output(true, None, "DP-1"));
         assert_eq!(column_insertion_index(Some(0), 3), 1);
         assert_eq!(column_insertion_index(Some(2), 3), 3);
         assert_eq!(column_insertion_index(None, 3), 3);
