@@ -4,7 +4,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{FilterResult, Keysym, ModifiersState, keysyms},
         pointer::{
             AxisFrame, ButtonEvent, Focus, GestureHoldBeginEvent, GestureHoldEndEvent,
             GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
@@ -17,9 +17,57 @@ use smithay::{
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 
-use crate::{config::ScrollDirection, layout::MouseOperation, state::Paw2};
+use crate::{
+    config::{Action, ScrollDirection},
+    layout::MouseOperation,
+    state::Paw2,
+};
 
 const BTN_LEFT: u32 = 0x110;
+
+enum KeyAction {
+    Compositor(Action),
+    Overview(OverviewKey),
+}
+
+enum OverviewKey {
+    Workspace(i32),
+    Column(i32),
+    Row(i32),
+    Monitor(i32),
+    Confirm,
+    Cancel,
+}
+
+fn overview_key(modifiers: &ModifiersState, keysym: Keysym) -> Option<OverviewKey> {
+    if modifiers.alt {
+        return None;
+    }
+    if modifiers.ctrl {
+        if modifiers.shift {
+            return None;
+        }
+        return match keysym.raw() {
+            keysyms::KEY_Left | keysyms::KEY_h => Some(OverviewKey::Monitor(-1)),
+            keysyms::KEY_Right | keysyms::KEY_l => Some(OverviewKey::Monitor(1)),
+            _ => None,
+        };
+    }
+    if modifiers.shift {
+        return matches!(keysym.raw(), keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab)
+            .then_some(OverviewKey::Row(-1));
+    }
+    match keysym.raw() {
+        keysyms::KEY_Left | keysyms::KEY_h => Some(OverviewKey::Column(-1)),
+        keysyms::KEY_Right | keysyms::KEY_l => Some(OverviewKey::Column(1)),
+        keysyms::KEY_Up | keysyms::KEY_k => Some(OverviewKey::Workspace(-1)),
+        keysyms::KEY_Down | keysyms::KEY_j => Some(OverviewKey::Workspace(1)),
+        keysyms::KEY_Tab => Some(OverviewKey::Row(1)),
+        keysyms::KEY_Return | keysyms::KEY_KP_Enter => Some(OverviewKey::Confirm),
+        keysyms::KEY_Escape => Some(OverviewKey::Cancel),
+        _ => None,
+    }
+}
 
 struct MouseGrab {
     start_data: GrabStartData<Paw2>,
@@ -203,11 +251,27 @@ impl Paw2 {
                         };
 
                         if key_state == KeyState::Pressed {
-                            if let Some(action) = state.config.action(modifiers, keysym) {
+                            let overview = state.overview_active();
+                            let action = if overview {
+                                overview_key(modifiers, keysym)
+                                    .map(KeyAction::Overview)
+                                    .or_else(|| {
+                                        state
+                                            .config
+                                            .action(modifiers, keysym)
+                                            .map(KeyAction::Compositor)
+                                    })
+                            } else {
+                                state
+                                    .config
+                                    .action(modifiers, keysym)
+                                    .map(KeyAction::Compositor)
+                            };
+                            if overview || action.is_some() {
                                 if !state.suppressed_keys.contains(&keysym) {
                                     state.suppressed_keys.push(keysym);
                                 }
-                                FilterResult::Intercept(Some(action))
+                                FilterResult::Intercept(action)
                             } else {
                                 FilterResult::Forward
                             }
@@ -225,7 +289,23 @@ impl Paw2 {
                 );
 
                 if let Some(action) = action.flatten() {
-                    self.run_action(action);
+                    match action {
+                        KeyAction::Compositor(action) => self.run_action(action),
+                        KeyAction::Overview(OverviewKey::Workspace(delta)) => {
+                            self.move_overview_workspace(delta)
+                        }
+                        KeyAction::Overview(OverviewKey::Column(delta)) => {
+                            self.move_overview_column(delta)
+                        }
+                        KeyAction::Overview(OverviewKey::Row(delta)) => {
+                            self.move_overview_row(delta)
+                        }
+                        KeyAction::Overview(OverviewKey::Monitor(delta)) => {
+                            self.move_overview_monitor(delta)
+                        }
+                        KeyAction::Overview(OverviewKey::Confirm) => self.confirm_overview(),
+                        KeyAction::Overview(OverviewKey::Cancel) => self.close_overview(),
+                    }
                 }
             }
             InputEvent::PointerMotion { event, .. } => {
@@ -235,6 +315,29 @@ impl Paw2 {
                 }
                 let current = self.seat.get_pointer().unwrap().current_location();
                 let pointer = self.seat.get_pointer().unwrap();
+                if self.overview_active() {
+                    let location = constrain_pointer(current + event.delta(), &geometries);
+                    pointer.relative_motion(
+                        self,
+                        None,
+                        &RelativeMotionEvent {
+                            delta: event.delta(),
+                            delta_unaccel: event.delta_unaccel(),
+                            utime: event.time(),
+                        },
+                    );
+                    pointer.motion(
+                        self,
+                        None,
+                        &MotionEvent {
+                            location,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                    return;
+                }
                 let under = self.surface_under(current);
                 let mut locked = false;
                 let mut confined = None;
@@ -318,8 +421,21 @@ impl Paw2 {
                     return;
                 };
                 let location = event.position_transformed(geometry.size) + geometry.loc.to_f64();
-                self.focus_output_at(location);
                 let pointer = self.seat.get_pointer().unwrap();
+                if self.overview_active() {
+                    pointer.motion(
+                        self,
+                        None,
+                        &MotionEvent {
+                            location,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                    return;
+                }
+                self.focus_output_at(location);
                 let under = self.surface_under(location);
 
                 pointer.motion(
@@ -346,6 +462,21 @@ impl Paw2 {
                 let pointer = self.seat.get_pointer().unwrap();
                 let serial = SERIAL_COUNTER.next_serial();
                 let location = pointer.current_location();
+
+                if self.overview_active() {
+                    if event.state() == ButtonState::Pressed
+                        && event.button_code() == BTN_LEFT
+                        && let Some((output, workspace, window)) = self.overview_hit(location)
+                    {
+                        self.focus_output_by_name(&output);
+                        self.activate_workspace(&output, workspace);
+                        if let Some(window) = window {
+                            self.focus_window_by_id(window);
+                        }
+                        self.close_overview();
+                    }
+                    return;
+                }
 
                 if event.state() == ButtonState::Pressed
                     && event.button_code() == BTN_LEFT
@@ -411,6 +542,15 @@ impl Paw2 {
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
+                if self.overview_active() {
+                    let amount = event.amount_v120(Axis::Vertical).unwrap_or_default();
+                    if source == AxisSource::Wheel && amount != 0.0 {
+                        let delta = if amount < 0.0 { -1 } else { 1 };
+                        let location = self.seat.get_pointer().unwrap().current_location();
+                        self.scroll_overview_at(location, delta);
+                    }
+                    return;
+                }
                 if source == AxisSource::Wheel
                     && let Some(amount) = event.amount_v120(Axis::Vertical)
                     && amount != 0.0
@@ -516,6 +656,67 @@ mod tests {
         assert_eq!(
             constrain_pointer((110.0, 30.0).into(), &geometries),
             (110.0, 30.0).into()
+        );
+    }
+
+    #[test]
+    fn overview_maps_navigation_keys_and_modifiers() {
+        let none = ModifiersState::default();
+        assert!(matches!(
+            overview_key(&none, keysyms::KEY_j.into()),
+            Some(OverviewKey::Workspace(1))
+        ));
+        assert!(matches!(
+            overview_key(&none, keysyms::KEY_Left.into()),
+            Some(OverviewKey::Column(-1))
+        ));
+        assert!(matches!(
+            overview_key(&none, keysyms::KEY_Tab.into()),
+            Some(OverviewKey::Row(1))
+        ));
+        assert!(matches!(
+            overview_key(
+                &ModifiersState {
+                    shift: true,
+                    ..Default::default()
+                },
+                keysyms::KEY_ISO_Left_Tab.into()
+            ),
+            Some(OverviewKey::Row(-1))
+        ));
+        assert!(matches!(
+            overview_key(
+                &ModifiersState {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                keysyms::KEY_l.into()
+            ),
+            Some(OverviewKey::Monitor(1))
+        ));
+        assert!(matches!(
+            overview_key(&none, keysyms::KEY_Return.into()),
+            Some(OverviewKey::Confirm)
+        ));
+        assert!(matches!(
+            overview_key(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                keysyms::KEY_j.into()
+            ),
+            Some(OverviewKey::Workspace(1))
+        ));
+        assert!(
+            overview_key(
+                &ModifiersState {
+                    alt: true,
+                    ..Default::default()
+                },
+                keysyms::KEY_j.into()
+            )
+            .is_none()
         );
     }
 

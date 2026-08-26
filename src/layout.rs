@@ -29,7 +29,7 @@ use smithay::{
 };
 
 use crate::{
-    config::{Action, LayoutMode},
+    config::{Action, Config, LayoutMode},
     state::Paw2,
 };
 
@@ -51,6 +51,41 @@ enum Direction {
 
 pub const WORKSPACE_COUNT: usize = 9;
 const MIN_ROW_HEIGHT: i32 = 48;
+/// Screen-space distance between workspace cards once the overview is fully
+/// open. It scales with the opening progress, so at rest the active card lands
+/// exactly on the output rectangle and the transition has no seam.
+const OVERVIEW_GAP: i32 = 24;
+
+#[derive(Clone)]
+struct OverviewSelection {
+    output: String,
+    workspace: usize,
+    window: Option<usize>,
+    /// Where the preview of this workspace is scrolled to, in workspace-logical
+    /// pixels. It starts at the workspace's own offset and then follows the
+    /// selection, so a column that scrolled off the card can still be reached.
+    pan: i32,
+}
+
+/// A window as the overview shows it. `geometry` is where the window really
+/// sits relative to the output, *unscaled* - the renderer applies the card's
+/// zoom to the surface itself, so the preview is the live window rather than a
+/// redrawn stand-in.
+pub(crate) struct OverviewWindow {
+    pub window: Window,
+    pub geometry: Rectangle<i32, Logical>,
+    pub selected: bool,
+}
+
+/// One workspace card in the strip. `card` is where it lands on the output and
+/// `zoom` is the factor its contents shrink by; together they are the whole
+/// transform, which is why nothing here is pre-scaled.
+pub(crate) struct OverviewWorkspace {
+    pub workspace: usize,
+    pub card: Rectangle<i32, Logical>,
+    pub zoom: f64,
+    pub windows: Vec<OverviewWindow>,
+}
 
 struct Column<T = Window> {
     windows: Vec<T>,
@@ -233,11 +268,14 @@ impl Workspace {
         self.windows.iter().position(|item| item == window)
     }
 
-    fn focused_column(&self) -> Option<usize> {
-        let window = self.windows.get(self.focused?)?;
+    fn column_of(&self, window: usize) -> Option<usize> {
         self.columns
             .iter()
-            .position(|column| column.windows.contains(window))
+            .position(|column| column.windows.iter().any(|tile| tile.id() == window))
+    }
+
+    fn focused_column(&self) -> Option<usize> {
+        self.column_of(self.windows.get(self.focused?)?.id())
     }
 
     fn focus_window(&mut self, window: &Window) {
@@ -562,6 +600,36 @@ impl Workspace {
             .columns
             .iter()
             .any(|column| column.windows.contains(window))
+    }
+
+    fn overview_window(&self) -> Option<usize> {
+        self.fullscreen
+            .as_ref()
+            .or_else(|| self.focused.and_then(|index| self.windows.get(index)))
+            .or_else(|| self.windows.first())
+            .map(Window::id)
+    }
+
+    fn overview_column_neighbor(&self, current: usize, delta: i32) -> Option<usize> {
+        if self.fullscreen.is_some() {
+            return None;
+        }
+        let current = self.windows.iter().find(|window| window.id() == current)?;
+        let floating = self
+            .windows
+            .iter()
+            .filter(|window| self.is_floating(window))
+            .cloned()
+            .collect::<Vec<_>>();
+        column_neighbor(&self.columns, &floating, current, delta).map(|window| window.id())
+    }
+
+    fn overview_row_neighbor(&self, current: usize, delta: i32) -> Option<usize> {
+        if self.fullscreen.is_some() {
+            return None;
+        }
+        let current = self.windows.iter().find(|window| window.id() == current)?;
+        row_neighbor(&self.columns, current, delta).map(|window| window.id())
     }
 
     fn tile_at(&mut self, window: Window, index: usize, width: Option<f64>) {
@@ -944,6 +1012,26 @@ impl Scroller {
     }
 }
 
+impl OverviewSelection {
+    /// Seeds the pan from the workspace's real offset, so opening the overview
+    /// has no horizontal jump. Every workspace and monitor change builds a fresh
+    /// selection, which is what resets the pan back to reality.
+    fn new(monitor: &Scroller, workspace: usize) -> Self {
+        Self {
+            output: monitor.name.clone(),
+            workspace,
+            window: monitor
+                .workspaces
+                .get(workspace)
+                .and_then(Workspace::overview_window),
+            pan: monitor
+                .workspaces
+                .get(workspace)
+                .map_or(0, |workspace| workspace.offset),
+        }
+    }
+}
+
 impl Scrollers {
     /// Everything a panel draws: the monitors with their workspace strips, and
     /// every window with the workspace it sits on.
@@ -995,6 +1083,17 @@ impl Scrollers {
 pub struct Scrollers {
     monitors: Vec<Scroller>,
     focused_output: Option<String>,
+    overview: Option<OverviewSelection>,
+    /// How far the overview is open: 0.0 is the plain desktop, 1.0 fully zoomed
+    /// out. It outlives `overview` so the closing animation still has something
+    /// to draw after the selection is gone.
+    overview_zoom: Tween,
+    /// Which workspace the strip is centred on, as a position in the visible
+    /// list, so switching workspace slides rather than jumps.
+    overview_scroll: Tween,
+    /// The selected workspace's preview offset, so moving along the columns
+    /// slides the card rather than jumping it.
+    overview_pan: Tween,
     parked: [Workspace; WORKSPACE_COUNT],
     animations: HashMap<usize, WindowAnimation>,
     manual_floating: HashMap<usize, ManualFloating>,
@@ -1036,6 +1135,46 @@ impl WindowAnimation {
         } else {
             1.0
         }
+    }
+}
+
+/// One number easing toward another. Like `WindowAnimation`, progress comes
+/// from absolute elapsed time, so reading it more than once in a frame is free.
+#[derive(Default)]
+struct Tween {
+    start: Duration,
+    duration: Duration,
+    from: f64,
+    to: f64,
+}
+
+impl Tween {
+    fn value(&self, now: Duration) -> f64 {
+        if self.duration.is_zero() {
+            return self.to;
+        }
+        let progress = (now.saturating_sub(self.start).as_secs_f64() / self.duration.as_secs_f64())
+            .clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * ease_out_cubic(progress)
+    }
+
+    fn finished(&self, now: Duration) -> bool {
+        self.duration.is_zero() || now.saturating_sub(self.start) >= self.duration
+    }
+
+    /// Re-aims at `to` from wherever the value stands right now, so closing the
+    /// overview mid-open resumes from what is on screen instead of snapping to
+    /// the far end and easing back.
+    fn retarget(&mut self, to: f64, now: Duration, duration: Option<Duration>) {
+        if self.to == to && !self.finished(now) {
+            return;
+        }
+        *self = Self {
+            from: self.value(now),
+            to,
+            start: now,
+            duration: duration.unwrap_or_default(),
+        };
     }
 }
 
@@ -2549,6 +2688,10 @@ impl Paw2 {
                 self.toggle_fullscreen();
                 false
             }
+            Action::ToggleOverview => {
+                self.toggle_overview();
+                false
+            }
             Action::FocusMonitorLeft => self.change_monitor(Direction::Left, false),
             Action::FocusMonitorRight => self.change_monitor(Direction::Right, false),
             Action::FocusMonitorUp => self.change_monitor(Direction::Up, false),
@@ -2585,6 +2728,24 @@ impl Paw2 {
                 false
             }
         };
+        if self.overview_active()
+            && matches!(
+                action,
+                Action::FocusMonitorLeft
+                    | Action::FocusMonitorRight
+                    | Action::FocusMonitorUp
+                    | Action::FocusMonitorDown
+                    | Action::MoveToMonitorLeft
+                    | Action::MoveToMonitorRight
+                    | Action::MoveToMonitorUp
+                    | Action::MoveToMonitorDown
+                    | Action::SwitchWorkspace(_)
+                    | Action::PreviousWorkspace
+                    | Action::NextWorkspace
+            )
+        {
+            self.select_active_workspace();
+        }
         if changed {
             self.relayout(true);
             self.sync_focus();
@@ -2711,6 +2872,13 @@ impl Paw2 {
     }
 
     pub(crate) fn activate_workspace(&mut self, output: &str, workspace: usize) {
+        if self.overview_active() && workspace < WORKSPACE_COUNT {
+            self.scroller.overview = self
+                .scroller
+                .monitor(output)
+                .map(|monitor| OverviewSelection::new(monitor, workspace));
+            self.retarget_overview(true);
+        }
         let changed = self
             .scroller
             .monitor_mut(output)
@@ -2722,6 +2890,284 @@ impl Paw2 {
             self.sync_workspace_protocol();
             crate::drm::redraw(self);
         }
+    }
+
+    pub(crate) fn overview_active(&self) -> bool {
+        self.scroller.overview.is_some()
+    }
+
+    /// True while the overview owns input. The closing animation outlives this,
+    /// so anything that only draws should ask `overview_visible` instead.
+    pub(crate) fn overview_visible(&self) -> bool {
+        self.scroller.overview.is_some() || self.overview_progress() > 0.0
+    }
+
+    /// How far open the overview is drawn right now, 0.0 to 1.0.
+    pub(crate) fn overview_progress(&self) -> f64 {
+        self.scroller.overview_zoom.value(self.start_time.elapsed())
+    }
+
+    /// Points both overview tweens at whatever the state now says. Every path
+    /// that opens, closes or moves the selection ends here, so the strip always
+    /// slides instead of jumping. The scroll only animates within one monitor -
+    /// hopping to another output has nothing to slide along.
+    fn retarget_overview(&mut self, animate_scroll: bool) {
+        let now = self.start_time.elapsed();
+        let duration = self
+            .config
+            .animations
+            .active()
+            .then_some(self.config.animations.duration);
+        let open = self.scroller.overview.is_some();
+        let target = self
+            .scroller
+            .overview
+            .as_ref()
+            .map(|selection| (selection.output.clone(), Some(selection.workspace)))
+            .or_else(|| Some((self.scroller.focused_output.clone()?, None)));
+        let center = target
+            .and_then(|(output, workspace)| {
+                let monitor = self.scroller.monitor(&output)?;
+                let workspace = workspace.unwrap_or(monitor.active_workspace);
+                let visible = visible_workspaces(&monitor.workspaces, monitor.active_workspace);
+                visible.iter().position(|candidate| *candidate == workspace)
+            })
+            .map_or(self.scroller.overview_scroll.to, |position| position as f64);
+        let pan = self.overview_pan_for_selection();
+        if let Some(selection) = self.scroller.overview.as_mut() {
+            selection.pan = pan;
+        }
+        self.scroller
+            .overview_zoom
+            .retarget(if open { 1.0 } else { 0.0 }, now, duration);
+        let scroll_duration = animate_scroll.then_some(duration).flatten();
+        self.scroller
+            .overview_scroll
+            .retarget(center, now, scroll_duration);
+        self.scroller
+            .overview_pan
+            .retarget(f64::from(pan), now, scroll_duration);
+        crate::drm::redraw(self);
+    }
+
+    /// The preview offset the current selection asks for. Resolved separately
+    /// from `retarget_overview` because it needs the work area, and that means
+    /// reading the output geometry and layer map before anything takes a `&mut`.
+    fn overview_pan_for_selection(&self) -> i32 {
+        let Some(selection) = self.scroller.overview.as_ref() else {
+            return self.scroller.overview_pan.to as i32;
+        };
+        let Some(monitor) = self.scroller.monitor(&selection.output) else {
+            return selection.pan;
+        };
+        let Some(workspace) = monitor.workspaces.get(selection.workspace) else {
+            return selection.pan;
+        };
+        if workspace.layout != LayoutMode::Scrolling || workspace.fullscreen.is_some() {
+            return 0;
+        }
+        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+            return selection.pan;
+        };
+        let area = work_area(
+            output_geometry,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        overview_pan_target(
+            &workspace.columns,
+            area.size,
+            selection
+                .window
+                .and_then(|window| workspace.column_of(window)),
+            selection.pan,
+            self.config.layout.column_width,
+            self.config.appearance.gaps,
+            self.config.layout.center_focused_column,
+        )
+    }
+
+    fn select_active_workspace(&mut self) {
+        let Some(monitor) = self
+            .scroller
+            .focused_output
+            .as_deref()
+            .and_then(|output| self.scroller.monitor(output))
+        else {
+            return;
+        };
+        self.scroller.overview = Some(OverviewSelection::new(monitor, monitor.active_workspace));
+        self.retarget_overview(true);
+    }
+
+    pub(crate) fn close_overview(&mut self) {
+        if self.scroller.overview.take().is_some() {
+            self.sync_focus();
+            self.retarget_overview(true);
+        }
+    }
+
+    fn toggle_overview(&mut self) {
+        if self.overview_active() {
+            self.close_overview();
+            return;
+        }
+        if self.has_exclusive_keyboard_layer() {
+            return;
+        }
+        let monitor = self
+            .scroller
+            .focused_output
+            .as_deref()
+            .and_then(|output| self.scroller.monitor(output))
+            .or_else(|| self.scroller.monitors.first());
+        let Some(monitor) = monitor else {
+            return;
+        };
+        self.scroller.overview = Some(OverviewSelection::new(monitor, monitor.active_workspace));
+        self.sync_focus();
+        self.retarget_overview(false);
+    }
+
+    pub(crate) fn move_overview_workspace(&mut self, delta: i32) {
+        let Some(selection) = self.scroller.overview.clone() else {
+            return;
+        };
+        let Some(monitor) = self.scroller.monitor(&selection.output) else {
+            return;
+        };
+        let visible = visible_workspaces(&monitor.workspaces, monitor.active_workspace);
+        let Some(workspace) = wrapped_selection(&visible, selection.workspace, delta) else {
+            return;
+        };
+        self.scroller.overview = Some(OverviewSelection::new(monitor, workspace));
+        self.retarget_overview(true);
+    }
+
+    pub(crate) fn move_overview_column(&mut self, delta: i32) {
+        let Some(selection) = self.scroller.overview.clone() else {
+            return;
+        };
+        let Some(window) = selection.window else {
+            return;
+        };
+        let Some(target) = self
+            .scroller
+            .monitor(&selection.output)
+            .and_then(|monitor| monitor.workspaces.get(selection.workspace))
+            .and_then(|workspace| workspace.overview_column_neighbor(window, delta))
+        else {
+            return;
+        };
+        self.scroller.overview.as_mut().unwrap().window = Some(target);
+        self.retarget_overview(true);
+    }
+
+    pub(crate) fn move_overview_row(&mut self, delta: i32) {
+        let Some(selection) = self.scroller.overview.clone() else {
+            return;
+        };
+        let Some(window) = selection.window else {
+            return;
+        };
+        let Some(target) = self
+            .scroller
+            .monitor(&selection.output)
+            .and_then(|monitor| monitor.workspaces.get(selection.workspace))
+            .and_then(|workspace| workspace.overview_row_neighbor(window, delta))
+        else {
+            return;
+        };
+        self.scroller.overview.as_mut().unwrap().window = Some(target);
+        self.retarget_overview(true);
+    }
+
+    pub(crate) fn move_overview_monitor(&mut self, delta: i32) {
+        let Some(selection) = self.scroller.overview.clone() else {
+            return;
+        };
+        let direction = if delta < 0 {
+            Direction::Left
+        } else {
+            Direction::Right
+        };
+        let geometries = self.output_geometries();
+        let Some(output) = directional_neighbor(&selection.output, direction, &geometries) else {
+            return;
+        };
+        let Some(monitor) = self.scroller.monitor(&output) else {
+            return;
+        };
+        self.scroller.overview = Some(OverviewSelection::new(monitor, monitor.active_workspace));
+        self.retarget_overview(false);
+    }
+
+    pub(crate) fn confirm_overview(&mut self) {
+        let Some(selection) = self.scroller.overview.take() else {
+            return;
+        };
+        self.focus_output_by_name(&selection.output);
+        self.activate_workspace(&selection.output, selection.workspace);
+        if let Some(window) = selection.window {
+            self.focus_window_by_id(window);
+        }
+        self.sync_focus();
+        self.retarget_overview(true);
+    }
+
+    /// What sits under the pointer in the overview: the workspace, and the
+    /// window inside it when the click landed on one.
+    pub(crate) fn overview_hit(
+        &self,
+        position: Point<f64, Logical>,
+    ) -> Option<(String, usize, Option<usize>)> {
+        let monitor = self.monitor_at(position)?;
+        let local = position - monitor.space.output_geometry(&monitor.output)?.loc.to_f64();
+        let workspaces = self.overview_workspaces(&monitor.output);
+        // Windows first: they sit on top of their card, and a click on one is
+        // meant for that window rather than the workspace behind it.
+        for workspace in &workspaces {
+            for preview in &workspace.windows {
+                if overview_screen_rect(preview.geometry, workspace.card, workspace.zoom)
+                    .to_f64()
+                    .contains(local)
+                {
+                    return Some((
+                        monitor.name.clone(),
+                        workspace.workspace,
+                        Some(preview.window.id()),
+                    ));
+                }
+            }
+        }
+        workspaces
+            .iter()
+            .find(|workspace| workspace.card.to_f64().contains(local))
+            .map(|workspace| (monitor.name.clone(), workspace.workspace, None))
+    }
+
+    /// Wheel over the strip moves the selection, the same as `j`/`k` would. It
+    /// deliberately does not switch workspace for real: that would relayout the
+    /// desktop underneath a view whose whole job is to preview it.
+    pub(crate) fn scroll_overview_at(&mut self, position: Point<f64, Logical>, delta: i32) {
+        let Some(monitor) = self.monitor_at(position) else {
+            return;
+        };
+        let name = monitor.name.clone();
+        let visible = visible_workspaces(&monitor.workspaces, monitor.active_workspace);
+        let current = self
+            .scroller
+            .overview
+            .as_ref()
+            .filter(|selection| selection.output == name)
+            .map_or(monitor.active_workspace, |selection| selection.workspace);
+        let Some(target) = wrapped_selection(&visible, current, delta) else {
+            return;
+        };
+        let Some(monitor) = self.scroller.monitor(&name) else {
+            return;
+        };
+        self.scroller.overview = Some(OverviewSelection::new(monitor, target));
+        self.retarget_overview(true);
     }
 
     fn sync_workspace_protocol(&mut self) {
@@ -2896,6 +3342,122 @@ impl Paw2 {
             .map(|monitor| &monitor.space)
     }
 
+    /// The workspace strip this output draws: one card per visible workspace,
+    /// each carrying its windows at their real, unscaled positions plus the zoom
+    /// the renderer should apply to them.
+    pub(crate) fn overview_workspaces(&self, output: &Output) -> Vec<OverviewWorkspace> {
+        let Some(monitor) = self.scroller.monitor_for(output) else {
+            return Vec::new();
+        };
+        let Some(output_geometry) = monitor.space.output_geometry(output) else {
+            return Vec::new();
+        };
+        let visible = visible_workspaces(&monitor.workspaces, monitor.active_workspace);
+        let selection = self
+            .scroller
+            .overview
+            .as_ref()
+            .filter(|selection| selection.output == monitor.name);
+        // Only one strip scrolls: the one holding the selection, or the focused
+        // one while the overview closes. Every other monitor sits on its own
+        // active workspace, which is not moving.
+        let scrolling = match &self.scroller.overview {
+            Some(selection) => selection.output == monitor.name,
+            None => self.scroller.focused_output.as_deref() == Some(monitor.name.as_str()),
+        };
+        let center = if scrolling {
+            self.scroller
+                .overview_scroll
+                .value(self.start_time.elapsed())
+        } else {
+            visible
+                .iter()
+                .position(|workspace| *workspace == monitor.active_workspace)
+                .unwrap_or_default() as f64
+        };
+        let progress = self.overview_progress();
+        let zoom = overview_zoom(progress, self.config.overview.zoom);
+        let pan = self
+            .scroller
+            .overview_pan
+            .value(self.start_time.elapsed())
+            .round() as i32;
+        let area = work_area(
+            output_geometry,
+            layer_map_for_output(output).non_exclusive_zone(),
+        );
+        overview_cards(
+            output_geometry.size,
+            &visible,
+            center,
+            progress,
+            self.config.overview.zoom,
+        )
+        .into_iter()
+        .map(|(index, card)| {
+            let workspace = &monitor.workspaces[index];
+            let selected = selection.filter(|selection| selection.workspace == index);
+            let selected_window = selected.and_then(|selection| selection.window);
+            // Only the workspace being navigated pans; the rest are not moving,
+            // so they keep showing their real scroll position.
+            let offset = match selected {
+                Some(_) => pan,
+                None => workspace.offset,
+            };
+            let windows = overview_window_placements(
+                workspace,
+                area,
+                output_geometry,
+                offset,
+                &self.config,
+                &self.scroller.manual_floating,
+            )
+            .into_iter()
+            .filter_map(|(window, mut geometry)| {
+                // Placements are global; the renderer works output-local.
+                geometry.loc -= output_geometry.loc;
+                let selected = selected_window == Some(window.id());
+                // The selection is never culled. Panning should always have
+                // revealed it, and a selection you cannot see is the exact
+                // failure this pan exists to prevent.
+                (selected
+                    || overview_screen_rect(geometry, card, zoom)
+                        .overlaps(Rectangle::from_size(output_geometry.size)))
+                .then_some(OverviewWindow {
+                    selected,
+                    window,
+                    geometry,
+                })
+            })
+            .collect();
+            OverviewWorkspace {
+                workspace: index,
+                card,
+                zoom,
+                windows,
+            }
+        })
+        .collect()
+    }
+
+    fn overview_inactive_windows(&self, output: &Output) -> Vec<Window> {
+        if !self.overview_visible() {
+            return Vec::new();
+        }
+        let Some(monitor) = self.scroller.monitor_for(output) else {
+            return Vec::new();
+        };
+        monitor
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(index, workspace)| {
+                *index != monitor.active_workspace && !workspace.windows.is_empty()
+            })
+            .flat_map(|(_, workspace)| workspace.windows.iter().cloned())
+            .collect()
+    }
+
     pub fn focused_window_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
         let monitor = self.scroller.monitor_for(output)?;
         if self.scroller.focused_output.as_deref() != Some(monitor.name.as_str()) {
@@ -2912,6 +3474,10 @@ impl Paw2 {
             .active()
             .fullscreen
             .as_ref()
+    }
+
+    pub(crate) fn renders_fullscreen(&self, output: &Output) -> bool {
+        !self.overview_visible() && self.fullscreen_window(output).is_some()
     }
 
     pub fn x11_override_windows(&self, output: &Output) -> Vec<(Window, Point<i32, Logical>)> {
@@ -3000,6 +3566,9 @@ impl Paw2 {
                 window.with_surfaces(&mut collect);
             }
         }
+        for window in self.overview_inactive_windows(output) {
+            window.with_surfaces(&mut collect);
+        }
         let layers = layer_map_for_output(output);
         for layer in layers.layers() {
             layer.with_surfaces(&mut collect);
@@ -3032,6 +3601,11 @@ impl Paw2 {
                     Some(output.clone())
                 });
             }
+        }
+        for window in self.overview_inactive_windows(output) {
+            window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
         }
         let layers = layer_map_for_output(output);
         for layer in layers.layers() {
@@ -3088,6 +3662,24 @@ impl Paw2 {
                     },
                 );
             }
+        }
+        for window in self.overview_inactive_windows(output) {
+            window.with_surfaces(|surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+                refresh_fractional_scale(surface, data);
+            });
+            window.take_presentation_feedback(
+                &mut feedback,
+                surface_primary_scanout_output,
+                |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
+            );
         }
         for layer in layer_map_for_output(output).layers() {
             layer.with_surfaces(|surface, data| {
@@ -3360,22 +3952,12 @@ impl Paw2 {
                 .collect::<Vec<_>>();
             workspace.sync_layout_sizes(tiled.len());
             let placements = if workspace.layout == LayoutMode::Scrolling {
-                let fractions = workspace
-                    .columns
-                    .iter()
-                    .map(|column| column.width.unwrap_or(self.config.layout.column_width))
-                    .collect::<Vec<_>>();
-                let requested_width = fractions
-                    .iter()
-                    .map(|fraction| (geometry.size.w as f64 * fraction).round() as i32)
-                    .min()
-                    .unwrap_or(geometry.size.w);
-                let gap =
-                    effective_gap(self.config.appearance.gaps, requested_width, geometry.size);
-                let widths = fractions
-                    .iter()
-                    .map(|fraction| column_width(geometry.size.w, *fraction, gap))
-                    .collect::<Vec<_>>();
+                let (gap, widths) = column_widths(
+                    &workspace.columns,
+                    geometry.size,
+                    self.config.layout.column_width,
+                    self.config.appearance.gaps,
+                );
                 workspace.offset = viewport_offset(
                     workspace.offset,
                     workspace.focused_column(),
@@ -3385,28 +3967,7 @@ impl Paw2 {
                     self.config.layout.center_focused_column && animate && reveal_output,
                     reveal_output,
                 );
-                let mut column_x = geometry.loc.x + gap - workspace.offset;
-                let mut placements = Vec::with_capacity(tiled.len());
-                for (column, width) in workspace.columns.iter().zip(widths) {
-                    let rows = stacked_rows(
-                        geometry.loc.y,
-                        geometry.size.h,
-                        &column.row_weights,
-                        gap,
-                        MIN_ROW_HEIGHT,
-                    );
-                    placements.extend(column.windows.iter().zip(rows).map(|(window, row)| {
-                        (
-                            window.clone(),
-                            Rectangle::new(
-                                (column_x, row.loc.y).into(),
-                                (width - gap, row.size.h).into(),
-                            ),
-                        )
-                    }));
-                    column_x += width;
-                }
-                placements
+                place_columns(&workspace.columns, geometry, &widths, gap, workspace.offset)
             } else {
                 workspace.offset = 0;
                 layout_rectangles(
@@ -3463,18 +4024,11 @@ impl Paw2 {
                     let rectangle = if fullscreen {
                         output_geometry
                     } else {
-                        let size = override_
-                            .and_then(|override_| override_.size)
-                            .unwrap_or_else(|| floating_size(window));
-                        Rectangle::new(
-                            override_
-                                .and_then(|override_| override_.location)
-                                .or_else(|| floating_locations.get(&window.id()).copied())
-                                .map_or_else(
-                                    || centered_rectangle(geometry, size).loc,
-                                    |location| constrain_window(geometry, size, location),
-                                ),
-                            size,
+                        floating_rectangle(
+                            window,
+                            geometry,
+                            override_,
+                            floating_locations.get(&window.id()).copied(),
                         )
                     };
                     place(
@@ -3524,17 +4078,32 @@ impl Paw2 {
         animations.retain(|_, animation| !animation.finished(now));
     }
 
+    /// Whether anything on screen is still moving, so the backend keeps queueing
+    /// repaints. The overview tweens count: without them the transition would
+    /// stall on the first frame that produced no damage.
     pub fn animations_active(&self) -> bool {
+        let now = self.start_time.elapsed();
         !self.scroller.animations.is_empty()
+            || !self.scroller.overview_zoom.finished(now)
+            || !self.scroller.overview_scroll.finished(now)
+            || !self.scroller.overview_pan.finished(now)
     }
 
     pub(crate) fn sync_focus(&mut self) {
-        let active_output = self.scroller.focused_output.as_deref();
-        let focused_surface = self.exclusive_keyboard_surface().or_else(|| {
+        let active_output = self.scroller.focused_output.clone();
+        let exclusive = self.exclusive_keyboard_surface();
+        if exclusive.is_some() && self.scroller.overview.take().is_some() {
+            self.retarget_overview(true);
+        }
+        let overview = self.overview_active();
+        let focused_surface = exclusive.or_else(|| {
+            if overview {
+                return None;
+            }
             self.scroller
                 .monitors
                 .iter()
-                .find(|monitor| Some(monitor.name.as_str()) == active_output)
+                .find(|monitor| Some(monitor.name.as_str()) == active_output.as_deref())
                 .and_then(|monitor| {
                     let workspace = monitor.active();
                     workspace
@@ -3554,7 +4123,8 @@ impl Paw2 {
             for (workspace_index, workspace) in monitor.workspaces.iter().enumerate() {
                 for (index, window) in workspace.windows.iter().enumerate() {
                     window.set_activated(
-                        Some(monitor.name.as_str()) == active_output
+                        !overview
+                            && Some(monitor.name.as_str()) == active_output.as_deref()
                             && workspace_index == monitor.active_workspace
                             && if let Some(fullscreen) = &workspace.fullscreen {
                                 window == fullscreen
@@ -4014,6 +4584,150 @@ fn constrain_window(
         .into()
 }
 
+fn visible_workspaces(workspaces: &[Workspace; WORKSPACE_COUNT], active: usize) -> Vec<usize> {
+    visible_workspace_indices(
+        workspaces
+            .iter()
+            .map(|workspace| !workspace.windows.is_empty()),
+        active,
+    )
+}
+
+fn visible_workspace_indices(occupied: impl Iterator<Item = bool>, active: usize) -> Vec<usize> {
+    occupied
+        .enumerate()
+        .filter_map(|(index, occupied)| (index == active || occupied).then_some(index))
+        .collect()
+}
+
+fn wrapped_selection(workspaces: &[usize], current: usize, delta: i32) -> Option<usize> {
+    let current = workspaces
+        .iter()
+        .position(|workspace| *workspace == current)?;
+    let target = (current as i32 + delta).rem_euclid(workspaces.len() as i32) as usize;
+    workspaces.get(target).copied()
+}
+
+/// The workspace strip: one card per visible workspace, stacked down the output
+/// and centred on `center`.
+///
+/// `progress` runs 0.0 (closed) to 1.0 (open) and drives both the shrink and
+/// the gap, so at 0.0 the centred card is exactly the output rectangle and the
+/// overview and the plain desktop line up pixel for pixel. That is what lets
+/// the transition animate without a seam.
+fn overview_cards(
+    output: Size<i32, Logical>,
+    workspaces: &[usize],
+    center: f64,
+    progress: f64,
+    zoom: f64,
+) -> Vec<(usize, Rectangle<i32, Logical>)> {
+    let scale = overview_zoom(progress, zoom);
+    let size: Size<i32, Logical> = (
+        (f64::from(output.w) * scale).round().max(1.0) as i32,
+        (f64::from(output.h) * scale).round().max(1.0) as i32,
+    )
+        .into();
+    let gap = (f64::from(OVERVIEW_GAP) * progress).round() as i32;
+    let step = size.h + gap;
+    let x = (output.w - size.w) / 2;
+    let start_y = (output.h - size.h) / 2 - (center * f64::from(step)).round() as i32;
+    workspaces
+        .iter()
+        .enumerate()
+        .map(|(position, workspace)| {
+            (
+                *workspace,
+                Rectangle::new((x, start_y + position as i32 * step).into(), size),
+            )
+        })
+        .collect()
+}
+
+/// How far workspace contents shrink at this point in the transition: 1.0 while
+/// closed, the configured zoom once open.
+fn overview_zoom(progress: f64, zoom: f64) -> f64 {
+    1.0 + (zoom - 1.0) * progress.clamp(0.0, 1.0)
+}
+
+/// Where a window that really sits at `geometry` lands inside its card.
+pub(crate) fn overview_screen_rect(
+    geometry: Rectangle<i32, Logical>,
+    card: Rectangle<i32, Logical>,
+    zoom: f64,
+) -> Rectangle<i32, Logical> {
+    let axis = |value: i32| (f64::from(value) * zoom).round() as i32;
+    Rectangle::new(
+        (
+            card.loc.x + axis(geometry.loc.x),
+            card.loc.y + axis(geometry.loc.y),
+        )
+            .into(),
+        (axis(geometry.size.w).max(1), axis(geometry.size.h).max(1)).into(),
+    )
+}
+
+/// Where every window of `workspace` sits, exactly as the real layout would
+/// place it in `area`. The preview goes through the same helpers as
+/// `relayout_with_animation`, so what the overview shows is what you get when
+/// you switch to it.
+fn overview_window_placements(
+    workspace: &Workspace,
+    area: Rectangle<i32, Logical>,
+    output: Rectangle<i32, Logical>,
+    offset: i32,
+    config: &Config,
+    manual_floating: &HashMap<usize, ManualFloating>,
+) -> Vec<(Window, Rectangle<i32, Logical>)> {
+    if let Some(window) = &workspace.fullscreen {
+        return vec![(window.clone(), output)];
+    }
+
+    let tiled = workspace
+        .columns
+        .iter()
+        .flat_map(|column| column.windows.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut placements = if workspace.layout == LayoutMode::Scrolling {
+        let (gap, widths) = column_widths(
+            &workspace.columns,
+            area.size,
+            config.layout.column_width,
+            config.appearance.gaps,
+        );
+        place_columns(&workspace.columns, area, &widths, gap, offset)
+    } else {
+        layout_rectangles(
+            workspace.layout,
+            area,
+            tiled.len(),
+            config.appearance.gaps,
+            workspace.effective_master_count(tiled.len()),
+            workspace.master_ratio.unwrap_or(config.layout.column_width),
+            &workspace.master_weights,
+            &workspace.dwindle_ratios,
+        )
+        .into_iter()
+        .zip(tiled)
+        .map(|(rectangle, window)| (window, rectangle))
+        .collect()
+    };
+
+    placements.extend(
+        workspace
+            .windows
+            .iter()
+            .filter(|window| workspace.is_floating(window))
+            .map(|window| {
+                (
+                    window.clone(),
+                    floating_rectangle(window, area, manual_floating.get(&window.id()), None),
+                )
+            }),
+    );
+    placements
+}
+
 fn work_area(
     output: Rectangle<i32, Logical>,
     non_exclusive_zone: Rectangle<i32, Logical>,
@@ -4024,6 +4738,43 @@ fn work_area(
 fn neighbor(current: usize, len: usize, delta: i32) -> Option<usize> {
     let next = current as i64 + delta as i64;
     (0..len as i64).contains(&next).then_some(next as usize)
+}
+
+fn column_neighbor<T: Clone + PartialEq>(
+    columns: &[Column<T>],
+    floating: &[T],
+    current: &T,
+    delta: i32,
+) -> Option<T> {
+    let current = columns
+        .iter()
+        .position(|column| column.windows.contains(current))
+        .or_else(|| {
+            floating
+                .iter()
+                .position(|window| window == current)
+                .map(|index| columns.len() + index)
+        })?;
+    let target = neighbor(current, columns.len() + floating.len(), delta)?;
+    columns
+        .get(target)
+        .and_then(|column| column.windows.get(column.focused))
+        // `checked_sub`, not `saturating_sub`: a column whose `focused` index has
+        // gone stale would otherwise fall through to the first floating window
+        // instead of reporting that it has nothing to offer.
+        .or_else(|| floating.get(target.checked_sub(columns.len())?))
+        .cloned()
+}
+
+fn row_neighbor<T: Clone + PartialEq>(columns: &[Column<T>], current: &T, delta: i32) -> Option<T> {
+    let column = columns
+        .iter()
+        .find(|column| column.windows.contains(current))?;
+    let current = column.windows.iter().position(|window| window == current)?;
+    column
+        .windows
+        .get(neighbor(current, column.windows.len(), delta)?)
+        .cloned()
 }
 
 fn swap_column_window<T>(column: &mut Column<T>, delta: i32) -> bool {
@@ -4142,6 +4893,113 @@ fn viewport_offset(
         }
     }
     offset.clamp(0, max_offset)
+}
+
+/// The width of every column of a scrolling workspace, and the gap that fits
+/// between them. Shared by the real layout and the overview preview so the two
+/// cannot drift apart.
+fn column_widths<T>(
+    columns: &[Column<T>],
+    area: Size<i32, Logical>,
+    default_width: f64,
+    requested_gap: i32,
+) -> (i32, Vec<i32>) {
+    let fractions = columns
+        .iter()
+        .map(|column| column.width.unwrap_or(default_width))
+        .collect::<Vec<_>>();
+    let requested_width = fractions
+        .iter()
+        .map(|fraction| (f64::from(area.w) * fraction).round() as i32)
+        .min()
+        .unwrap_or(area.w);
+    let gap = effective_gap(requested_gap, requested_width, area);
+    let widths = fractions
+        .iter()
+        .map(|fraction| column_width(area.w, *fraction, gap))
+        .collect();
+    (gap, widths)
+}
+
+/// Where a workspace's preview should be scrolled to so that `column` lands on
+/// its card.
+///
+/// The card is screen-sized, so this is the same question the real viewport
+/// answers when you focus a column - and it is answered with the same
+/// `viewport_offset`, so panning in the overview and focusing on the desktop can
+/// never disagree. A strip that already fits clamps to `0`, which is what keeps
+/// the preview equal to reality in the common case.
+fn overview_pan_target<T>(
+    columns: &[Column<T>],
+    area: Size<i32, Logical>,
+    column: Option<usize>,
+    current: i32,
+    default_width: f64,
+    requested_gap: i32,
+    center: bool,
+) -> i32 {
+    // No column means a floating window is selected. Those do not scroll with
+    // the strip on the real desktop either, and they always sit inside the work
+    // area, so leaving the pan alone keeps them in view.
+    let Some(column) = column else {
+        return current;
+    };
+    let (gap, widths) = column_widths(columns, area, default_width, requested_gap);
+    viewport_offset(current, Some(column), &widths, area.w, gap, center, true)
+}
+
+/// Where the tiled windows of a scrolling workspace sit, for a viewport scrolled
+/// to `offset`.
+fn place_columns<T: Clone>(
+    columns: &[Column<T>],
+    area: Rectangle<i32, Logical>,
+    widths: &[i32],
+    gap: i32,
+    offset: i32,
+) -> Vec<(T, Rectangle<i32, Logical>)> {
+    let mut column_x = area.loc.x + gap - offset;
+    let mut placements = Vec::new();
+    for (column, width) in columns.iter().zip(widths) {
+        let rows = stacked_rows(
+            area.loc.y,
+            area.size.h,
+            &column.row_weights,
+            gap,
+            MIN_ROW_HEIGHT,
+        );
+        placements.extend(column.windows.iter().zip(rows).map(|(window, row)| {
+            (
+                window.clone(),
+                Rectangle::new(
+                    (column_x, row.loc.y).into(),
+                    (width - gap, row.size.h).into(),
+                ),
+            )
+        }));
+        column_x += width;
+    }
+    placements
+}
+
+/// Where a floating window sits inside `area`: at its manual override if it has
+/// one, else where it already was, else centred.
+fn floating_rectangle(
+    window: &Window,
+    area: Rectangle<i32, Logical>,
+    override_: Option<&ManualFloating>,
+    current: Option<Point<i32, Logical>>,
+) -> Rectangle<i32, Logical> {
+    let size = override_
+        .and_then(|override_| override_.size)
+        .unwrap_or_else(|| floating_size(window));
+    let location = override_
+        .and_then(|override_| override_.location)
+        .or(current)
+        .map_or_else(
+            || centered_rectangle(area, size).loc,
+            |location| constrain_window(area, size, location),
+        );
+    Rectangle::new(location, size)
 }
 
 fn effective_gap(
@@ -4486,6 +5344,221 @@ mod tests {
                 serial_number: "Unknown".into(),
             },
         )
+    }
+
+    #[test]
+    fn overview_filters_orders_and_centers_workspaces() {
+        let visible = visible_workspace_indices(
+            [false, true, false, false, false, true, false, false, false].into_iter(),
+            3,
+        );
+        assert_eq!(visible, [1, 3, 5]);
+        assert_eq!(wrapped_selection(&visible, 1, -1), Some(5));
+        assert_eq!(wrapped_selection(&visible, 5, 1), Some(1));
+
+        // Closed, the centred card is exactly the output: that seam is what
+        // lets the overview animate out of the live desktop without a jump.
+        let output: Size<i32, Logical> = (1920, 1080).into();
+        let closed = overview_cards(output, &visible, 1.0, 0.0, 0.5);
+        assert_eq!(closed[1].0, 3);
+        assert_eq!(closed[1].1, Rectangle::from_size(output));
+        assert_eq!(overview_zoom(0.0, 0.5), 1.0);
+
+        // Open, cards keep the output's proportions and sit centred.
+        let cards = overview_cards(output, &visible, 1.0, 1.0, 0.5);
+        assert_eq!(
+            cards[1].1,
+            Rectangle::new((480, 270).into(), (960, 540).into())
+        );
+        assert!(cards[0].1.loc.y < cards[1].1.loc.y);
+        assert!(cards[2].1.loc.y > cards[1].1.loc.y);
+        assert_eq!(cards[1].1.loc.y - cards[0].1.loc.y, 540 + OVERVIEW_GAP);
+        assert_eq!(overview_zoom(1.0, 0.5), 0.5);
+
+        // Centring follows the fractional scroll position.
+        let scrolled = overview_cards(output, &visible, 2.0, 1.0, 0.5);
+        assert_eq!(scrolled[2].1.loc.y, 270);
+        let halfway = overview_cards(output, &visible, 1.5, 1.0, 0.5);
+        assert!(halfway[1].1.loc.y < 270 && halfway[2].1.loc.y > 270);
+
+        // A window lands inside its card at the card's own zoom.
+        assert_eq!(
+            overview_screen_rect(
+                Rectangle::new((960, 540).into(), (960, 540).into()),
+                cards[1].1,
+                0.5,
+            ),
+            Rectangle::new((960, 540).into(), (480, 270).into())
+        );
+    }
+
+    #[test]
+    fn columns_are_placed_the_same_for_the_desktop_and_the_preview() {
+        let columns = [
+            Column {
+                windows: vec![1, 2],
+                row_weights: vec![1.0, 1.0],
+                focused: 0,
+                width: Some(0.5),
+            },
+            Column {
+                windows: vec![3],
+                row_weights: vec![1.0],
+                focused: 0,
+                width: Some(0.5),
+            },
+        ];
+        let area = Rectangle::new((0, 0).into(), (1000, 600).into());
+        let (gap, widths) = column_widths(&columns, area.size, 0.6, 15);
+        assert_eq!(gap, 15);
+        assert_eq!(widths, vec![493, 493]);
+
+        // Both callers pass the workspace's own offset, so an unscrolled and a
+        // scrolled viewport differ by exactly that offset and nothing else.
+        let resting = place_columns(&columns, area, &widths, gap, 0);
+        assert_eq!(resting.len(), 3);
+        assert_eq!(resting[0].1.loc.x, gap);
+        assert_eq!(resting[0].1.size.w, 493 - gap);
+        assert_eq!(resting[2].1.loc.x, gap + 493);
+        // Two rows stack inside the first column, one fills the second.
+        assert!(resting[1].1.loc.y > resting[0].1.loc.y);
+        assert_eq!(resting[0].1.loc.x, resting[1].1.loc.x);
+        assert!(resting[2].1.size.h > resting[0].1.size.h);
+
+        let scrolled = place_columns(&columns, area, &widths, gap, 200);
+        for (rested, scrolled) in resting.iter().zip(&scrolled) {
+            assert_eq!(scrolled.1.loc.x, rested.1.loc.x - 200);
+            assert_eq!(scrolled.1.size, rested.1.size);
+        }
+    }
+
+    #[test]
+    fn tween_eases_between_its_ends_and_reverses_from_where_it_stands() {
+        let now = Duration::from_millis(500);
+        let duration = Some(Duration::from_millis(200));
+        let mut tween = Tween::default();
+        assert_eq!(tween.value(now), 0.0);
+        assert!(tween.finished(now));
+
+        tween.retarget(1.0, now, duration);
+        assert_eq!(tween.value(now), 0.0);
+        assert!(!tween.finished(now));
+        let middle = tween.value(now + Duration::from_millis(100));
+        assert!(middle > 0.0 && middle < 1.0);
+        // Absolute time, so an overshooting read still lands exactly on the end
+        // rather than leaving the overview a hair short of open.
+        assert_eq!(tween.value(now + Duration::from_millis(200)), 1.0);
+        assert_eq!(tween.value(now + Duration::from_secs(9)), 1.0);
+        assert!(tween.finished(now + Duration::from_millis(200)));
+
+        // Re-aiming at the same target must not restart the animation.
+        let later = now + Duration::from_millis(100);
+        tween.retarget(1.0, later, duration);
+        assert_eq!(tween.value(later), middle);
+
+        // Reversing mid-flight resumes from what is on screen.
+        tween.retarget(0.0, later, duration);
+        assert_eq!(tween.value(later), middle);
+        assert_eq!(tween.value(later + Duration::from_millis(200)), 0.0);
+
+        // No duration means no animation, the same as everything else here.
+        tween.retarget(1.0, later, None);
+        assert_eq!(tween.value(later), 1.0);
+        assert!(tween.finished(later));
+    }
+
+    #[test]
+    fn overview_navigates_columns_rows_and_floating_windows() {
+        let columns = [
+            Column {
+                windows: vec![1, 2],
+                row_weights: vec![1.0, 1.0],
+                focused: 1,
+                width: None,
+            },
+            Column {
+                windows: vec![3, 4],
+                row_weights: vec![1.0, 1.0],
+                focused: 0,
+                width: None,
+            },
+        ];
+        let floating = [5, 6];
+
+        assert_eq!(column_neighbor(&columns, &floating, &1, 1), Some(3));
+        assert_eq!(column_neighbor(&columns, &floating, &3, -1), Some(2));
+        assert_eq!(column_neighbor(&columns, &floating, &4, 1), Some(5));
+        assert_eq!(column_neighbor(&columns, &floating, &5, 1), Some(6));
+        assert_eq!(column_neighbor(&columns, &floating, &6, 1), None);
+        assert_eq!(row_neighbor(&columns, &1, 1), Some(2));
+        assert_eq!(row_neighbor(&columns, &2, 1), None);
+        assert_eq!(row_neighbor(&columns, &5, 1), None);
+
+        // A column whose `focused` index has gone stale offers nothing, rather
+        // than falling through to the first floating window.
+        let stale = [Column {
+            windows: vec![1],
+            row_weights: vec![1.0],
+            focused: 7,
+            width: None,
+        }];
+        assert_eq!(column_neighbor(&stale, &floating, &5, -1), None);
+    }
+
+    #[test]
+    fn overview_pans_only_far_enough_to_reveal_the_selected_column() {
+        // Six half-width columns on a 1000px area. `column_width` makes each 493
+        // wide with a 15px gap, so the visible span is 970 and a column occupies
+        // 478 of it: two columns overhang it by a single pixel.
+        let columns = (0..6)
+            .map(|index| Column {
+                windows: vec![index],
+                row_weights: vec![1.0],
+                focused: 0,
+                width: Some(0.5),
+            })
+            .collect::<Vec<_>>();
+        let area: Size<i32, Logical> = (1000, 600).into();
+        let pan = |column: Option<usize>, current: i32| {
+            overview_pan_target(&columns, area, column, current, 0.5, 15, false)
+        };
+
+        // The first column is already on the card, so the view does not move.
+        assert_eq!(pan(Some(0), 0), 0);
+        // Anything further is revealed by exactly what it overhangs by, never
+        // more: column 2 starts at 2*493 and needs 478 of the 970 visible.
+        assert_eq!(pan(Some(2), 0), 493 * 2 + 478 - 970);
+        // The last column pins the view at its far end.
+        let far = pan(Some(5), 0);
+        assert_eq!(far, 493 * 5 + 478 - 970);
+        assert!(far > pan(Some(2), 0));
+        assert_eq!(pan(Some(5), far), far);
+        // Coming back scrolls the other way, and only to the column's own edge.
+        assert_eq!(pan(Some(1), far), 493);
+        // A floating selection has no column and leaves the pan where it is.
+        assert_eq!(pan(None, far), far);
+        // `center_focused_column` is honoured.
+        assert_eq!(
+            overview_pan_target(&columns, area, Some(3), 0, 0.5, 15, true),
+            493 * 3 - (970 - 478) / 2
+        );
+
+        // Three narrower columns fit the card outright, so nothing pans and the
+        // preview stays equal to the real desktop - the common case.
+        let fitting = (0..3)
+            .map(|index| Column {
+                windows: vec![index],
+                row_weights: vec![1.0],
+                focused: 0,
+                width: Some(0.3),
+            })
+            .collect::<Vec<_>>();
+        for column in 0..3 {
+            assert_eq!(
+                overview_pan_target(&fitting, area, Some(column), 0, 0.3, 15, false),
+                0
+            );
+        }
     }
 
     #[test]

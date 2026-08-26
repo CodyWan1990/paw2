@@ -62,6 +62,12 @@ duration_ms = 150
 # Multiplier for watching animations in slow motion; 3.0 runs them 3x slower.
 slowdown = 1.0
 
+[overview]
+# How far the workspaces shrink when the overview opens. 0.5 is half size.
+zoom = 0.5
+# Shown behind the workspace cards, where the desktop no longer reaches.
+backdrop_color = "#1c1c1c"
+
 [input]
 # Focus windows as the pointer enters them without moving the workspace viewport.
 focus_follows_mouse = false
@@ -145,6 +151,7 @@ increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
 toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
+toggle_overview = ["Super+o"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
 focus_monitor_up = []
@@ -199,6 +206,7 @@ pub enum Action {
     ToggleFloating,
     CloseWindow,
     ToggleFullscreen,
+    ToggleOverview,
     FocusMonitorLeft,
     FocusMonitorRight,
     FocusMonitorUp,
@@ -305,6 +313,14 @@ pub struct AnimationConfig {
     pub duration: Duration,
 }
 
+/// How the overview draws itself: how far the workspaces shrink, and what shows
+/// through around them once they no longer cover the output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverviewConfig {
+    pub zoom: f64,
+    pub backdrop_color: [f32; 4],
+}
+
 impl AnimationConfig {
     /// Animations need both the switch and a non-zero duration to be visible.
     pub fn active(&self) -> bool {
@@ -353,6 +369,7 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub appearance: AppearanceConfig,
     pub animations: AnimationConfig,
+    pub overview: OverviewConfig,
     pub input: InputConfig,
     pub theme: ThemeConfig,
     pub backend: BackendConfig,
@@ -842,6 +859,8 @@ struct RawConfig {
     autostart: RawAutostart,
     #[serde(default)]
     animations: RawAnimations,
+    #[serde(default)]
+    overview: RawOverview,
     bindings: RawBindings,
 }
 
@@ -901,6 +920,22 @@ impl Default for RawAnimations {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawOverview {
+    zoom: f64,
+    backdrop_color: String,
+}
+
+impl Default for RawOverview {
+    fn default() -> Self {
+        Self {
+            zoom: 0.5,
+            backdrop_color: "#1c1c1c".into(),
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawBindings {
@@ -939,6 +974,7 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("toggle_floating",        Action::ToggleFloating,       "Super+Shift+space"),
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
     ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
+    ("toggle_overview",        Action::ToggleOverview,       "Super+o"),
     ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
     ("focus_monitor_right",    Action::FocusMonitorRight,    "Super+period"),
     ("focus_monitor_up",       Action::FocusMonitorUp,       ""),
@@ -1214,11 +1250,19 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     {
         return Err("theme.cursor_size must be between 1 and 256".into());
     }
-    let focus_ring_color = parse_color(&raw.appearance.focus_ring_color, "focus_ring_color")?;
+    let focus_ring_color = parse_color(
+        &raw.appearance.focus_ring_color,
+        "appearance.focus_ring_color",
+    )?;
     let shadow_color = premultiply(
-        parse_color(&raw.appearance.shadow_color, "shadow_color")?,
+        parse_color(&raw.appearance.shadow_color, "appearance.shadow_color")?,
         raw.appearance.shadow_opacity as f32,
     );
+    if !(OVERVIEW_ZOOM_RANGE).contains(&raw.overview.zoom) {
+        let (low, high) = (OVERVIEW_ZOOM_RANGE.start(), OVERVIEW_ZOOM_RANGE.end());
+        return Err(format!("overview.zoom must be between {low} and {high}"));
+    }
+    let backdrop_color = parse_color(&raw.overview.backdrop_color, "overview.backdrop_color")?;
     if let Some(path) = &raw.backend.drm_device
         && !path.is_absolute()
     {
@@ -1396,6 +1440,10 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
                 f64::from(raw.animations.duration_ms) / 1000.0 * raw.animations.slowdown,
             ),
         },
+        overview: OverviewConfig {
+            zoom: raw.overview.zoom,
+            backdrop_color,
+        },
         input: raw.input,
         theme: raw.theme,
         backend: raw.backend,
@@ -1425,8 +1473,12 @@ fn add_binding(
     Ok(())
 }
 
+/// Below this the previews stop being readable; above it the strip stops
+/// showing more than one workspace, which is the whole point of the overview.
+const OVERVIEW_ZOOM_RANGE: std::ops::RangeInclusive<f64> = 0.2..=0.75;
+
 fn parse_color(value: &str, field: &str) -> Result<[f32; 4], String> {
-    let complain = || format!("appearance.{field} must use #RRGGBB");
+    let complain = || format!("{field} must use #RRGGBB");
     let hex = value
         .strip_prefix('#')
         .filter(|hex| hex.len() == 6)
@@ -1516,7 +1568,7 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 62);
+        assert_eq!(config.bindings.len(), 63);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -1527,6 +1579,16 @@ mod tests {
                 xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
             ),
             Some(Action::ToggleFloating)
+        );
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("o", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::ToggleOverview)
         );
         let disabled = parse(&DEFAULT_CONFIG.replace(
             "toggle_floating = [\"Super+Shift+space\"]",
@@ -1598,6 +1660,32 @@ mod tests {
         assert!(config.appearance.blur_enabled());
         assert_eq!(config.appearance.window_opacity(), 0.95);
         assert!(config.animations.active());
+        assert_eq!(config.overview.zoom, 0.5);
+        assert_eq!(
+            config.overview.backdrop_color,
+            [28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0, 1.0]
+        );
+        assert!(
+            parse(&DEFAULT_CONFIG.replace("zoom = 0.5", "zoom = 0.9"))
+                .unwrap_err()
+                .contains("overview.zoom must be between")
+        );
+        assert!(
+            parse(&DEFAULT_CONFIG.replace(
+                r##"backdrop_color = "#1c1c1c""##,
+                r#"backdrop_color = "grey""#
+            ))
+            .unwrap_err()
+            .contains("overview.backdrop_color must use #RRGGBB")
+        );
+        // A config written before the overview existed still gets its defaults.
+        let legacy_overview = parse(
+            &DEFAULT_CONFIG
+                .replace("zoom = 0.5\n", "")
+                .replace(r##"backdrop_color = "#1c1c1c""##, ""),
+        )
+        .unwrap();
+        assert_eq!(legacy_overview.overview, config.overview);
         assert!(config.backend.direct_scanout);
         // The shipped config and the built-in default must not drift apart.
         assert_eq!(config.security, SecurityConfig::default());
@@ -1928,7 +2016,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 62);
+        assert_eq!(legacy.bindings.len(), 63);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -1961,7 +2049,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 49);
+        assert_eq!(config.bindings.len(), 50);
 
         let old_monitor_bindings = DEFAULT_CONFIG
             .replace(

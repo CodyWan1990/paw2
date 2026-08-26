@@ -13,7 +13,10 @@ use smithay::{
                 memory::MemoryRenderBufferRenderElement,
                 solid::SolidColorRenderElement,
                 surface::WaylandSurfaceRenderElement,
-                utils::{CropRenderElement, RelocateRenderElement, RescaleRenderElement},
+                utils::{
+                    ConstrainAlign, ConstrainScaleBehavior, CropRenderElement, Relocate,
+                    RelocateRenderElement, RescaleRenderElement,
+                },
             },
             gles::{
                 GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture,
@@ -22,12 +25,17 @@ use smithay::{
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
-    desktop::space::{
-        ConstrainBehavior, ConstrainReference, SpaceRenderElements, constrain_space_element,
-        space_render_elements,
+    desktop::{
+        layer_map_for_output,
+        space::{
+            ConstrainBehavior, ConstrainReference, SpaceRenderElements, constrain_space_element,
+            space_render_elements,
+        },
     },
     output::{Output, OutputNoMode},
-    utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform, user_data::UserDataMap},
+    utils::{
+        Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform, user_data::UserDataMap,
+    },
     wayland::{
         background_effect::BackgroundEffectSurfaceCachedState,
         compositor::{RectangleKind, RegionAttributes, with_states},
@@ -35,7 +43,11 @@ use smithay::{
     },
 };
 
-use crate::{config::AppearanceConfig, layout::is_exclusive_keyboard_layer, state::Paw2};
+use crate::{
+    config::AppearanceConfig,
+    layout::{is_exclusive_keyboard_layer, overview_screen_rect},
+    state::Paw2,
+};
 
 const DOWNSAMPLE_SHADER: &str = r#"#version 100
 
@@ -82,6 +94,18 @@ void main() {
     gl_FragColor = color;
 }
 "#;
+
+/// Painted behind each workspace card so a desktop with no wallpaper client
+/// still shows a card rather than a hole onto the backdrop.
+const OVERVIEW_CARD: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
+/// The card shadow, as fractions of a card's height. Keeping them relative is
+/// what makes the shadow shrink with the card instead of swamping it.
+const OVERVIEW_SHADOW_SPREAD: f64 = 0.03;
+const OVERVIEW_SHADOW_OFFSET: f64 = 0.012;
+const OVERVIEW_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
+/// Logical pixels, held constant across zoom levels so the selection stays
+/// legible however far the workspaces are shrunk.
+const OVERVIEW_RING_WIDTH: i32 = 3;
 
 const UPSAMPLE_SHADER: &str = r#"#version 100
 
@@ -279,17 +303,40 @@ smithay::backend::renderer::element::render_elements! {
     Shader=PixelShaderElement,
     Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
-    Fullscreen=FullscreenElement,
+    Constrained=ConstrainedWindowElement,
     Solid=SolidColorRenderElement,
 }
 
-type FullscreenElement = CropRenderElement<
+type ConstrainedWindowElement = CropRenderElement<
     RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
 >;
 
-pub fn clear_color(fullscreen: bool) -> [f32; 4] {
-    if fullscreen {
+/// Shrinks output-relative surface elements into a workspace card: scaled about
+/// the output origin, moved onto the card, then clipped to `crop`. One uniform
+/// transform for wallpaper and windows alike, which is why the preview keeps the
+/// proportions of the real desktop.
+fn zoomed(
+    elements: impl IntoIterator<Item = WaylandSurfaceRenderElement<GlesRenderer>>,
+    zoom: f64,
+    card: Point<i32, Physical>,
+    crop: Rectangle<i32, Physical>,
+    scale: Scale<f64>,
+) -> impl Iterator<Item = ConstrainedWindowElement> {
+    elements.into_iter().filter_map(move |element| {
+        let scaled = RescaleRenderElement::from_element(element, Point::default(), zoom);
+        let moved = RelocateRenderElement::from_element(scaled, card, Relocate::Relative);
+        CropRenderElement::from_element(moved, scale, crop)
+    })
+}
+
+/// What the output is wiped to before anything is drawn: black behind a
+/// fullscreen window, the configured backdrop behind the overview's cards, and
+/// otherwise the near-black that shows through gaps.
+pub fn clear_color(state: &Paw2, output: &Output) -> [f32; 4] {
+    if state.renders_fullscreen(output) {
         [0.0, 0.0, 0.0, 1.0]
+    } else if state.overview_visible() {
+        state.config.overview.backdrop_color
     } else {
         [0.04, 0.04, 0.05, 1.0]
     }
@@ -313,6 +360,15 @@ pub struct Effects {
     /// the damage tracker repaints them, even when nothing has moved.
     generation: usize,
     appearance: AppearanceConfig,
+    /// One stable id per workspace card, kept for the same reason the ring is:
+    /// a fresh id every frame would damage the card forever.
+    overview_cards: [Id; crate::layout::WORKSPACE_COUNT],
+    /// Cached alongside the card height and ring size they were built for.
+    /// `update_uniforms` damages unconditionally, so rebuilding these every
+    /// frame would keep the compositor repainting for as long as the overview
+    /// is open.
+    overview_shadows: [Option<(i32, PixelShaderElement)>; crate::layout::WORKSPACE_COUNT],
+    overview_ring: Option<((i32, i32), PixelShaderElement)>,
 }
 
 impl Effects {
@@ -321,13 +377,11 @@ impl Effects {
             .blur_enabled()
             .then(|| compile_blur(renderer))
             .flatten();
-        let ring_program = (appearance.focus_ring_width > 0)
-            .then(|| compile_ring(renderer))
-            .flatten();
-        let shadow_program = appearance
-            .shadow_enabled()
-            .then(|| compile_shadow(renderer))
-            .flatten();
+        // Both of these are compiled up front rather than on demand: the
+        // overview needs them for its selection ring and its card shadows even
+        // when the desktop's own ring and shadows are switched off.
+        let ring_program = compile_ring(renderer);
+        let shadow_program = compile_shadow(renderer);
         let window_program = window_effects(&appearance)
             .then(|| compile_window(renderer))
             .flatten();
@@ -341,6 +395,9 @@ impl Effects {
             window_program,
             generation: 0,
             appearance,
+            overview_cards: std::array::from_fn(|_| Id::new()),
+            overview_shadows: std::array::from_fn(|_| None),
+            overview_ring: None,
         }
     }
 
@@ -379,6 +436,8 @@ impl Effects {
                 self.shadows.clear();
             }
             self.generation = self.generation.wrapping_add(1);
+            self.overview_ring = None;
+            self.overview_shadows = std::array::from_fn(|_| None);
             if let Some(ring) = &mut self.ring {
                 ring.update_uniforms(ring_uniforms(&appearance));
             }
@@ -388,6 +447,11 @@ impl Effects {
             }
         }
         state.advance_animations();
+        // Gated on visibility, not on input ownership: the closing animation
+        // still has to be drawn after the overview has given focus back.
+        if state.overview_visible() {
+            return self.overview_elements(renderer, state, output);
+        }
         let scale = Scale::from(output.current_scale().fractional_scale());
         if let Some(window) = state.fullscreen_window(output).cloned() {
             // A suspended output is unmapped from its space but still owns the
@@ -396,7 +460,7 @@ impl Effects {
             else {
                 return Ok(Vec::new());
             };
-            let layers = smithay::desktop::layer_map_for_output(output);
+            let layers = layer_map_for_output(output);
             let mut elements = layers
                 .layers()
                 .filter(|surface| {
@@ -433,7 +497,7 @@ impl Effects {
                     .map(PawRenderElements::Cursor),
             );
             elements.extend(
-                constrain_space_element::<_, _, FullscreenElement, _, _>(
+                constrain_space_element::<_, _, ConstrainedWindowElement, _, _>(
                     renderer,
                     &window,
                     (0, 0),
@@ -442,12 +506,11 @@ impl Effects {
                     Rectangle::from_size(output_size),
                     ConstrainBehavior {
                         reference: ConstrainReference::Geometry,
-                        behavior:
-                            smithay::backend::renderer::element::utils::ConstrainScaleBehavior::Fit,
-                        align: smithay::backend::renderer::element::utils::ConstrainAlign::CENTER,
+                        behavior: ConstrainScaleBehavior::Fit,
+                        align: ConstrainAlign::CENTER,
                     },
                 )
-                .map(PawRenderElements::Fullscreen),
+                .map(PawRenderElements::Constrained),
             );
             return Ok(elements);
         }
@@ -489,6 +552,225 @@ impl Effects {
         self.shadows
             .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
         Ok(elements)
+    }
+
+    /// The overview: every visible workspace drawn as a shrunken copy of the
+    /// real output - its wallpaper, its windows, its layout - floating on the
+    /// backdrop. There is one transform per card and everything inside goes
+    /// through it, which is what keeps the previews honest.
+    fn overview_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        state: &Paw2,
+        output: &Output,
+    ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let Some(output_size) = state.output_geometry(output).map(|geometry| geometry.size) else {
+            return Ok(Vec::new());
+        };
+
+        // Top and overlay stay at full size above the overview; background and
+        // bottom shrink with the workspaces, so every card carries the
+        // wallpaper the way the real desktop does.
+        let layers = layer_map_for_output(output);
+        let (above, below): (Vec<_>, Vec<_>) = layers
+            .layers()
+            .rev()
+            .filter_map(|surface| {
+                layers
+                    .layer_geometry(surface)
+                    .map(|geometry| (geometry.loc, surface.clone()))
+            })
+            .partition(|(_, surface)| matches!(surface.layer(), Layer::Top | Layer::Overlay));
+        drop(layers);
+
+        let mut elements = above
+            .iter()
+            .flat_map(|(location, surface)| {
+                AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(
+                    surface,
+                    renderer,
+                    location.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+            })
+            .map(PawRenderElements::Cursor)
+            .collect::<Vec<_>>();
+
+        let mut shadowed = Vec::new();
+        let mut shadows = Vec::new();
+        for workspace in state.overview_workspaces(output) {
+            let card = workspace.card.to_f64().to_physical(scale).to_i32_round();
+            // Windows may scroll out past their card's sides, exactly as they do
+            // on the real desktop; the band stops them bleeding into the card
+            // above or below.
+            let band = Rectangle::new(
+                (0, card.loc.y).into(),
+                (
+                    ((f64::from(output_size.w) * scale.x).round() as i32).max(1),
+                    card.size.h,
+                )
+                    .into(),
+            );
+
+            if let Some(selected) = workspace.windows.iter().find(|preview| preview.selected) {
+                let ring = self.overview_ring(
+                    overview_screen_rect(selected.geometry, workspace.card, workspace.zoom),
+                    workspace.zoom,
+                );
+                elements.extend(ring.map(PawRenderElements::Shader));
+            }
+
+            for preview in &workspace.windows {
+                // A window's surface can reach past its geometry - client-side
+                // shadows do exactly that - so it renders from the bounding box
+                // origin, the same correction `Space` makes when it maps one.
+                let origin = preview.geometry.loc - preview.window.geometry().loc;
+                elements.extend(
+                    zoomed(
+                        AsRenderElements::<GlesRenderer>::render_elements::<
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(
+                            &preview.window,
+                            renderer,
+                            origin.to_physical_precise_round(scale),
+                            scale,
+                            1.0,
+                        ),
+                        workspace.zoom,
+                        card.loc,
+                        band,
+                        scale,
+                    )
+                    .map(PawRenderElements::Constrained),
+                );
+            }
+
+            for (location, surface) in &below {
+                elements.extend(
+                    zoomed(
+                        AsRenderElements::<GlesRenderer>::render_elements::<
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(
+                            surface,
+                            renderer,
+                            location.to_physical_precise_round(scale),
+                            scale,
+                            1.0,
+                        ),
+                        workspace.zoom,
+                        card.loc,
+                        card,
+                        scale,
+                    )
+                    .map(PawRenderElements::Constrained),
+                );
+            }
+
+            elements.push(PawRenderElements::Solid(SolidColorRenderElement::new(
+                self.overview_cards[workspace.workspace].clone(),
+                card,
+                CommitCounter::default(),
+                OVERVIEW_CARD,
+                Kind::Unspecified,
+            )));
+            // Collected rather than pushed: a shadow reaches past its own card,
+            // and drawing them all last keeps one card's shadow from landing on
+            // top of the next card's wallpaper.
+            shadows.extend(
+                self.overview_shadow(workspace.workspace, workspace.card)
+                    .map(PawRenderElements::Shader),
+            );
+            shadowed.push(workspace.workspace);
+        }
+        // ponytail: linear lookup, bounded by the workspaces one output shows.
+        for (workspace, shadow) in self.overview_shadows.iter_mut().enumerate() {
+            if !shadowed.contains(&workspace) {
+                *shadow = None;
+            }
+        }
+        elements.append(&mut shadows);
+        Ok(elements)
+    }
+
+    /// The ring around the selected preview. Unlike the desktop's focus ring
+    /// this keeps a fixed width and ignores `focus_ring_width` entirely: in the
+    /// overview the ring is the cursor, not decoration, and a ring scaled down
+    /// with the card comes out a single pixel wide and disappears.
+    fn overview_ring(
+        &mut self,
+        window: Rectangle<i32, Logical>,
+        zoom: f64,
+    ) -> Option<PixelShaderElement> {
+        let appearance = self.appearance;
+        let program = self.ring_program.clone()?;
+        let width = OVERVIEW_RING_WIDTH;
+        let radius = (f64::from(appearance.corner_radius) * zoom).round() as i32;
+        let area = ring_area(window, width);
+        let uniforms = || {
+            vec![
+                Uniform::new("corner_radius", radius as f32),
+                Uniform::new("ring_width", width as f32),
+                Uniform::new("ring_color", appearance.focus_ring_color),
+            ]
+        };
+        let ring = match &mut self.overview_ring {
+            Some((cached, ring)) if *cached == (width, radius) => ring,
+            slot => {
+                let ring = PixelShaderElement::new(
+                    program,
+                    area,
+                    None,
+                    1.0,
+                    uniforms(),
+                    Kind::Unspecified,
+                );
+                &mut slot.insert(((width, radius), ring)).1
+            }
+        };
+        ring.resize(area, None);
+        Some(ring.clone())
+    }
+
+    /// The shadow that lifts one workspace card off the backdrop. Its spread is
+    /// a fraction of the card, so it shrinks with the card during the animation
+    /// instead of staying window-sized and swamping it.
+    fn overview_shadow(
+        &mut self,
+        workspace: usize,
+        card: Rectangle<i32, Logical>,
+    ) -> Option<PixelShaderElement> {
+        let program = self.shadow_program.clone()?;
+        let spread = ((f64::from(card.size.h) * OVERVIEW_SHADOW_SPREAD).round() as i32).max(1);
+        let offset = (f64::from(card.size.h) * OVERVIEW_SHADOW_OFFSET).round() as i32;
+        let area = Rectangle::new(
+            (card.loc.x - spread, card.loc.y - spread + offset).into(),
+            card.size + (spread * 2, spread * 2).into(),
+        );
+        let shadow = match &mut self.overview_shadows[workspace] {
+            Some((cached, shadow)) if *cached == card.size.h => shadow,
+            slot => {
+                let shadow = PixelShaderElement::new(
+                    program,
+                    area,
+                    None,
+                    1.0,
+                    vec![
+                        Uniform::new("corner_radius", 0.0f32),
+                        Uniform::new("spread", spread as f32),
+                        Uniform::new("shadow_color", OVERVIEW_SHADOW_COLOR),
+                        Uniform::new("window_offset", [0.0f32, offset as f32]),
+                    ],
+                    Kind::Unspecified,
+                );
+                &mut slot.insert((card.size.h, shadow)).1
+            }
+        };
+        shadow.resize(area, None);
+        Some(shadow.clone())
     }
 
     /// Wraps a window in the corner/opacity shader. Anything that is not a

@@ -79,7 +79,6 @@ pub fn init(
                 let frame_target = state.clock.now() + frame_duration;
                 state.pre_repaint(&output, frame_target);
                 let damage = Rectangle::from_size(backend.window_size());
-                let fullscreen = state.fullscreen_window(&output).is_some();
                 // Skip the frame rather than the session. The DRM path already
                 // warns and returns on a failed frame; this one used to panic,
                 // which turns one bad frame into a lost nested session.
@@ -100,7 +99,7 @@ pub fn init(
                             &mut framebuffer,
                             0,
                             &elements,
-                            clear_color(fullscreen),
+                            clear_color(state, &output),
                         )
                         .map_err(|error| tracing::warn!(?error, "failed to render frame"))
                         .ok()?;

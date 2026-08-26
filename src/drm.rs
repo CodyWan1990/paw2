@@ -930,7 +930,7 @@ impl DirectBackend {
         }
         let output = self.outputs[index].output.clone();
         self.capture_output(state, &output);
-        let fullscreen = state.fullscreen_window(&output).is_some();
+        let fullscreen = state.renders_fullscreen(&output);
         update_vrr(&mut self.outputs[index], fullscreen);
         let frame_target = state.clock.now() + frame_duration(&output);
         state.pre_repaint(&output, frame_target);
@@ -958,7 +958,7 @@ impl DirectBackend {
         match active.kms.render_frame(
             &mut self.renderer,
             &elements,
-            clear_color(fullscreen),
+            clear_color(state, &output),
             frame_flags(fullscreen, direct_scanout),
         ) {
             Ok(frame) if !frame.is_empty => {
@@ -1111,7 +1111,7 @@ impl DirectBackend {
                 let elements = self
                     .effects
                     .output_elements(&mut self.renderer, state, &output)?;
-                let clear = clear_color(state.fullscreen_window(&output).is_some());
+                let clear = clear_color(state, &output);
                 (output, scale, crop, elements, clear)
             }
             CaptureTarget::Window(target) => {

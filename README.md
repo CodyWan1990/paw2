@@ -21,6 +21,7 @@ of it, and Paw2 neither needs nor waits for it.
 - Automatic per-monitor VRR for fullscreen games
 - Live per-monitor fractional scaling
 - Nine independent workspaces per monitor with Waybar integration
+- Per-monitor workspace overview with live window previews
 - Configurable gaps and focused-window ring
 - Client-controlled transparency and background blur protocols
 - Wayland wallpaper clients through WLR layer shell
@@ -110,6 +111,10 @@ focus_ring_width = 1
 focus_ring_color = "#0b3d91"
 blur_radius = 8
 
+[overview]
+zoom = 0.5
+backdrop_color = "#1c1c1c"
+
 [input]
 focus_follows_mouse = false
 middle_click_paste = true
@@ -175,6 +180,7 @@ increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
 toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
+toggle_overview = ["Super+o"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
 focus_monitor_up = []
@@ -212,6 +218,20 @@ can be selected and their cycling order; it must contain at least one unique
 layout. A direct binding for a disabled layout does nothing. Dwindle alternates
 horizontal and vertical splits, master-stack uses `column_width` for its master
 area, and monocle fills the usable area with the focused tiled window on top.
+`toggle_overview` zooms the desktop out into a vertical strip of workspace
+cards, each one a live shrunken copy of the output - its wallpaper, its
+windows, its real layout - with the selected card centred and the backdrop
+showing around them. Only workspaces holding windows appear, plus the one you
+are on. Columns that scroll off the side of a workspace stay visible past the
+edge of its card, so a long strip reads at a glance. `Up`/`Down` or `k`/`j`
+select workspaces, while `Left`/`Right` or `h`/`l` select columns and
+`Tab`/`Shift+Tab` select stacked windows. These controls work with or without
+`Super` held.
+`Ctrl+Left`/`Right` or `Ctrl+h`/`l` select another monitor. `Enter` activates
+the selected workspace and focuses its selected window; `Escape` closes without
+switching. Existing configured bindings still work, the mouse wheel moves the
+selection without closing, and clicking a window preview focuses that window
+and closes the overview.
 The default scrolling layout keeps horizontal columns with vertical stacks.
 `column_width` is the default fraction of each output used by new columns.
 `preset_column_widths` controls the sizes cycled on the focused column; all
@@ -243,7 +263,9 @@ and swap stay within each side vertically, and cross to the nearest window on
 the other side horizontally. Dwindle focus and swap prefer the nearest aligned
 window in the pressed direction, falling back to diagonal tiles. Monocle
 traverses tiled-window order.
-Appearance sizes are logical
+Overview `zoom` is how far the workspaces shrink when it opens, between `0.2`
+and `0.75`; `backdrop_color` is what shows behind the cards, where the desktop
+no longer reaches. Appearance sizes are logical
 pixels; set the ring width or blur radius to `0` to disable that feature. Transparency and blur are
 applied automatically to normal window areas that clients do not declare
 opaque. The smooth multi-pass effect is clipped to the XDG window geometry;
