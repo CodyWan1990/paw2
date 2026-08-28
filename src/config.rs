@@ -127,6 +127,16 @@ commands = [
   # ["waybar"],
 ]
 
+# Named application scratchpads launch on first use. `app_id` matches a
+# Wayland app_id or X11 WM_CLASS exactly.
+#[scratchpads.terminal]
+#command = ["kitty", "--class", "paw2-terminal"]
+#app_id = "paw2-terminal"
+#edge = "top"
+#size = [75, 60]
+#position = [12.5, 5]
+#margin = 24
+
 [bindings]
 focus_left = ["Super+h", "Super+Left"]
 focus_right = ["Super+l", "Super+Right"]
@@ -152,6 +162,7 @@ toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 toggle_overview = ["Super+o"]
+toggle_scratchpad_overview = ["Super+Shift+o"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
 focus_monitor_up = []
@@ -166,6 +177,9 @@ quit = ["Super+Shift+Escape"]
 "Super+Return" = ["kitty", "--single-instance"]
 # "Super+d" = ["fuzzel"]
 # "Super+b" = ["firefox", "--new-window"]
+
+[bindings.scratchpads]
+# "Super+grave" = "terminal"
 
 [bindings.workspace]
 switch = [
@@ -207,6 +221,8 @@ pub enum Action {
     CloseWindow,
     ToggleFullscreen,
     ToggleOverview,
+    ToggleScratchpad(usize),
+    ToggleScratchpadOverview,
     FocusMonitorLeft,
     FocusMonitorRight,
     FocusMonitorUp,
@@ -233,6 +249,27 @@ pub enum LayoutMode {
     Dwindle,
     MasterStack,
     Monocle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScratchpadEdge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScratchpadConfig {
+    pub name: String,
+    pub command: Vec<String>,
+    pub app_id: String,
+    pub edge: ScratchpadEdge,
+    pub size: [f64; 2],
+    pub position: Option<[f64; 2]>,
+    pub margin: i32,
 }
 
 impl LayoutMode {
@@ -376,6 +413,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub monitors: Vec<MonitorConfig>,
     pub autostart: Vec<Vec<String>>,
+    pub scratchpads: Vec<ScratchpadConfig>,
     pub binding_commands: Vec<Vec<String>>,
     bindings: Vec<(Binding, Action)>,
 }
@@ -483,6 +521,7 @@ impl Config {
         self.theme.gtk_theme = updated.theme.gtk_theme;
         apply_live_monitor_fields(&mut self.monitors, &updated.monitors);
         self.binding_commands = updated.binding_commands;
+        self.scratchpads = updated.scratchpads;
         self.bindings = updated.bindings;
         restart_required
     }
@@ -861,7 +900,33 @@ struct RawConfig {
     animations: RawAnimations,
     #[serde(default)]
     overview: RawOverview,
+    #[serde(default)]
+    scratchpads: BTreeMap<String, RawScratchpad>,
     bindings: RawBindings,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawScratchpad {
+    command: Vec<String>,
+    app_id: String,
+    edge: ScratchpadEdge,
+    size: [f64; 2],
+    position: Option<[f64; 2]>,
+    margin: u16,
+}
+
+impl Default for RawScratchpad {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            app_id: String::new(),
+            edge: ScratchpadEdge::Top,
+            size: [75.0, 60.0],
+            position: None,
+            margin: 24,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -943,6 +1008,7 @@ struct RawBindings {
     #[serde(flatten)]
     actions: BTreeMap<String, Vec<String>>,
     commands: BTreeMap<String, Vec<String>>,
+    scratchpads: BTreeMap<String, String>,
     workspace: RawWorkspaceBindings,
 }
 
@@ -975,6 +1041,7 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
     ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
     ("toggle_overview",        Action::ToggleOverview,       "Super+o"),
+    ("toggle_scratchpad_overview", Action::ToggleScratchpadOverview, "Super+Shift+o"),
     ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
     ("focus_monitor_right",    Action::FocusMonitorRight,    "Super+period"),
     ("focus_monitor_up",       Action::FocusMonitorUp,       ""),
@@ -1352,9 +1419,66 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         });
     }
 
+    let mut scratchpads = Vec::new();
+    for (name, scratchpad) in raw.scratchpads {
+        if name.trim().is_empty() {
+            return Err("scratchpad names cannot be empty".into());
+        }
+        if scratchpad.command.is_empty() || scratchpad.command[0].trim().is_empty() {
+            return Err(format!(
+                "scratchpads.{name}.command must contain an executable"
+            ));
+        }
+        if scratchpad.app_id.trim().is_empty() {
+            return Err(format!("scratchpads.{name}.app_id cannot be empty"));
+        }
+        if scratchpads
+            .iter()
+            .any(|item: &ScratchpadConfig| item.app_id == scratchpad.app_id)
+        {
+            return Err(format!(
+                "scratchpad app_id `{}` is configured more than once",
+                scratchpad.app_id
+            ));
+        }
+        if scratchpad
+            .size
+            .iter()
+            .any(|value| !value.is_finite() || !(1.0..=100.0).contains(value))
+        {
+            return Err(format!(
+                "scratchpads.{name}.size values must be between 1 and 100"
+            ));
+        }
+        if let Some(position) = scratchpad.position
+            && (position
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=100.0).contains(value))
+                || position[0] + scratchpad.size[0] > 100.0
+                || position[1] + scratchpad.size[1] > 100.0)
+        {
+            return Err(format!(
+                "scratchpads.{name}.position and size must fit within 100 percent"
+            ));
+        }
+        if scratchpad.margin > 256 {
+            return Err(format!("scratchpads.{name}.margin must be at most 256"));
+        }
+        scratchpads.push(ScratchpadConfig {
+            name,
+            command: scratchpad.command,
+            app_id: scratchpad.app_id,
+            edge: scratchpad.edge,
+            size: scratchpad.size,
+            position: scratchpad.position,
+            margin: scratchpad.margin.into(),
+        });
+    }
+
     let mut bindings = Vec::new();
     let workspace = raw.bindings.workspace;
     let command_bindings = raw.bindings.commands;
+    let scratchpad_bindings = raw.bindings.scratchpads;
     if workspace.switch.len() != 9 || workspace.r#move.len() != 9 {
         return Err("bindings.workspace switch and move must each contain exactly 9 lists".into());
     }
@@ -1417,6 +1541,17 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         add_binding(&mut bindings, &value, action)?;
         binding_commands.push(command);
     }
+    for (value, name) in scratchpad_bindings {
+        let Some(index) = scratchpads
+            .iter()
+            .position(|scratchpad| scratchpad.name == name)
+        else {
+            return Err(format!(
+                "bindings.scratchpads.{value} names unknown scratchpad `{name}`"
+            ));
+        };
+        add_binding(&mut bindings, &value, Action::ToggleScratchpad(index))?;
+    }
 
     Ok(Config {
         layout: raw.layout,
@@ -1450,6 +1585,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         security: raw.security,
         monitors,
         autostart: raw.autostart.commands,
+        scratchpads,
         binding_commands,
         bindings,
     })
@@ -1568,7 +1704,7 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 63);
+        assert_eq!(config.bindings.len(), 64);
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -2016,7 +2152,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 63);
+        assert_eq!(legacy.bindings.len(), 64);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -2049,7 +2185,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 50);
+        assert_eq!(config.bindings.len(), 51);
 
         let old_monitor_bindings = DEFAULT_CONFIG
             .replace(
@@ -2553,5 +2689,34 @@ swap_right = ["Super+Shift+l"]
         .unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.monitors[0].vrr, VrrPolicy::Automatic);
+    }
+
+    #[test]
+    fn parses_and_validates_scratchpads() {
+        let source = format!(
+            "{}\n[scratchpads.term]\ncommand = [\"kitty\", \"--class\", \"paw-term\"]\napp_id = \"paw-term\"\nedge = \"bottom\"\nsize = [70, 55]\nposition = [15, 20]\nmargin = 12\n",
+            DEFAULT_CONFIG.replace(
+                "# \"Super+grave\" = \"terminal\"",
+                "\"Super+grave\" = \"term\""
+            )
+        );
+        let config = parse(&source).unwrap();
+        assert_eq!(config.scratchpads.len(), 1);
+        assert_eq!(config.scratchpads[0].edge, ScratchpadEdge::Bottom);
+        assert_eq!(config.scratchpads[0].size, [70.0, 55.0]);
+        assert_eq!(config.scratchpads[0].position, Some([15.0, 20.0]));
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    logo: true,
+                    ..Default::default()
+                },
+                xkb::keysym_from_name("grave", xkb::KEYSYM_CASE_INSENSITIVE),
+            ),
+            Some(Action::ToggleScratchpad(0))
+        );
+
+        let invalid = source.replace("size = [70, 55]", "size = [101, 55]");
+        assert!(parse(&invalid).unwrap_err().contains("between 1 and 100"));
     }
 }

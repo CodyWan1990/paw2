@@ -22,6 +22,7 @@ of it, and Paw2 neither needs nor waits for it.
 - Live per-monitor fractional scaling
 - Nine independent workspaces per monitor with Waybar integration
 - Per-monitor workspace overview with live window previews
+- Named Wayland and XWayland application scratchpads with live previews
 - Configurable gaps and focused-window ring
 - Client-controlled transparency and background blur protocols
 - Wayland wallpaper clients through WLR layer shell
@@ -156,6 +157,13 @@ commands = [
   ["waybar"],
 ]
 
+[scratchpads.terminal]
+command = ["kitty", "--class", "paw2-terminal"]
+app_id = "paw2-terminal"
+edge = "top"
+size = [75, 60]
+margin = 24
+
 [bindings]
 focus_left = ["Super+h", "Super+Left"]
 focus_right = ["Super+l", "Super+Right"]
@@ -181,6 +189,7 @@ toggle_floating = ["Super+Shift+space"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 toggle_overview = ["Super+o"]
+toggle_scratchpad_overview = ["Super+Shift+o"]
 focus_monitor_left = ["Super+comma"]
 focus_monitor_right = ["Super+period"]
 focus_monitor_up = []
@@ -195,6 +204,9 @@ quit = ["Super+Shift+Escape"]
 "Super+Return" = ["kitty", "--single-instance"]
 "Super+d" = ["fuzzel"]
 "Super+b" = ["firefox", "--new-window"]
+
+[bindings.scratchpads]
+"Super+grave" = "terminal"
 
 [bindings.workspace]
 switch = [
@@ -212,6 +224,21 @@ next = ["Super+Page_Down"]
 move_previous = ["Super+Shift+Page_Up"]
 move_next = ["Super+Shift+Page_Down"]
 ```
+
+Each `[scratchpads.NAME]` entry describes one application window. `command` is
+an argv array launched on first use, while `app_id` exactly matches either a
+native Wayland app ID or an X11 `WM_CLASS`. `edge` accepts `top`, `bottom`,
+`left`, or `right`; `size` is a percentage pair. An optional `position = [x,
+y]` sets the top-left corner in percentages, otherwise Paw2 centres the window
+against its configured edge using `margin` logical pixels.
+
+Scratchpads stay running while hidden. `Super+left-drag` moves them and resizes
+from an edge, and Paw2 remembers separate geometry for each monitor in
+`$XDG_STATE_HOME/paw2/scratchpads.json` (normally
+`~/.local/state/paw2/scratchpads.json`). The scratchpad overview shows live
+previews of every scratchpad used during the current session; use the arrow or
+Vim keys, Enter, Escape, or the mouse. A shell can reset saved placement by
+sending `{"cmd":"reset-scratchpad","name":"terminal"}` to `$PAW2_SOCKET`.
 
 Each workspace remembers its layout. `enabled_layouts` controls which layouts
 can be selected and their cycling order; it must contain at least one unique

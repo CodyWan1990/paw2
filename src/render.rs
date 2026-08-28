@@ -335,7 +335,7 @@ fn zoomed(
 pub fn clear_color(state: &Paw2, output: &Output) -> [f32; 4] {
     if state.renders_fullscreen(output) {
         [0.0, 0.0, 0.0, 1.0]
-    } else if state.overview_visible() {
+    } else if state.overview_visible() || state.scratchpad_overview_visible_on(output) {
         state.config.overview.backdrop_color
     } else {
         [0.04, 0.04, 0.05, 1.0]
@@ -447,13 +447,18 @@ impl Effects {
             }
         }
         state.advance_animations();
+        if state.scratchpad_overview_visible_on(output) {
+            return self.scratchpad_overview_elements(renderer, state, output);
+        }
         // Gated on visibility, not on input ownership: the closing animation
         // still has to be drawn after the overview has given focus back.
         if state.overview_visible() {
             return self.overview_elements(renderer, state, output);
         }
         let scale = Scale::from(output.current_scale().fractional_scale());
-        if let Some(window) = state.fullscreen_window(output).cloned() {
+        if state.renders_fullscreen(output)
+            && let Some(window) = state.fullscreen_window(output).cloned()
+        {
             // A suspended output is unmapped from its space but still owns the
             // fullscreen window, so its geometry can be gone.
             let Some(output_size) = state.output_geometry(output).map(|geometry| geometry.size)
@@ -551,6 +556,41 @@ impl Effects {
         // ponytail: linear lookup, bounded by the windows on one workspace.
         self.shadows
             .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
+        Ok(elements)
+    }
+
+    fn scratchpad_overview_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        state: &Paw2,
+        output: &Output,
+    ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let mut elements = Vec::new();
+        for preview in state.scratchpad_previews(output) {
+            if preview.selected {
+                elements.extend(
+                    self.overview_ring(preview.card, 1.0)
+                        .map(PawRenderElements::Shader),
+                );
+            }
+            elements.extend(
+                constrain_space_element::<_, _, ConstrainedWindowElement, _, _>(
+                    renderer,
+                    &preview.window,
+                    preview.card.loc,
+                    1.0,
+                    scale,
+                    preview.card,
+                    ConstrainBehavior {
+                        reference: ConstrainReference::BoundingBox,
+                        behavior: ConstrainScaleBehavior::Fit,
+                        align: ConstrainAlign::CENTER,
+                    },
+                )
+                .map(PawRenderElements::Constrained),
+            );
+        }
         Ok(elements)
     }
 

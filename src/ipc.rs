@@ -42,6 +42,15 @@ pub struct WindowState {
     pub focused: bool,
 }
 
+#[derive(Serialize, PartialEq)]
+pub struct ScratchpadState {
+    pub name: String,
+    pub app_id: String,
+    pub loaded: bool,
+    pub visible: bool,
+    pub output: Option<String>,
+}
+
 /// One entry in a monitor's mode list.
 #[derive(Serialize, PartialEq)]
 pub struct ModeState {
@@ -75,6 +84,7 @@ struct Snapshot<'a> {
     kind: &'static str,
     outputs: &'a [OutputState],
     windows: &'a [WindowState],
+    scratchpads: &'a [ScratchpadState],
     /// The layouts `cycle_layout` steps through, in order.
     layouts: &'a [String],
 }
@@ -333,6 +343,27 @@ fn run(state: &mut Paw2, line: &str) {
                 None => state.run_action(Action::CycleLayout),
             }
         }
+        Some("toggle-scratchpad") => {
+            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
+                state.toggle_scratchpad_by_name(name);
+            }
+        }
+        Some("show-scratchpad") => {
+            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
+                state.show_scratchpad_by_name(name);
+            }
+        }
+        Some("hide-scratchpad") => {
+            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
+                state.hide_scratchpad(name);
+            }
+        }
+        Some("reset-scratchpad") => {
+            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
+                state.reset_scratchpad(name);
+            }
+        }
+        Some("toggle-scratchpad-overview") => state.toggle_scratchpad_overview(),
         Some("quit") => state.run_action(Action::Quit),
         // No set-config: settings are changed by writing config.d/, which the
         // config watcher picks up within half a second.
@@ -357,6 +388,7 @@ pub fn flush(state: &mut Paw2) {
     state.ipc.config_dirty = false;
 
     let (outputs, windows) = state.scroller.ipc_state();
+    let scratchpads = state.scratchpad_ipc_state();
     let layouts = state
         .config
         .layout
@@ -368,6 +400,7 @@ pub fn flush(state: &mut Paw2) {
         kind: "snapshot",
         outputs: &outputs,
         windows: &windows,
+        scratchpads: &scratchpads,
         layouts: &layouts,
     });
     let config = serialize(&ConfigMessage {

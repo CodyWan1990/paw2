@@ -28,6 +28,39 @@ const BTN_LEFT: u32 = 0x110;
 enum KeyAction {
     Compositor(Action),
     Overview(OverviewKey),
+    ScratchpadOverview(ScratchpadOverviewKey),
+}
+
+enum ScratchpadOverviewKey {
+    Move { horizontal: bool, delta: i32 },
+    Confirm,
+    Cancel,
+}
+
+fn scratchpad_overview_key(keysym: Keysym) -> Option<ScratchpadOverviewKey> {
+    match keysym.raw() {
+        keysyms::KEY_Left | keysyms::KEY_h => Some(ScratchpadOverviewKey::Move {
+            horizontal: true,
+            delta: -1,
+        }),
+        keysyms::KEY_Right | keysyms::KEY_l | keysyms::KEY_Tab => {
+            Some(ScratchpadOverviewKey::Move {
+                horizontal: true,
+                delta: 1,
+            })
+        }
+        keysyms::KEY_Up | keysyms::KEY_k => Some(ScratchpadOverviewKey::Move {
+            horizontal: false,
+            delta: -1,
+        }),
+        keysyms::KEY_Down | keysyms::KEY_j => Some(ScratchpadOverviewKey::Move {
+            horizontal: false,
+            delta: 1,
+        }),
+        keysyms::KEY_Return | keysyms::KEY_KP_Enter => Some(ScratchpadOverviewKey::Confirm),
+        keysyms::KEY_Escape => Some(ScratchpadOverviewKey::Cancel),
+        _ => None,
+    }
 }
 
 enum OverviewKey {
@@ -252,7 +285,10 @@ impl Paw2 {
 
                         if key_state == KeyState::Pressed {
                             let overview = state.overview_active();
-                            let action = if overview {
+                            let scratchpad_overview = state.scratchpad_overview_active();
+                            let action = if scratchpad_overview {
+                                scratchpad_overview_key(keysym).map(KeyAction::ScratchpadOverview)
+                            } else if overview {
                                 overview_key(modifiers, keysym)
                                     .map(KeyAction::Overview)
                                     .or_else(|| {
@@ -267,7 +303,7 @@ impl Paw2 {
                                     .action(modifiers, keysym)
                                     .map(KeyAction::Compositor)
                             };
-                            if overview || action.is_some() {
+                            if overview || scratchpad_overview || action.is_some() {
                                 if !state.suppressed_keys.contains(&keysym) {
                                     state.suppressed_keys.push(keysym);
                                 }
@@ -305,6 +341,16 @@ impl Paw2 {
                         }
                         KeyAction::Overview(OverviewKey::Confirm) => self.confirm_overview(),
                         KeyAction::Overview(OverviewKey::Cancel) => self.close_overview(),
+                        KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Move {
+                            horizontal,
+                            delta,
+                        }) => self.move_scratchpad_overview(horizontal, delta),
+                        KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Confirm) => {
+                            self.confirm_scratchpad_overview()
+                        }
+                        KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Cancel) => {
+                            self.close_scratchpad_overview()
+                        }
                     }
                 }
             }
@@ -315,7 +361,7 @@ impl Paw2 {
                 }
                 let current = self.seat.get_pointer().unwrap().current_location();
                 let pointer = self.seat.get_pointer().unwrap();
-                if self.overview_active() {
+                if self.overview_active() || self.scratchpad_overview_active() {
                     let location = constrain_pointer(current + event.delta(), &geometries);
                     pointer.relative_motion(
                         self,
@@ -422,7 +468,7 @@ impl Paw2 {
                 };
                 let location = event.position_transformed(geometry.size) + geometry.loc.to_f64();
                 let pointer = self.seat.get_pointer().unwrap();
-                if self.overview_active() {
+                if self.overview_active() || self.scratchpad_overview_active() {
                     pointer.motion(
                         self,
                         None,
@@ -462,6 +508,16 @@ impl Paw2 {
                 let pointer = self.seat.get_pointer().unwrap();
                 let serial = SERIAL_COUNTER.next_serial();
                 let location = pointer.current_location();
+
+                if self.scratchpad_overview_active() {
+                    if event.state() == ButtonState::Pressed
+                        && event.button_code() == BTN_LEFT
+                        && let Some(index) = self.scratchpad_overview_hit(location)
+                    {
+                        self.select_scratchpad_overview(index);
+                    }
+                    return;
+                }
 
                 if self.overview_active() {
                     if event.state() == ButtonState::Pressed
@@ -542,12 +598,16 @@ impl Paw2 {
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
-                if self.overview_active() {
+                if self.overview_active() || self.scratchpad_overview_active() {
                     let amount = event.amount_v120(Axis::Vertical).unwrap_or_default();
                     if source == AxisSource::Wheel && amount != 0.0 {
                         let delta = if amount < 0.0 { -1 } else { 1 };
-                        let location = self.seat.get_pointer().unwrap().current_location();
-                        self.scroll_overview_at(location, delta);
+                        if self.scratchpad_overview_active() {
+                            self.move_scratchpad_overview(true, delta);
+                        } else {
+                            let location = self.seat.get_pointer().unwrap().current_location();
+                            self.scroll_overview_at(location, delta);
+                        }
                     }
                     return;
                 }

@@ -143,6 +143,7 @@ impl XwmHandler for Paw2 {
             && let Some(window) = self.window_for_x11_surface(&window).cloned()
         {
             self.capture_window_metadata_changed(&window);
+            self.refresh_scratchpad_membership(&window);
         }
         if matches!(
             property,

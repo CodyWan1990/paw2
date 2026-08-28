@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
     let mut state = Paw2::new(&mut event_loop, display, config, cursor_defaults);
+    state.initialize_scratchpads();
     state
         .ipc
         .publish_config(config_watcher.document(), config_error);
@@ -83,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     apply_gsettings_updates(desktop_theme_changes);
                     let restart_required = state.config.apply_runtime(config);
+                    state.reconcile_scratchpads();
                     state.relayout(true);
                     drm::redraw(state);
                     state.ipc.publish_config(

@@ -1,4 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, env, fs, path::PathBuf, time::Duration};
+
+use serde::{Deserialize, Serialize};
 
 use smithay::{
     backend::renderer::element::{Id, RenderElementStates, default_primary_scanout_output_compare},
@@ -29,7 +31,7 @@ use smithay::{
 };
 
 use crate::{
-    config::{Action, Config, LayoutMode},
+    config::{Action, Config, LayoutMode, ScratchpadConfig, ScratchpadEdge},
     state::Paw2,
 };
 
@@ -65,6 +67,35 @@ struct OverviewSelection {
     /// pixels. It starts at the workspace's own offset and then follows the
     /// selection, so a column that scrolled off the card can still be reached.
     pan: i32,
+}
+
+#[derive(Clone)]
+struct ScratchpadOverviewSelection {
+    names: Vec<String>,
+    selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SavedScratchpadGeometry {
+    location: [i32; 2],
+    size: [i32; 2],
+}
+
+#[derive(Default)]
+struct ScratchpadRuntime {
+    window: Option<Window>,
+    visible: bool,
+    hiding: bool,
+    show_on_map: bool,
+    output: Option<String>,
+    previous_focus: Option<usize>,
+    launching: Option<Duration>,
+}
+
+pub(crate) struct ScratchpadPreview {
+    pub window: Window,
+    pub card: Rectangle<i32, Logical>,
+    pub selected: bool,
 }
 
 /// A window as the overview shows it. `geometry` is where the window really
@@ -124,6 +155,16 @@ pub(crate) enum FloatingEdge {
 }
 
 pub(crate) enum MouseOperation {
+    MoveScratchpad {
+        name: String,
+        initial_location: Point<i32, Logical>,
+    },
+    ResizeScratchpad {
+        name: String,
+        initial_geometry: Rectangle<i32, Logical>,
+        x: Option<FloatingEdge>,
+        y: Option<FloatingEdge>,
+    },
     MoveTiled {
         window: Window,
         origin_output: String,
@@ -1094,10 +1135,16 @@ pub struct Scrollers {
     /// The selected workspace's preview offset, so moving along the columns
     /// slides the card rather than jumping it.
     overview_pan: Tween,
+    scratchpad_overview: Option<ScratchpadOverviewSelection>,
     parked: [Workspace; WORKSPACE_COUNT],
     animations: HashMap<usize, WindowAnimation>,
     manual_floating: HashMap<usize, ManualFloating>,
     drag_preview: Option<usize>,
+    scratchpads: HashMap<String, ScratchpadRuntime>,
+    scratchpad_geometry: HashMap<String, HashMap<String, SavedScratchpadGeometry>>,
+    scratchpad_state_path: Option<PathBuf>,
+    scratchpad_order: Vec<String>,
+    focused_scratchpad: Option<String>,
 }
 
 /// A window gliding to a new position, and fading in if it was just mapped.
@@ -1236,6 +1283,72 @@ fn start_motion(
     current
 }
 
+fn scratchpad_state_path() -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .map(|root| root.join("paw2/scratchpads.json"))
+}
+
+fn configured_scratchpad_rectangle(
+    config: &ScratchpadConfig,
+    area: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let size: Size<i32, Logical> = (
+        ((f64::from(area.size.w) * config.size[0] / 100.0)
+            .round()
+            .max(f64::from(MIN_ROW_HEIGHT)) as i32)
+            .min(area.size.w.max(1)),
+        ((f64::from(area.size.h) * config.size[1] / 100.0)
+            .round()
+            .max(f64::from(MIN_ROW_HEIGHT)) as i32)
+            .min(area.size.h.max(1)),
+    )
+        .into();
+    let location = if let Some([x, y]) = config.position {
+        (
+            area.loc.x + (f64::from(area.size.w) * x / 100.0).round() as i32,
+            area.loc.y + (f64::from(area.size.h) * y / 100.0).round() as i32,
+        )
+            .into()
+    } else {
+        match config.edge {
+            ScratchpadEdge::Top => (
+                area.loc.x + (area.size.w - size.w) / 2,
+                area.loc.y + config.margin,
+            ),
+            ScratchpadEdge::Bottom => (
+                area.loc.x + (area.size.w - size.w) / 2,
+                area.loc.y + area.size.h - size.h - config.margin,
+            ),
+            ScratchpadEdge::Left => (
+                area.loc.x + config.margin,
+                area.loc.y + (area.size.h - size.h) / 2,
+            ),
+            ScratchpadEdge::Right => (
+                area.loc.x + area.size.w - size.w - config.margin,
+                area.loc.y + (area.size.h - size.h) / 2,
+            ),
+        }
+        .into()
+    };
+    Rectangle::new(constrain_window(area, size, location), size)
+}
+
+fn hidden_scratchpad_location(
+    edge: ScratchpadEdge,
+    area: Rectangle<i32, Logical>,
+    rectangle: Rectangle<i32, Logical>,
+) -> Point<i32, Logical> {
+    match edge {
+        ScratchpadEdge::Top => (rectangle.loc.x, area.loc.y - rectangle.size.h),
+        ScratchpadEdge::Bottom => (rectangle.loc.x, area.loc.y + area.size.h),
+        ScratchpadEdge::Left => (area.loc.x - rectangle.size.w, rectangle.loc.y),
+        ScratchpadEdge::Right => (area.loc.x + area.size.w, rectangle.loc.y),
+    }
+    .into()
+}
+
 impl Scrollers {
     /// Lookup by output identity rather than by name. `Output: PartialEq` is an
     /// `Arc::ptr_eq`, so this costs nothing next to `Output::name`, which locks
@@ -1326,11 +1439,186 @@ impl Scrollers {
 }
 
 impl Paw2 {
+    pub fn initialize_scratchpads(&mut self) {
+        let path = scratchpad_state_path();
+        self.scroller.scratchpad_geometry = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| match serde_json::from_slice(&bytes) {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    tracing::warn!(?error, ?path, "could not read scratchpad state");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        self.scroller.scratchpad_state_path = path;
+    }
+
+    pub fn reconcile_scratchpads(&mut self) {
+        let removed = self
+            .scroller
+            .scratchpads
+            .keys()
+            .filter(|name| {
+                !self
+                    .config
+                    .scratchpads
+                    .iter()
+                    .any(|config| config.name == **name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut windows = Vec::new();
+        for name in removed {
+            if let Some(runtime) = self.scroller.scratchpads.remove(&name)
+                && let Some(window) = runtime.window
+            {
+                for monitor in &mut self.scroller.monitors {
+                    monitor.space.unmap_elem(&window);
+                }
+                windows.push(window);
+            }
+            self.scroller.scratchpad_order.retain(|item| item != &name);
+            if self.scroller.focused_scratchpad.as_deref() == Some(&name) {
+                self.scroller.focused_scratchpad = None;
+            }
+        }
+        if windows.is_empty() {
+            return;
+        }
+        if let Some(monitor) = self.scroller.focused_mut() {
+            for window in windows {
+                monitor.active_mut().add(window, true);
+            }
+        } else {
+            for window in windows {
+                self.scroller.parked[0].add(window, true);
+            }
+        }
+        self.relayout(true);
+        self.sync_focus();
+    }
+
+    fn save_scratchpad_geometry(&self) {
+        let Some(path) = &self.scroller.scratchpad_state_path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let result = (|| -> std::io::Result<()> {
+            fs::create_dir_all(parent)?;
+            let temporary = path.with_extension("json.tmp");
+            let bytes = serde_json::to_vec_pretty(&self.scroller.scratchpad_geometry)
+                .map_err(std::io::Error::other)?;
+            fs::write(&temporary, bytes)?;
+            fs::rename(temporary, path)
+        })();
+        if let Err(error) = result {
+            tracing::warn!(?error, ?path, "could not save scratchpad geometry");
+        }
+    }
+
+    fn scratchpad_rectangle(&self, name: &str, output: &str) -> Option<Rectangle<i32, Logical>> {
+        let config = self
+            .config
+            .scratchpads
+            .iter()
+            .find(|scratchpad| scratchpad.name == name)?;
+        let monitor = self.scroller.monitor(output)?;
+        let output_geometry = monitor.space.output_geometry(&monitor.output)?;
+        let area = work_area(
+            output_geometry,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let saved = self
+            .scroller
+            .scratchpad_geometry
+            .get(name)
+            .and_then(|outputs| outputs.get(output));
+        let rectangle = saved.map_or_else(
+            || configured_scratchpad_rectangle(config, area),
+            |saved| {
+                let size: Size<i32, Logical> = (
+                    saved.size[0].max(1).min(area.size.w.max(1)),
+                    saved.size[1].max(1).min(area.size.h.max(1)),
+                )
+                    .into();
+                let location = area.loc + Point::from((saved.location[0], saved.location[1]));
+                Rectangle::new(constrain_window(area, size, location), size)
+            },
+        );
+        Some(rectangle)
+    }
+
+    fn remember_scratchpad_geometry(&mut self, name: &str) {
+        let Some(runtime) = self.scroller.scratchpads.get(name) else {
+            return;
+        };
+        let (Some(window), Some(output)) = (&runtime.window, &runtime.output) else {
+            return;
+        };
+        let Some(monitor) = self.scroller.monitor(output) else {
+            return;
+        };
+        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output_geometry,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let Some(geometry) = monitor.space.element_geometry(window) else {
+            return;
+        };
+        self.scroller
+            .scratchpad_geometry
+            .entry(name.into())
+            .or_default()
+            .insert(
+                output.clone(),
+                SavedScratchpadGeometry {
+                    location: [geometry.loc.x - area.loc.x, geometry.loc.y - area.loc.y],
+                    size: [geometry.size.w, geometry.size.h],
+                },
+            );
+        self.save_scratchpad_geometry();
+    }
+
+    fn scratchpad_name_for_window(&self, window: &Window) -> Option<String> {
+        self.scroller
+            .scratchpads
+            .iter()
+            .find_map(|(name, runtime)| {
+                (runtime.window.as_ref() == Some(window)).then(|| name.clone())
+            })
+    }
+
     pub(crate) fn begin_mouse_operation(
         &mut self,
         window: Window,
         location: Point<f64, Logical>,
     ) -> Option<MouseOperation> {
+        if let Some(name) = self.scratchpad_name_for_window(&window) {
+            let runtime = self.scroller.scratchpads.get(&name)?;
+            let output = runtime.output.as_deref()?;
+            let monitor = self.scroller.monitor(output)?;
+            let geometry = monitor.space.element_geometry(&window)?;
+            let (x, y) = floating_resize_edges(location, geometry, 8);
+            if !window_is_fixed_size(&window) && (x.is_some() || y.is_some()) {
+                return Some(MouseOperation::ResizeScratchpad {
+                    name,
+                    initial_geometry: geometry,
+                    x,
+                    y,
+                });
+            }
+            return Some(MouseOperation::MoveScratchpad {
+                name,
+                initial_location: geometry.loc,
+            });
+        }
         let monitor = self
             .scroller
             .monitors
@@ -1548,6 +1836,22 @@ impl Paw2 {
         location: Point<f64, Logical>,
     ) {
         match operation {
+            MouseOperation::MoveScratchpad {
+                name,
+                initial_location,
+            } => self.drag_scratchpad(name, *initial_location, None, None, location - start),
+            MouseOperation::ResizeScratchpad {
+                name,
+                initial_geometry,
+                x,
+                y,
+            } => self.drag_scratchpad(
+                name,
+                initial_geometry.loc,
+                Some(*initial_geometry),
+                Some((*x, *y)),
+                location - start,
+            ),
             MouseOperation::MoveTiled {
                 window,
                 preview_size,
@@ -1573,6 +1877,58 @@ impl Paw2 {
                 }
             }
         }
+    }
+
+    fn drag_scratchpad(
+        &mut self,
+        name: &str,
+        initial_location: Point<i32, Logical>,
+        initial_geometry: Option<Rectangle<i32, Logical>>,
+        edges: Option<(Option<FloatingEdge>, Option<FloatingEdge>)>,
+        delta: Point<f64, Logical>,
+    ) {
+        let Some(runtime) = self.scroller.scratchpads.get(name) else {
+            return;
+        };
+        let (Some(window), Some(output)) = (runtime.window.clone(), runtime.output.clone()) else {
+            return;
+        };
+        let Some(monitor) = self.scroller.monitor_mut(&output) else {
+            return;
+        };
+        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+            return;
+        };
+        let area = work_area(
+            output_geometry,
+            layer_map_for_output(&monitor.output).non_exclusive_zone(),
+        );
+        let rectangle = match (initial_geometry, edges) {
+            (Some(initial), Some((x, y))) => {
+                resized_floating_rectangle(initial, x, y, delta, area, MIN_ROW_HEIGHT)
+            }
+            _ => {
+                let size = monitor
+                    .space
+                    .element_geometry(&window)
+                    .map(|geometry| geometry.size)
+                    .unwrap_or_else(|| floating_size(&window));
+                Rectangle::new(
+                    constrain_window(
+                        area,
+                        size,
+                        (initial_location.to_f64() + delta).to_i32_round(),
+                    ),
+                    size,
+                )
+            }
+        };
+        configure_window(&window, rectangle, false);
+        monitor
+            .space
+            .map_element(window.clone(), rectangle.loc, true);
+        monitor.space.raise_element(&window, false);
+        self.scroller.animations.remove(&window.id());
     }
 
     fn drag_axis_resize(&mut self, window: &Window, resize: &AxisResize, delta: f64) {
@@ -1749,6 +2105,14 @@ impl Paw2 {
         operation: &MouseOperation,
         pointer: Point<f64, Logical>,
     ) {
+        match operation {
+            MouseOperation::MoveScratchpad { name, .. }
+            | MouseOperation::ResizeScratchpad { name, .. } => {
+                self.remember_scratchpad_geometry(name);
+                return;
+            }
+            _ => {}
+        }
         let MouseOperation::MoveTiled {
             window,
             origin_output,
@@ -2048,6 +2412,13 @@ impl Paw2 {
     }
 
     pub fn output_removed(&mut self, name: &str, destination: Option<&str>) {
+        let scratchpads = self
+            .scroller
+            .scratchpads
+            .iter()
+            .filter(|(_, runtime)| runtime.visible && runtime.output.as_deref() == Some(name))
+            .map(|(scratchpad, _)| scratchpad.clone())
+            .collect::<Vec<_>>();
         let Some(index) = self
             .scroller
             .monitors
@@ -2111,6 +2482,9 @@ impl Paw2 {
         for (window, output) in keep_fullscreen {
             self.set_window_fullscreen(&window, Some(&output));
         }
+        for scratchpad in scratchpads {
+            self.show_scratchpad(&scratchpad);
+        }
         self.relayout(true);
         self.sync_focus();
     }
@@ -2150,6 +2524,365 @@ impl Paw2 {
         self.focus_window(&window);
     }
 
+    fn matching_scratchpad(&self, window: &Window) -> Option<String> {
+        let (_, app_id) = crate::screencopy::window_metadata(window);
+        self.config
+            .scratchpads
+            .iter()
+            .find(|scratchpad| scratchpad.app_id == app_id)
+            .map(|scratchpad| scratchpad.name.clone())
+    }
+
+    fn claim_scratchpad(&mut self, window: &Window) -> bool {
+        let Some(name) = self.matching_scratchpad(window) else {
+            return false;
+        };
+        if self
+            .scroller
+            .scratchpads
+            .get(&name)
+            .and_then(|runtime| runtime.window.as_ref())
+            .is_some()
+        {
+            return false;
+        }
+        let output = self.scroller.focused_output.clone().or_else(|| {
+            self.scroller
+                .monitors
+                .first()
+                .map(|monitor| monitor.name.clone())
+        });
+        let runtime = self.scroller.scratchpads.entry(name.clone()).or_default();
+        runtime.window = Some(window.clone());
+        runtime.launching = None;
+        runtime.output = output.clone();
+        let show = std::mem::take(&mut runtime.show_on_map);
+        if let Some(output) = output
+            && let Some(rectangle) = self.scratchpad_rectangle(&name, &output)
+        {
+            configure_window(window, rectangle, false);
+        }
+        if show {
+            self.show_scratchpad(&name);
+        } else {
+            self.sync_focus();
+        }
+        true
+    }
+
+    pub fn refresh_scratchpad_membership(&mut self, window: &Window) {
+        if self.scratchpad_name_for_window(window).is_some() {
+            return;
+        }
+        let Some(name) = self.matching_scratchpad(window) else {
+            return;
+        };
+        if self
+            .scroller
+            .scratchpads
+            .get(&name)
+            .and_then(|runtime| runtime.window.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        for monitor in &mut self.scroller.monitors {
+            if monitor
+                .remove_where(|candidate| candidate == window)
+                .is_some()
+            {
+                break;
+            }
+        }
+        for workspace in &mut self.scroller.parked {
+            workspace.remove_where(|candidate| candidate == window);
+        }
+        self.claim_scratchpad(window);
+        self.relayout(true);
+    }
+
+    pub fn toggle_scratchpad(&mut self, index: usize) {
+        let Some(config) = self.config.scratchpads.get(index).cloned() else {
+            return;
+        };
+        let loaded = self
+            .scroller
+            .scratchpads
+            .get(&config.name)
+            .and_then(|runtime| runtime.window.as_ref())
+            .is_some();
+        if loaded {
+            let visible = self
+                .scroller
+                .scratchpads
+                .get(&config.name)
+                .is_some_and(|runtime| runtime.visible && !runtime.hiding);
+            if visible {
+                self.hide_scratchpad(&config.name);
+            } else {
+                self.show_scratchpad(&config.name);
+            }
+            return;
+        }
+
+        let now = self.start_time.elapsed();
+        let runtime = self
+            .scroller
+            .scratchpads
+            .entry(config.name.clone())
+            .or_default();
+        runtime.show_on_map = true;
+        if runtime
+            .launching
+            .is_some_and(|started| now.saturating_sub(started) < Duration::from_secs(5))
+        {
+            return;
+        }
+        runtime.launching = Some(now);
+        if let Err(error) = crate::spawn(
+            &config.command,
+            &self.cursor_defaults.configured(
+                self.config.theme.cursor_theme.as_deref(),
+                self.config.theme.cursor_size,
+            ),
+        ) {
+            runtime.launching = None;
+            tracing::error!(?error, scratchpad = %config.name, "failed to launch scratchpad");
+        }
+    }
+
+    pub fn show_scratchpad_by_name(&mut self, name: &str) {
+        let Some(index) = self
+            .config
+            .scratchpads
+            .iter()
+            .position(|scratchpad| scratchpad.name == name)
+        else {
+            return;
+        };
+        if self
+            .scroller
+            .scratchpads
+            .get(name)
+            .and_then(|runtime| runtime.window.as_ref())
+            .is_some()
+        {
+            self.show_scratchpad(name);
+        } else {
+            self.toggle_scratchpad(index);
+        }
+    }
+
+    pub fn toggle_scratchpad_by_name(&mut self, name: &str) {
+        if let Some(index) = self
+            .config
+            .scratchpads
+            .iter()
+            .position(|scratchpad| scratchpad.name == name)
+        {
+            self.toggle_scratchpad(index);
+        }
+    }
+
+    pub fn scratchpad_ipc_state(&self) -> Vec<crate::ipc::ScratchpadState> {
+        self.config
+            .scratchpads
+            .iter()
+            .map(|config| {
+                let runtime = self.scroller.scratchpads.get(&config.name);
+                crate::ipc::ScratchpadState {
+                    name: config.name.clone(),
+                    app_id: config.app_id.clone(),
+                    loaded: runtime
+                        .and_then(|runtime| runtime.window.as_ref())
+                        .is_some(),
+                    visible: runtime.is_some_and(|runtime| runtime.visible),
+                    output: runtime.and_then(|runtime| runtime.output.clone()),
+                }
+            })
+            .collect()
+    }
+
+    fn show_scratchpad(&mut self, name: &str) {
+        let Some(window) = self
+            .scroller
+            .scratchpads
+            .get(name)
+            .and_then(|runtime| runtime.window.clone())
+        else {
+            return;
+        };
+        let Some(output) = self.scroller.focused_output.clone() else {
+            return;
+        };
+        let Some(rectangle) = self.scratchpad_rectangle(name, &output) else {
+            return;
+        };
+        let Some(edge) = self
+            .config
+            .scratchpads
+            .iter()
+            .find(|scratchpad| scratchpad.name == name)
+            .map(|scratchpad| scratchpad.edge)
+        else {
+            return;
+        };
+        let previous_focus = self.scroller.focused_mut().and_then(|monitor| {
+            monitor
+                .active()
+                .focused
+                .and_then(|index| monitor.active().windows.get(index))
+                .map(|window| window.id())
+        });
+        for monitor in &mut self.scroller.monitors {
+            if monitor.name != output {
+                monitor.space.unmap_elem(&window);
+            }
+        }
+        let Some(monitor_index) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.name == output)
+        else {
+            return;
+        };
+        let current = {
+            let monitor = &self.scroller.monitors[monitor_index];
+            let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+                return;
+            };
+            let area = work_area(
+                output_geometry,
+                layer_map_for_output(&monitor.output).non_exclusive_zone(),
+            );
+            monitor
+                .space
+                .element_location(&window)
+                .unwrap_or_else(|| hidden_scratchpad_location(edge, area, rectangle))
+        };
+        configure_window(&window, rectangle, false);
+        let duration = self
+            .config
+            .animations
+            .active()
+            .then_some(self.config.animations.duration);
+        let position = start_motion(
+            &mut self.scroller.animations,
+            window.id(),
+            Some(current),
+            rectangle.loc,
+            self.start_time.elapsed(),
+            duration,
+        );
+        let monitor = &mut self.scroller.monitors[monitor_index];
+        monitor.space.map_element(window.clone(), position, true);
+        monitor.space.raise_element(&window, false);
+
+        let runtime = self.scroller.scratchpads.get_mut(name).unwrap();
+        runtime.visible = true;
+        runtime.hiding = false;
+        runtime.output = Some(output);
+        runtime.previous_focus = previous_focus;
+        self.scroller.focused_scratchpad = Some(name.into());
+        self.scroller.scratchpad_order.retain(|item| item != name);
+        self.scroller.scratchpad_order.push(name.into());
+        self.sync_focus();
+        self.ipc.touch();
+        crate::drm::redraw(self);
+    }
+
+    pub fn hide_scratchpad(&mut self, name: &str) {
+        let Some(runtime) = self.scroller.scratchpads.get(name) else {
+            return;
+        };
+        let (Some(window), Some(output)) = (runtime.window.clone(), runtime.output.clone()) else {
+            return;
+        };
+        let previous_focus = runtime.previous_focus;
+        let Some(rectangle) = self.scratchpad_rectangle(name, &output) else {
+            return;
+        };
+        let Some(edge) = self
+            .config
+            .scratchpads
+            .iter()
+            .find(|scratchpad| scratchpad.name == name)
+            .map(|scratchpad| scratchpad.edge)
+        else {
+            return;
+        };
+        let Some(monitor_index) = self
+            .scroller
+            .monitors
+            .iter()
+            .position(|monitor| monitor.name == output)
+        else {
+            return;
+        };
+        let (area, current) = {
+            let monitor = &self.scroller.monitors[monitor_index];
+            let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+                return;
+            };
+            (
+                work_area(
+                    output_geometry,
+                    layer_map_for_output(&monitor.output).non_exclusive_zone(),
+                ),
+                monitor
+                    .space
+                    .element_location(&window)
+                    .unwrap_or(rectangle.loc),
+            )
+        };
+        let hidden = hidden_scratchpad_location(edge, area, rectangle);
+        let duration = self
+            .config
+            .animations
+            .active()
+            .then_some(self.config.animations.duration);
+        let position = start_motion(
+            &mut self.scroller.animations,
+            window.id(),
+            Some(current),
+            hidden,
+            self.start_time.elapsed(),
+            duration,
+        );
+        let monitor = &mut self.scroller.monitors[monitor_index];
+        monitor.space.map_element(window.clone(), position, true);
+        if duration.is_none() {
+            monitor.space.unmap_elem(&window);
+        }
+        let runtime = self.scroller.scratchpads.get_mut(name).unwrap();
+        runtime.hiding = duration.is_some();
+        runtime.visible = duration.is_some();
+        if self.scroller.focused_scratchpad.as_deref() == Some(name) {
+            self.scroller.focused_scratchpad = None;
+            if let Some(id) = previous_focus {
+                self.focus_window_by_id(id);
+            } else {
+                self.sync_focus();
+            }
+        }
+        self.ipc.touch();
+        crate::drm::redraw(self);
+    }
+
+    pub fn reset_scratchpad(&mut self, name: &str) {
+        self.scroller.scratchpad_geometry.remove(name);
+        self.save_scratchpad_geometry();
+        if self
+            .scroller
+            .scratchpads
+            .get(name)
+            .is_some_and(|runtime| runtime.visible)
+        {
+            self.show_scratchpad(name);
+        }
+    }
+
     pub fn add_window(&mut self, surface: ToplevelSurface) {
         self.add_managed_window(Window::new_wayland_window(surface), false, false);
     }
@@ -2174,6 +2907,10 @@ impl Paw2 {
 
     fn add_managed_window(&mut self, window: Window, fullscreen: bool, floating: bool) {
         self.capture_window_added(&window);
+        if self.claim_scratchpad(&window) {
+            self.ipc.touch();
+            return;
+        }
         let pointer = self.seat.get_pointer().unwrap().current_location();
         self.focus_output_at(pointer);
         if let Some(output) = self.scroller.focused_output.clone()
@@ -2248,6 +2985,27 @@ impl Paw2 {
 
     /// Removes the window from whichever workspace holds it, mapped or parked.
     fn remove_managed_window(&mut self, predicate: impl Fn(&Window) -> bool) -> bool {
+        let scratchpad = self
+            .scroller
+            .scratchpads
+            .iter_mut()
+            .find_map(|(name, runtime)| {
+                runtime.window.as_ref().filter(|window| predicate(window))?;
+                runtime.visible = false;
+                runtime.hiding = false;
+                Some((name.clone(), runtime.window.take().unwrap()))
+            });
+        if let Some((name, window)) = scratchpad {
+            for monitor in &mut self.scroller.monitors {
+                monitor.space.unmap_elem(&window);
+            }
+            self.scroller.scratchpad_order.retain(|item| item != &name);
+            if self.scroller.focused_scratchpad.as_deref() == Some(&name) {
+                self.scroller.focused_scratchpad = None;
+            }
+            self.forget_window(&window);
+            return true;
+        }
         let window = self
             .scroller
             .monitors
@@ -2307,6 +3065,17 @@ impl Paw2 {
             }
             return;
         };
+        if let Some(name) = self.scratchpad_name_for_window(&window)
+            && let Some(output) = self
+                .scroller
+                .scratchpads
+                .get(&name)
+                .and_then(|runtime| runtime.output.as_deref())
+            && let Some(rectangle) = self.scratchpad_rectangle(&name, output)
+        {
+            configure_window(&window, rectangle, false);
+            return;
+        }
         if !self.scroller.is_floating(&window) {
             self.relayout(false);
             return;
@@ -2355,6 +3124,29 @@ impl Paw2 {
     }
 
     fn focus_window_with_behavior(&mut self, window: &Window, reveal_and_raise: bool) {
+        if let Some(name) = self.scratchpad_name_for_window(window) {
+            let Some(output) = self
+                .scroller
+                .scratchpads
+                .get(&name)
+                .filter(|runtime| runtime.visible)
+                .and_then(|runtime| runtime.output.clone())
+            else {
+                return;
+            };
+            self.scroller.focused_output = Some(output.clone());
+            self.scroller.focused_scratchpad = Some(name.clone());
+            if reveal_and_raise {
+                if let Some(monitor) = self.scroller.monitor_mut(&output) {
+                    monitor.space.raise_element(window, false);
+                }
+                self.scroller.scratchpad_order.retain(|item| item != &name);
+                self.scroller.scratchpad_order.push(name);
+            }
+            self.sync_focus();
+            return;
+        }
+        self.scroller.focused_scratchpad = None;
         let Some(monitor_index) = self
             .scroller
             .monitors
@@ -2515,6 +3307,9 @@ impl Paw2 {
     /// Both branches relayout and refocus themselves, and the redraw arrives with
     /// the client's configure-commit, so `run_action` has nothing left to do.
     fn toggle_fullscreen(&mut self) {
+        if self.scroller.focused_scratchpad.is_some() {
+            return;
+        }
         let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
             let workspace = scroller.active();
             workspace
@@ -2537,6 +3332,9 @@ impl Paw2 {
     }
 
     fn toggle_floating(&mut self) -> bool {
+        if self.scroller.focused_scratchpad.is_some() {
+            return false;
+        }
         let pointer_x = self.seat.get_pointer().unwrap().current_location().x;
         let Some(output) = self.scroller.focused_output.clone() else {
             return false;
@@ -2670,12 +3468,21 @@ impl Paw2 {
             }
             Action::ToggleFloating => self.toggle_floating(),
             Action::CloseWindow => {
-                if let Some(window) = self.scroller.focused_mut().and_then(|scroller| {
-                    let workspace = scroller.active();
-                    workspace
-                        .focused
-                        .and_then(|index| workspace.windows.get(index))
-                }) {
+                let scratchpad = self
+                    .scroller
+                    .focused_scratchpad
+                    .as_ref()
+                    .and_then(|name| self.scroller.scratchpads.get(name))
+                    .and_then(|runtime| runtime.window.clone());
+                let window = scratchpad.or_else(|| {
+                    self.scroller.focused_mut().and_then(|scroller| {
+                        let workspace = scroller.active();
+                        workspace
+                            .focused
+                            .and_then(|index| workspace.windows.get(index).cloned())
+                    })
+                });
+                if let Some(window) = window {
                     if let Some(surface) = window.toplevel() {
                         surface.send_close();
                     } else if let Some(surface) = window.x11_surface() {
@@ -2690,6 +3497,14 @@ impl Paw2 {
             }
             Action::ToggleOverview => {
                 self.toggle_overview();
+                false
+            }
+            Action::ToggleScratchpad(index) => {
+                self.toggle_scratchpad(index);
+                false
+            }
+            Action::ToggleScratchpadOverview => {
+                self.toggle_scratchpad_overview();
                 false
             }
             Action::FocusMonitorLeft => self.change_monitor(Direction::Left, false),
@@ -2894,6 +3709,113 @@ impl Paw2 {
 
     pub(crate) fn overview_active(&self) -> bool {
         self.scroller.overview.is_some()
+    }
+
+    pub(crate) fn scratchpad_overview_active(&self) -> bool {
+        self.scroller.scratchpad_overview.is_some()
+    }
+
+    pub(crate) fn scratchpad_overview_visible_on(&self, output: &Output) -> bool {
+        self.scratchpad_overview_active()
+            && self.scroller.focused_output.as_deref() == Some(output.name().as_str())
+    }
+
+    pub fn toggle_scratchpad_overview(&mut self) {
+        if self.scroller.scratchpad_overview.is_some() {
+            self.close_scratchpad_overview();
+            return;
+        }
+        let names = self
+            .config
+            .scratchpads
+            .iter()
+            .filter(|config| {
+                self.scroller
+                    .scratchpads
+                    .get(&config.name)
+                    .and_then(|runtime| runtime.window.as_ref())
+                    .is_some()
+            })
+            .map(|config| config.name.clone())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return;
+        }
+        if self.overview_active() {
+            self.close_overview();
+        }
+        self.scroller.scratchpad_overview =
+            Some(ScratchpadOverviewSelection { names, selected: 0 });
+        self.sync_focus();
+        crate::drm::redraw(self);
+    }
+
+    pub(crate) fn move_scratchpad_overview(&mut self, horizontal: bool, delta: i32) {
+        let Some(selection) = &mut self.scroller.scratchpad_overview else {
+            return;
+        };
+        let step = if horizontal {
+            1
+        } else {
+            (selection.names.len() as f64).sqrt().ceil() as i32
+        };
+        selection.selected = (selection.selected as i32 + delta * step)
+            .rem_euclid(selection.names.len() as i32) as usize;
+        crate::drm::redraw(self);
+    }
+
+    pub(crate) fn confirm_scratchpad_overview(&mut self) {
+        let Some(name) = self
+            .scroller
+            .scratchpad_overview
+            .as_ref()
+            .and_then(|selection| selection.names.get(selection.selected))
+            .cloned()
+        else {
+            return;
+        };
+        let visible = self
+            .scroller
+            .scratchpads
+            .get(&name)
+            .is_some_and(|runtime| runtime.visible && !runtime.hiding);
+        let window = self
+            .scroller
+            .scratchpads
+            .get(&name)
+            .and_then(|runtime| runtime.window.clone());
+        self.close_scratchpad_overview();
+        if visible {
+            if let Some(window) = window {
+                self.focus_window(&window);
+            }
+        } else {
+            self.show_scratchpad(&name);
+        }
+    }
+
+    pub(crate) fn close_scratchpad_overview(&mut self) {
+        if self.scroller.scratchpad_overview.take().is_some() {
+            self.sync_focus();
+            crate::drm::redraw(self);
+        }
+    }
+
+    pub(crate) fn scratchpad_overview_hit(&self, location: Point<f64, Logical>) -> Option<usize> {
+        let output = self.default_output()?;
+        let origin = self.output_geometry(&output)?.loc.to_f64();
+        self.scratchpad_previews(&output)
+            .iter()
+            .position(|preview| preview.card.to_f64().contains(location - origin))
+    }
+
+    pub(crate) fn select_scratchpad_overview(&mut self, index: usize) {
+        if let Some(selection) = &mut self.scroller.scratchpad_overview
+            && index < selection.names.len()
+        {
+            selection.selected = index;
+            self.confirm_scratchpad_overview();
+        }
     }
 
     /// True while the overview owns input. The closing animation outlives this,
@@ -3458,10 +4380,45 @@ impl Paw2 {
             .collect()
     }
 
+    pub(crate) fn scratchpad_previews(&self, output: &Output) -> Vec<ScratchpadPreview> {
+        let Some(selection) = &self.scroller.scratchpad_overview else {
+            return Vec::new();
+        };
+        if self.scroller.focused_output.as_deref() != Some(output.name().as_str()) {
+            return Vec::new();
+        }
+        let Some(size) = self.output_geometry(output).map(|geometry| geometry.size) else {
+            return Vec::new();
+        };
+        scratchpad_cards(size, selection.names.len())
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, card)| {
+                let name = selection.names.get(index)?;
+                let window = self.scroller.scratchpads.get(name)?.window.clone()?;
+                Some(ScratchpadPreview {
+                    window,
+                    card,
+                    selected: index == selection.selected,
+                })
+            })
+            .collect()
+    }
+
     pub fn focused_window_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
         let monitor = self.scroller.monitor_for(output)?;
         if self.scroller.focused_output.as_deref() != Some(monitor.name.as_str()) {
             return None;
+        }
+        if let Some(window) = self
+            .scroller
+            .focused_scratchpad
+            .as_ref()
+            .and_then(|name| self.scroller.scratchpads.get(name))
+            .filter(|runtime| runtime.visible && runtime.output.as_deref() == Some(&monitor.name))
+            .and_then(|runtime| runtime.window.as_ref())
+        {
+            return monitor.space.element_geometry(window);
         }
         let workspace = monitor.active();
         let window = workspace.windows.get(workspace.focused?)?;
@@ -3477,7 +4434,12 @@ impl Paw2 {
     }
 
     pub(crate) fn renders_fullscreen(&self, output: &Output) -> bool {
-        !self.overview_visible() && self.fullscreen_window(output).is_some()
+        !self.overview_visible()
+            && !self.scratchpad_overview_visible_on(output)
+            && !self.scroller.scratchpads.values().any(|runtime| {
+                runtime.visible && runtime.output.as_deref() == Some(output.name().as_str())
+            })
+            && self.fullscreen_window(output).is_some()
     }
 
     pub fn x11_override_windows(&self, output: &Output) -> Vec<(Window, Point<i32, Logical>)> {
@@ -3519,13 +4481,26 @@ impl Paw2 {
         let monitor = self.scroller.monitor_for(output)?;
         let window = self
             .scroller
-            .workspaces()
-            .flat_map(|workspace| &workspace.windows)
+            .scratchpads
+            .values()
+            .filter_map(|runtime| runtime.window.as_ref())
+            .chain(
+                self.scroller
+                    .workspaces()
+                    .flat_map(|workspace| &workspace.windows),
+            )
             .find(|window| {
                 window_surface(window)
                     .is_some_and(|surface| Id::from_wayland_resource(&surface) == *element)
             })?;
-        if self.scroller.drag_preview != Some(window.id())
+        let scratchpad_visible = self
+            .scratchpad_name_for_window(window)
+            .and_then(|name| self.scroller.scratchpads.get(&name))
+            .is_some_and(|runtime| {
+                runtime.visible && runtime.output.as_deref() == Some(output.name().as_str())
+            });
+        if !scratchpad_visible
+            && self.scroller.drag_preview != Some(window.id())
             && !monitor.active().windows.contains(window)
         {
             return None;
@@ -3724,6 +4699,15 @@ impl Paw2 {
     }
 
     pub(crate) fn capture_output_for_window(&self, window: &Window) -> Option<Output> {
+        if let Some(output) = self
+            .scratchpad_name_for_window(window)
+            .and_then(|name| self.scroller.scratchpads.get(&name))
+            .and_then(|runtime| runtime.output.as_deref())
+            .and_then(|output| self.scroller.monitor(output))
+            .map(|monitor| monitor.output.clone())
+        {
+            return Some(output);
+        }
         self.scroller.monitors.iter().find_map(|monitor| {
             monitor
                 .workspaces
@@ -3744,21 +4728,42 @@ impl Paw2 {
     /// workspace belongs to no space.
     fn find_window(&self, predicate: impl Fn(&Window) -> bool) -> Option<&Window> {
         self.scroller
-            .monitors
-            .iter()
-            .flat_map(|monitor| monitor.space.elements())
+            .scratchpads
+            .values()
+            .filter_map(|runtime| runtime.window.as_ref())
             .find(|window| predicate(window))
             .or_else(|| {
                 self.scroller
                     .monitors
                     .iter()
-                    .flat_map(|monitor| &monitor.workspaces)
-                    .flat_map(|workspace| &workspace.windows)
+                    .flat_map(|monitor| monitor.space.elements())
                     .find(|window| predicate(window))
+                    .or_else(|| {
+                        self.scroller
+                            .monitors
+                            .iter()
+                            .flat_map(|monitor| &monitor.workspaces)
+                            .flat_map(|workspace| &workspace.windows)
+                            .find(|window| predicate(window))
+                    })
             })
     }
 
     pub fn window_location(&self, surface: &WlSurface) -> Option<Point<i32, Logical>> {
+        if let Some(location) = self.scroller.scratchpads.values().find_map(|runtime| {
+            let window = runtime.window.as_ref()?;
+            (window_surface(window).as_ref() == Some(surface))
+                .then(|| {
+                    runtime
+                        .output
+                        .as_deref()
+                        .and_then(|output| self.scroller.monitor(output))
+                        .and_then(|monitor| monitor.space.element_location(window))
+                })
+                .flatten()
+        }) {
+            return Some(location);
+        }
         self.scroller.monitors.iter().find_map(|monitor| {
             let window = monitor
                 .workspaces
@@ -3771,6 +4776,11 @@ impl Paw2 {
 
     pub fn window_under(&self, position: Point<f64, Logical>) -> Option<Window> {
         let monitor = self.monitor_at(position)?;
+        if let Some((window, _)) = monitor.space.element_under(position)
+            && self.scratchpad_name_for_window(window).is_some()
+        {
+            return Some(window.clone());
+        }
         if let Some(window) = monitor.active().fullscreen.as_ref() {
             let geometry = monitor.space.output_geometry(&monitor.output)?;
             let local = position - geometry.loc.to_f64();
@@ -3835,8 +4845,17 @@ impl Paw2 {
         let overlay = layers
             .layer_under(Layer::Overlay, local)
             .and_then(layer_surface);
+        let scratchpad = monitor
+            .space
+            .element_under(position)
+            .filter(|(window, _)| self.scratchpad_name_for_window(window).is_some())
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(surface, offset)| (surface, (offset + location).to_f64()))
+            });
         if let Some(window) = monitor.active().fullscreen.as_ref() {
-            return overlay.or_else(|| {
+            return overlay.or(scratchpad).or_else(|| {
                 let placement = aspect_fit(window.geometry(), output_geometry.size)?;
                 if !placement.target.contains(local) {
                     return None;
@@ -4050,6 +5069,45 @@ impl Paw2 {
                 space.raise_element(&window, false);
             }
         }
+        let scratchpad_placements = self
+            .scroller
+            .scratchpads
+            .iter()
+            .filter_map(|(name, runtime)| {
+                let window = runtime.window.clone()?;
+                let output = runtime.output.clone()?;
+                let rectangle = runtime
+                    .visible
+                    .then(|| self.scratchpad_rectangle(name, &output))??;
+                Some((output, window, rectangle))
+            })
+            .collect::<Vec<_>>();
+        for (output, window, rectangle) in scratchpad_placements {
+            configure_window(&window, rectangle, false);
+            if !self.scroller.animations.contains_key(&window.id())
+                && let Some(monitor) = self.scroller.monitor_mut(&output)
+            {
+                monitor.space.map_element(window, rectangle.loc, true);
+            }
+        }
+        let ordered = self
+            .scroller
+            .scratchpad_order
+            .iter()
+            .filter_map(|name| {
+                let runtime = self.scroller.scratchpads.get(name)?;
+                Some((
+                    runtime.output.clone()?,
+                    runtime.window.clone()?,
+                    runtime.visible,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (output, window, visible) in ordered {
+            if visible && let Some(monitor) = self.scroller.monitor_mut(&output) {
+                monitor.space.raise_element(&window, false);
+            }
+        }
     }
 
     /// Re-maps every animating window at its position for the current instant.
@@ -4061,7 +5119,7 @@ impl Paw2 {
             return;
         }
         let now = self.start_time.elapsed();
-        let animations = &mut self.scroller.animations;
+        let mut animations = std::mem::take(&mut self.scroller.animations);
         for monitor in &mut self.scroller.monitors {
             let moved = monitor.workspaces[monitor.active_workspace]
                 .windows
@@ -4075,7 +5133,54 @@ impl Paw2 {
                 monitor.space.map_element(window, position, false);
             }
         }
+        let scratchpads = self
+            .scroller
+            .scratchpads
+            .iter()
+            .filter_map(|(name, runtime)| {
+                let window = runtime.window.clone()?;
+                let output = runtime.output.clone()?;
+                let animation = animations.get(&window.id())?;
+                Some((
+                    name.clone(),
+                    window,
+                    output,
+                    animation.position(now),
+                    runtime.hiding,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (_, window, output, position, _) in &scratchpads {
+            if let Some(monitor) = self.scroller.monitor_mut(output) {
+                monitor.space.map_element(window.clone(), *position, true);
+                monitor.space.raise_element(window, false);
+            }
+        }
+        let hidden = scratchpads
+            .into_iter()
+            .filter_map(|(name, window, output, _, hiding)| {
+                (hiding
+                    && animations
+                        .get(&window.id())
+                        .is_some_and(|value| value.finished(now)))
+                .then_some((name, window, output))
+            })
+            .collect::<Vec<_>>();
+        let visibility_changed = !hidden.is_empty();
         animations.retain(|_, animation| !animation.finished(now));
+        for (name, window, output) in hidden {
+            if let Some(monitor) = self.scroller.monitor_mut(&output) {
+                monitor.space.unmap_elem(&window);
+            }
+            if let Some(runtime) = self.scroller.scratchpads.get_mut(&name) {
+                runtime.visible = false;
+                runtime.hiding = false;
+            }
+        }
+        self.scroller.animations = animations;
+        if visibility_changed {
+            self.ipc.touch();
+        }
     }
 
     /// Whether anything on screen is still moving, so the backend keeps queueing
@@ -4095,10 +5200,26 @@ impl Paw2 {
         if exclusive.is_some() && self.scroller.overview.take().is_some() {
             self.retarget_overview(true);
         }
-        let overview = self.overview_active();
+        if exclusive.is_some() {
+            self.scroller.scratchpad_overview = None;
+        }
+        let overview = self.overview_active() || self.scroller.scratchpad_overview.is_some();
         let focused_surface = exclusive.or_else(|| {
             if overview {
                 return None;
+            }
+            if let Some(name) = &self.scroller.focused_scratchpad
+                && let Some(surface) = self
+                    .scroller
+                    .scratchpads
+                    .get(name)
+                    .filter(|runtime| {
+                        runtime.visible && runtime.output.as_deref() == active_output.as_deref()
+                    })
+                    .and_then(|runtime| runtime.window.as_ref())
+                    .and_then(window_surface)
+            {
+                return Some(surface);
             }
             self.scroller
                 .monitors
@@ -4118,6 +5239,22 @@ impl Paw2 {
                         })
                 })
         });
+
+        for (name, runtime) in &self.scroller.scratchpads {
+            if let Some(window) = &runtime.window {
+                window.set_activated(
+                    !overview
+                        && runtime.visible
+                        && runtime.output.as_deref() == active_output.as_deref()
+                        && self.scroller.focused_scratchpad.as_deref() == Some(name),
+                );
+                if let Some(surface) = window.toplevel()
+                    && surface.is_initial_configure_sent()
+                {
+                    surface.send_pending_configure();
+                }
+            }
+        }
 
         for monitor in &self.scroller.monitors {
             for (workspace_index, workspace) in monitor.workspaces.iter().enumerate() {
@@ -4639,6 +5776,30 @@ fn overview_cards(
             (
                 *workspace,
                 Rectangle::new((x, start_y + position as i32 * step).into(), size),
+            )
+        })
+        .collect()
+}
+
+fn scratchpad_cards(output: Size<i32, Logical>, count: usize) -> Vec<Rectangle<i32, Logical>> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let columns = (count as f64).sqrt().ceil() as i32;
+    let rows = (count as i32 + columns - 1) / columns;
+    let gap = OVERVIEW_GAP;
+    let width = ((output.w - gap * (columns + 1)) / columns).max(1);
+    let height = ((output.h - gap * (rows + 1)) / rows).max(1);
+    (0..count)
+        .map(|index| {
+            let index = index as i32;
+            Rectangle::new(
+                (
+                    gap + (index % columns) * (width + gap),
+                    gap + (index / columns) * (height + gap),
+                )
+                    .into(),
+                (width, height).into(),
             )
         })
         .collect()
@@ -6355,6 +7516,70 @@ mod tests {
         assert_eq!(
             right.space.outputs().map(Output::name).collect::<Vec<_>>(),
             ["right"]
+        );
+    }
+
+    #[test]
+    fn scratchpad_geometry_uses_percentages_and_each_edge() {
+        let area = Rectangle::new((100, 50).into(), (1000, 800).into());
+        let mut config = ScratchpadConfig {
+            name: "term".into(),
+            command: vec!["kitty".into()],
+            app_id: "paw-term".into(),
+            edge: ScratchpadEdge::Top,
+            size: [50.0, 50.0],
+            position: None,
+            margin: 20,
+        };
+        let rectangle = configured_scratchpad_rectangle(&config, area);
+        assert_eq!(
+            rectangle,
+            Rectangle::new((350, 70).into(), (500, 400).into())
+        );
+        assert_eq!(
+            hidden_scratchpad_location(config.edge, area, rectangle),
+            (350, -350).into()
+        );
+        config.edge = ScratchpadEdge::Right;
+        let rectangle = configured_scratchpad_rectangle(&config, area);
+        assert_eq!(rectangle.loc, (580, 250).into());
+        assert_eq!(
+            hidden_scratchpad_location(config.edge, area, rectangle),
+            (1100, 250).into()
+        );
+    }
+
+    #[test]
+    fn scratchpad_overview_cards_form_a_grid() {
+        let cards = scratchpad_cards((1000, 800).into(), 4);
+        assert_eq!(cards.len(), 4);
+        assert!(cards.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
+        assert!(
+            cards
+                .iter()
+                .all(|card| Rectangle::from_size((1000, 800).into()).contains_rect(*card))
+        );
+    }
+
+    #[test]
+    fn scratchpad_geometry_state_round_trips() {
+        let state = HashMap::from([(
+            "term".to_string(),
+            HashMap::from([(
+                "DP-1".to_string(),
+                SavedScratchpadGeometry {
+                    location: [120, 80],
+                    size: [900, 600],
+                },
+            )]),
+        )]);
+        let encoded = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, HashMap<String, SavedScratchpadGeometry>>>(
+                &encoded
+            )
+            .unwrap(),
+            state
         );
     }
 }

@@ -352,6 +352,7 @@ impl XdgShellHandler for Paw2 {
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         if let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() {
             self.capture_window_metadata_changed(&window);
+            self.refresh_scratchpad_membership(&window);
         }
     }
 
