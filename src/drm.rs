@@ -1,4 +1,8 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::{
@@ -189,6 +193,7 @@ pub fn init(
     event_loop: &mut EventLoop<'static, Paw2>,
     state: &mut Paw2,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let clock = Instant::now();
     let (mut session, session_notifier) = LibSeatSession::new()?;
     let path = select_device(&session, state.config.backend.drm_device.clone())?;
     let node = DrmNode::from_path(&path)?;
@@ -207,6 +212,7 @@ pub fn init(
         ));
         info!("enabled linux-drm-syncobj explicit synchronization");
     }
+    crate::phase(&clock, "drm device opened");
     let gbm = GbmDevice::new(fd)?;
     let display = unsafe { EGLDisplay::new(gbm.clone())? };
     let context = EGLContext::new_with_priority(&display, ContextPriority::High)?;
@@ -214,8 +220,10 @@ pub fn init(
     if let Err(error) = renderer.bind_wl_display(&state.display_handle) {
         warn!(?error, "legacy EGL Wayland buffer support unavailable");
     }
+    crate::phase(&clock, "renderer created");
     state.shm_state.update_formats(renderer.shm_formats());
     let effects = Effects::new(&mut renderer, state.config.appearance);
+    crate::phase(&clock, "effects compiled");
     if effects.blur_available() {
         state.enable_background_effects();
     }
@@ -264,6 +272,7 @@ pub fn init(
         renderer,
     };
     backend.rescan(state)?;
+    crate::phase(&clock, "outputs enabled");
     if backend.outputs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -280,45 +289,6 @@ pub fn init(
         .dmabuf_state
         .create_global_with_default_feedback::<Paw2>(&state.display_handle, &dmabuf_feedback);
     state.direct = Some(backend);
-
-    let mut libinput =
-        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
-    libinput
-        .udev_assign_seat(&session.seat())
-        .map_err(|()| io::Error::other("failed to assign libinput seat"))?;
-    event_loop.handle().insert_source(
-        LibinputInputBackend::new(libinput.clone()),
-        |event: InputEvent<LibinputInputBackend>, _, state| {
-            state.process_input(event);
-            redraw(state);
-        },
-    )?;
-
-    event_loop
-        .handle()
-        .insert_source(session_notifier, move |event, _, state| {
-            with_backend(state, |backend, _| match event {
-                SessionEvent::PauseSession => {
-                    info!("session paused");
-                    libinput.suspend();
-                    backend.manager.pause();
-                }
-                SessionEvent::ActivateSession => {
-                    info!("session resumed");
-                    if let Err(error) = libinput.resume() {
-                        error!(?error, "failed to resume libinput");
-                    }
-                    if let Err(error) = backend.manager.lock().activate(false) {
-                        error!(?error, "failed to reactivate DRM");
-                    }
-                    for output in &mut backend.outputs {
-                        output.kms.reset_buffers();
-                        output.frame_pending = false;
-                        output.repaint_scheduled = false;
-                    }
-                }
-            });
-        })?;
 
     // A `LoopHandle` owns an `Rc` to the loop, and this callback is stored *in*
     // the loop: keeping a strong handle here would leak every event source,
@@ -394,6 +364,55 @@ pub fn init(
             TimeoutAction::Drop
         })?;
 
+    // Everything the first frame needs is wired up, so draw it before opening
+    // the input devices below - libseat opens those one logind round trip at a
+    // time, and it is the longest stretch left in a login. Nothing sees input
+    // any later for it: the event loop that delivers those events does not
+    // start until `main` runs it either way, so the wait moves behind the
+    // desktop instead of in front of it.
+    event_loop.dispatch(Duration::ZERO, state)?;
+    crate::phase(&clock, "first frame");
+
+    let mut libinput =
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
+    libinput
+        .udev_assign_seat(&session.seat())
+        .map_err(|()| io::Error::other("failed to assign libinput seat"))?;
+    event_loop.handle().insert_source(
+        LibinputInputBackend::new(libinput.clone()),
+        |event: InputEvent<LibinputInputBackend>, _, state| {
+            state.process_input(event);
+            redraw(state);
+        },
+    )?;
+
+    event_loop
+        .handle()
+        .insert_source(session_notifier, move |event, _, state| {
+            with_backend(state, |backend, _| match event {
+                SessionEvent::PauseSession => {
+                    info!("session paused");
+                    libinput.suspend();
+                    backend.manager.pause();
+                }
+                SessionEvent::ActivateSession => {
+                    info!("session resumed");
+                    if let Err(error) = libinput.resume() {
+                        error!(?error, "failed to resume libinput");
+                    }
+                    if let Err(error) = backend.manager.lock().activate(false) {
+                        error!(?error, "failed to reactivate DRM");
+                    }
+                    for output in &mut backend.outputs {
+                        output.kms.reset_buffers();
+                        output.frame_pending = false;
+                        output.repaint_scheduled = false;
+                    }
+                }
+            });
+        })?;
+
+    crate::phase(&clock, "input devices opened");
     Ok(())
 }
 

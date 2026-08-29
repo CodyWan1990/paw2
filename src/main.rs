@@ -18,7 +18,7 @@ use std::{
     ffi::{OsStr, OsString},
     io,
     sync::{Mutex, MutexGuard, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use smithay::reexports::{
@@ -35,6 +35,7 @@ enum Mode {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let clock = Instant::now();
     init_logging();
 
     let Some(mode) = parse_args(std::env::args_os().skip(1))? else {
@@ -43,10 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let cursor_defaults = cursor::CursorSettings::environment();
     let (config, mut config_watcher, config_error) = config::load()?;
-    apply_theme(&config.theme);
+    phase(&clock, "config loaded");
+    // Only the environment half runs here: it costs nothing and has to precede
+    // every spawned client. The `gsettings` half is one cold process per key, so
+    // it waits until the desktop is on screen.
+    apply_theme_environment(&config.theme);
     let mut event_loop: EventLoop<Paw2> = EventLoop::try_new()?;
     let display = Display::new()?;
     let mut state = Paw2::new(&mut event_loop, display, config, cursor_defaults);
+    phase(&clock, "compositor state ready");
     state.initialize_scratchpads();
     state
         .ipc
@@ -120,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == Mode::Direct {
         state.apply_startup_monitor();
     }
+    phase(&clock, "backend ready");
 
     // SAFETY: Paw2 is single-threaded and sets the child environment before
     // spawning a client or entering the event loop.
@@ -133,6 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Never let nested clients escape to the parent X server.
     unsafe { std::env::remove_var("DISPLAY") };
+
+    // The direct backend has already put the first frame on screen, so the rest
+    // of the session handshake - four `gsettings`, a keyring daemon, D-Bus and
+    // systemd - runs behind the desktop rather than in front of it.
+    apply_gsettings(theme_gsettings(&state.config.theme));
     if mode == Mode::Direct {
         initialize_keyring();
     }
@@ -165,6 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spawn(command, &cursor_settings)?;
     }
 
+    phase(&clock, "startup complete");
     let result = event_loop.run(None, &mut state, |state| {
         ipc::flush(state);
         let _ = state.display_handle.flush_clients();
@@ -292,9 +305,15 @@ fn keyring_control(output: &str) -> Option<&str> {
 }
 
 fn update_graphical_session(action: &str) {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", action, "paw2-session.target"])
-        .status();
+    let mut command = std::process::Command::new("systemctl");
+    command.arg("--user");
+    // Nothing in Paw2 waits on the target's units, so starting it is fire and
+    // forget. Stopping stays blocking: `shutdown` needs those services gone
+    // while the compositor is still alive to serve them.
+    if action == "start" {
+        command.arg("--no-block");
+    }
+    let status = command.args([action, "paw2-session.target"]).status();
     match status {
         Ok(status) if status.success() => {}
         Ok(status) => tracing::warn!(%status, action, "could not update graphical session target"),
@@ -323,15 +342,13 @@ fn unset_activation_environment() {
     }
 }
 
-fn apply_theme(theme: &config::ThemeConfig) {
+fn apply_theme_environment(theme: &config::ThemeConfig) {
     // SAFETY: startup is single-threaded and no clients have been spawned yet.
     unsafe {
         for (name, value) in theme_environment(theme) {
             std::env::set_var(name, value);
         }
     }
-
-    apply_gsettings(theme_gsettings(theme));
 }
 
 fn apply_gsettings(settings: Vec<(&'static str, String)>) {
@@ -343,7 +360,11 @@ fn apply_gsettings(settings: Vec<(&'static str, String)>) {
     );
 }
 
+/// Every `gsettings` here is a cold process that loads glib and D-Bus-activates
+/// `dconf`, and that latency is the same whether one runs or four do. Spawning
+/// the whole set before waiting on any of it pays for it once.
 fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
+    let mut running = Vec::with_capacity(settings.len());
     for (key, value) in settings {
         let mut command = std::process::Command::new("gsettings");
         command.arg(if value.is_some() { "set" } else { "reset" });
@@ -351,9 +372,8 @@ fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
         if let Some(value) = value {
             command.arg(value);
         }
-        match command.status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
+        match command.spawn() {
+            Ok(child) => running.push((key, child)),
             Err(error) => {
                 tracing::warn!(
                     ?error,
@@ -361,6 +381,13 @@ fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
                 );
                 break;
             }
+        }
+    }
+    for (key, mut child) in running {
+        match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
+            Err(error) => tracing::warn!(?error, key, "could not wait for gsettings"),
         }
     }
 }
@@ -536,6 +563,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<Option<Mod
 
 fn print_usage() {
     println!("Usage:\n  paw2\n  paw2 --nested [COMMAND [ARG...]]\n  paw2 --help");
+}
+
+/// Startup phase timing, so a slow login is legible in the session log instead
+/// of reconstructed from the timestamps of unrelated lines.
+pub(crate) fn phase(clock: &Instant, name: &str) {
+    tracing::info!(name, elapsed_ms = clock.elapsed().as_millis(), "startup phase");
 }
 
 fn init_logging() {
