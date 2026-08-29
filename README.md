@@ -186,9 +186,11 @@ virtual terminals.
 
 ## Configuration
 
-On first run Paw2 writes a commented `paw2/config.toml` under
-`$XDG_CONFIG_HOME` (normally `~/.config/paw2/config.toml`). That generated file
-is the reference — this section explains what the values mean.
+On first run Paw2 writes `paw2/config.toml` under `$XDG_CONFIG_HOME` (normally
+`~/.config/paw2/config.toml`). It is a copy of **[`EXAMPLE.toml`](EXAMPLE.toml)**
+— every option Paw2 accepts, annotated, with the hardware-specific sections
+commented out. Read that file for the literal values and copy from it; this
+section explains what they mean.
 
 Most settings reload **within about half a second of saving**. An invalid save
 is reported and the last working configuration keeps running.
@@ -197,46 +199,36 @@ is reported and the last working configuration keeps running.
 | --- | --- |
 | Bindings, commands, layout, appearance, animations, overview, `focus_follows_mouse`, monitor resolution / refresh / scale / transform, cursor / GTK / icon theme | Backend, monitor position, VRR, `focus_at_startup`, autostart, `middle_click_paste`, Qt style and font |
 
+Colours are `#RRGGBB` — six hex digits, no alpha and no shorthand. Sizes are
+logical pixels unless noted. Unknown keys are rejected rather than ignored, so a
+typo names itself.
+
 ### `[layout]`
 
-```toml
-[layout]
-enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
-column_width = 0.6
-preset_column_widths = [0.33333, 0.5, 0.66667]
-center_focused_column = false
-tab_grouping = false
-```
-
-| Key | Meaning |
-| --- | --- |
-| `enabled_layouts` | Which layouts exist and their cycle order. At least one, no duplicates. A binding for a disabled layout does nothing. |
-| `column_width` | Fraction of the output width new columns get. |
-| `preset_column_widths` | Widths cycled by `cycle_column_width`. Each between `0.1` and `1.0`. |
-| `center_focused_column` | When `false`, the viewport moves only enough to reveal the focused column. |
-| `tab_grouping` | Enables tab groups. Groups last for the session only. |
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled_layouts` | all four | Which layouts exist and their cycle order. At least one, no duplicates. A binding for a layout left out does nothing. |
+| `column_width` | `0.6` | Fraction of the output width new columns get. `0.1`–`1.0`. |
+| `preset_column_widths` | `0.33333, 0.5, 0.66667` | Widths cycled by `cycle_column_width`. Each `0.1`–`1.0`, list not empty. |
+| `center_focused_column` | `false` | When `false`, the viewport moves only enough to reveal the focused column. |
+| `tab_grouping` | `false` | Enables tab groups. Groups last for the session only. |
 
 ### `[appearance]`
 
-```toml
-[appearance]
-gaps = 15
-focus_ring_width = 1
-focus_ring_color = "#0b3d91"
-corner_radius = 8
-shadow_radius = 12
-shadow_color = "#000000"
-shadow_opacity = 0.45
-shadow_offset_x = 0
-shadow_offset_y = 4
-blur = true
-blur_radius = 8
-transparency = true
-opacity = 0.95
-```
-
-All sizes are logical pixels. Setting a radius or width to `0` disables that
-effect, as does `blur = false` or `transparency = false`.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `gaps` | `15` | Space between windows and output edges. At most `256`. |
+| `focus_ring_width` | `1` | Ring around the focused window. Cannot exceed `gaps`; `0` disables it. |
+| `focus_ring_color` | `#0b3d91` | Ring colour. |
+| `corner_radius` | `8` | Rounded window corners. At most `64`; `0` disables. |
+| `shadow_radius` | `12` | How far the shadow reaches past the window. At most `64`; `0` disables. |
+| `shadow_color` | `#000000` | Shadow colour. |
+| `shadow_opacity` | `0.45` | `0.0`–`1.0`. Fully transparent also disables the shadow. |
+| `shadow_offset_x` / `_y` | `0` / `4` | Between `-64` and `64`. |
+| `blur` | `true` | Backdrop blur behind translucent windows. |
+| `blur_radius` | `8` | At most `64`; `0` also disables it. |
+| `transparency` | `true` | Compositor-set window transparency. |
+| `opacity` | `0.95` | `0.1`–`1.0`. |
 
 Transparency and blur apply to window areas that clients do not declare opaque,
 clipped to the XDG window geometry. Protocol-aware clients can request their own
@@ -245,181 +237,116 @@ wallpapers, or to the cursor.
 
 ### `[animations]`
 
-```toml
-[animations]
-enabled = true
-duration_ms = 150
-slowdown = 1.0
-```
-
-`slowdown` multiplies the duration, which is mostly useful for watching an
-animation in slow motion.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Window movement and resize animations. |
+| `duration_ms` | `150` | At most `5000`. |
+| `slowdown` | `1.0` | Multiplies the duration. `0.1`–`100.0`, for watching in slow motion. |
 
 ### `[overview]`
 
-```toml
-[overview]
-zoom = 0.5
-backdrop_color = "#1c1c1c"
-```
-
-`zoom` is how far workspaces shrink when the overview opens, between `0.2` and
-`0.75`. `backdrop_color` shows behind the cards.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `zoom` | `0.5` | How far workspaces shrink when the overview opens. `0.2`–`0.75`. |
+| `backdrop_color` | `#1c1c1c` | Shown behind the workspace cards. |
 
 ### `[input]`
 
-```toml
-[input]
-focus_follows_mouse = false
-middle_click_paste = true
-```
-
-Focus-follows-mouse never scrolls the viewport or raises floating windows.
-Disabling `middle_click_paste` hides the Wayland and X11 primary selection; it
-does not swallow ordinary middle clicks.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `focus_follows_mouse` | `false` | Focus windows as the pointer enters them. Never scrolls the viewport or raises floating windows. |
+| `middle_click_paste` | `true` | Exposes the Wayland and X11 primary selection. Disabling it does not swallow ordinary middle clicks. |
 
 ### `[theme]`
 
-Optional. Every key may be omitted.
+Optional and commented out by default. Every key may be omitted, but none may be
+left blank.
 
-```toml
-[theme]
-cursor_theme = "Oxygen_Zion"
-cursor_size = 24
-icon_theme = "Papirus-Dark"
-gtk_theme = "Breeze"
-qt_style = "Breeze"
-font = "Monofur Nerd Font Propo 12"
-```
+| Key | Meaning |
+| --- | --- |
+| `cursor_theme` | Cursor theme name. Applies live. |
+| `cursor_size` | `1`–`256`. Applies live. |
+| `icon_theme` | Icon theme name. Applies live. |
+| `gtk_theme` | GTK theme name. Applies live. |
+| `qt_style` | Qt style name. Applies at the next start. |
+| `font` | Interface font, name and size. Applies at the next start. |
 
 Paw2 publishes these through GSettings and exports Qt settings to the
-applications it launches. Cursor, GTK and icon changes apply live; Qt style and
-font changes apply at the next start. Applications that cache theme values need
-reopening. Shared Qt icon and font settings need your distribution's Qt GTK
-platform-theme plugin.
+applications it launches. Applications that cache theme values need reopening.
+Shared Qt icon and font settings need your distribution's Qt GTK platform-theme
+plugin.
 
 ### `[backend]`
 
 Hand-edited only — `paw2-shell` never writes this section, so these stay yours
 for rescuing a machine that will not start.
 
-```toml
-[backend]
-direct_scanout = true
-# drm_device = "/dev/dri/card1"
-# connector = "DP-1"
-```
-
-Set `direct_scanout = false` and restart if scanout causes display corruption.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `direct_scanout` | `true` | Scan out compatible fullscreen buffers on the DRM primary plane. Set `false` and restart if it corrupts your display. |
+| `drm_device` | automatic | Absolute path to a GPU, e.g. `/dev/dri/card1`. |
+| `connector` | automatic | Drive a single named output. Cannot be combined with `[[monitors]]`. |
 
 ### `[[monitors]]`
 
 Monitors are detected automatically and placed left to right at their preferred
-mode. Add an entry only to pin something.
+mode. Add an entry only to pin something. Connectors must be unique and only one
+monitor may set `focus_at_startup`.
 
-```toml
-[[monitors]]
-connector = "DP-2"
-focus_at_startup = true
-resolution = [2560, 1440]
-refresh = 120.0
-position = [0, 0]
-scale = 1.0
-transform = "normal"
-vrr = "automatic"
-```
-
-| Key | Meaning |
-| --- | --- |
-| `connector` | Required. The DRM connector name, e.g. `DP-1`, `HDMI-A-1`. |
-| `focus_at_startup` | Which monitor has focus when the session begins. |
-| `resolution`, `refresh`, `position` | Pinned mode and layout position. |
-| `scale` | Positive number; `1.0` is 100%, `1.25` is 125%. |
-| `transform` | `normal`, `90`, `180`, `270`, `flipped`, and the flipped-rotated variants. |
-| `vrr` | `automatic` (default), `always`, or `never`. |
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `connector` | required | The DRM connector name, e.g. `DP-1`, `HDMI-A-1`. |
+| `focus_at_startup` | `false` | Which monitor has focus when the session begins. |
+| `resolution`, `refresh`, `position` | preferred mode, left to right | Pinned mode and layout position. |
+| `scale` | `1.0` | Positive number; `1.0` is 100%, `1.25` is 125%. |
+| `transform` | `normal` | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`, `flipped-180`, `flipped-270`. |
+| `vrr` | `automatic` | `automatic`, `always`, or `never`. |
 
 An unavailable mode leaves the working mode in place and reports the error on
 the control socket.
 
 ### `[security]`
 
-```toml
-[security]
-privileged_clients = [
-  "xdg-desktop-portal-wlr",
-  "xdg-desktop-portal",
-  "wl-paste",
-  "wl-copy",
-]
-```
+`privileged_clients` lists the only clients allowed to bind the privileged
+globals: the window list (`ext-foreign-toplevel-list-v1`), per-window capture,
+and the clipboard manager interface (`ext-data-control-v1`, which sees every
+copy as it happens). Everything else can still capture whole outputs, so `grim`
+and `wf-recorder` work without an entry.
 
-Only these clients may bind the privileged globals: the window list
-(`ext-foreign-toplevel-list-v1`), per-window capture, and the clipboard manager
-interface (`ext-data-control-v1`, which sees every copy as it happens).
-Everything else can still capture whole outputs, so `grim` and `wf-recorder`
-work without an entry.
-
-Names are matched against the basename of the connecting process's executable,
-so add whatever binary actually connects — for `wl-paste --watch cliphist store`
-that is `wl-paste`, not `cliphist`.
+It ships allowing `xdg-desktop-portal-wlr`, `xdg-desktop-portal`, `wl-paste` and
+`wl-copy`. Names are matched against the basename of the connecting process's
+executable, so add whatever binary actually connects — for
+`wl-paste --watch cliphist store` that is `wl-paste`, not `cliphist`.
 
 ### `[autostart]`
 
-```toml
-[autostart]
-commands = [
-  ["swaybg", "-i", "/absolute/path/to/wallpaper.png", "-m", "fill"],
-  ["waybar"],
-]
-```
-
-Argv arrays, run once in order at startup. Use `["sh", "-c", "..."]` only when
-you actually need shell syntax.
+`commands` is a list of argv arrays, run once in order at startup, and empty by
+default. The first element is the executable; use `["sh", "-c", "..."]` only
+when you actually need shell syntax.
 
 ### `[scratchpads.NAME]`
 
-Each entry describes one application window.
+Each entry describes one application window. None are configured by default.
 
-```toml
-[scratchpads.terminal]
-command = ["kitty", "--class", "paw2-terminal"]
-app_id = "paw2-terminal"
-edge = "top"
-size = [75, 60]
-margin = 24
-# position = [12.5, 5]
-```
-
-| Key | Meaning |
-| --- | --- |
-| `command` | Argv array, launched on first use. |
-| `app_id` | Exact match against a Wayland app ID or an X11 `WM_CLASS`. |
-| `edge` | `top`, `bottom`, `left` or `right`. |
-| `size` | Percentage pair of the monitor. |
-| `position` | Optional top-left corner in percentages. Without it, Paw2 centres the window against its edge. |
-| `margin` | Logical pixels from the edge. |
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `command` | required | Argv array, launched on first use. |
+| `app_id` | required | Exact match against a Wayland app ID or an X11 `WM_CLASS`. Each may be used once. |
+| `edge` | `top` | `top`, `bottom`, `left` or `right`. |
+| `size` | `75, 60` | Percentage pair of the monitor, each `1`–`100`. |
+| `position` | centred on its edge | Optional top-left corner in percentages. Position plus size must fit within 100. |
+| `margin` | `24` | Logical pixels from the edge, at most `256`. |
 
 ### Bindings
 
-```toml
-[bindings]
-focus_left = ["Super+h", "Super+Left"]
-close_window = ["Super+q", "Super+BackSpace"]
-quit = ["Super+Shift+Escape"]
+Every action takes a list of trigger strings; an empty list disables it.
+[`EXAMPLE.toml`](EXAMPLE.toml) lists all 39 of them with their defaults, and
+[Default keys](#default-keys) above shows what they do.
 
-[bindings.commands]
-"Super+Return" = ["kitty", "--single-instance"]
-"Super+d" = ["fuzzel"]
-
-[bindings.scratchpads]
-"Super+grave" = "terminal"
-```
-
-Every action takes a list of binding strings; an empty list disables it. The
-generated `config.toml` lists all of them with their defaults.
-
-Beyond keys, binding strings accept `WheelScrollUp`, `WheelScrollDown` and
-`MouseLeft`, so mouse shortcuts sit beside keyboard ones:
+Modifiers are `Ctrl` (or `Control`), `Alt`, `Shift` and `Super` (or `logo`),
+joined with `+`. The trigger is an X keysym name, or one of `WheelScrollUp`,
+`WheelScrollDown`, `MouseLeft`, `MouseRight` and `MouseMiddle` — so mouse
+shortcuts sit beside keyboard ones:
 
 ```toml
 [bindings]
@@ -432,18 +359,13 @@ increase_column_width = ["Ctrl+Alt+WheelScrollUp"]
 Wheel shortcuts fire once per physical detent and consume matching wheel events.
 Touchpad and unmatched scrolling still reach applications.
 
-Workspace and numbered-scratchpad bindings are lists of nine, one per slot:
+No trigger may be assigned to two actions. Only `tab_group_drag` takes a mouse
+button, and it requires one.
 
-```toml
-[bindings.workspace]
-switch = [["Super+1"], ["Super+2"], ["Super+3"], ["Super+4"], ["Super+5"],
-          ["Super+6"], ["Super+7"], ["Super+8"], ["Super+9"]]
-
-[bindings.numbered_scratchpads]
-toggle = [["Super+Alt+1"], ["Super+Alt+2"], ["Super+Alt+3"], ["Super+Alt+4"],
-          ["Super+Alt+5"], ["Super+Alt+6"], ["Super+Alt+7"], ["Super+Alt+8"],
-          ["Super+Alt+9"]]
-```
+Three tables extend the plain actions: `[bindings.commands]` maps a trigger to
+an argv array, `[bindings.scratchpads]` maps one to a scratchpad name, and
+`[bindings.workspace]` plus `[bindings.numbered_scratchpads]` take lists of
+exactly nine, one per slot.
 
 ### If the config is broken at startup
 

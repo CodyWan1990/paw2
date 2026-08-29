@@ -1,0 +1,260 @@
+# Paw2 configuration
+#
+# This file is both the annotated reference and what Paw2 writes to
+# ~/.config/paw2/config.toml on first run. Every option Paw2 accepts is
+# here; sections that depend on your hardware are commented out.
+#
+# Most settings apply within about half a second of saving. Backend,
+# monitor position, VRR, startup focus, autostart, middle-click paste, Qt
+# style and font need a restart. An invalid save is reported and the last
+# working configuration keeps running.
+#
+# Colours are six hex digits behind a #, with no alpha and no shorthand.
+# Sizes are logical pixels unless noted. Unknown keys are rejected, so a
+# typo names itself rather than being silently ignored.
+#
+# Anything in ~/.config/paw2/config.d/*.toml applies over this file, one
+# whole section at a time. See the README for how that works.
+
+[layout]
+# Layouts available to cycling, in cycle order.
+# Choose from scrolling, dwindle, master_stack and monocle. At least one,
+# no duplicates. A binding for a layout left out here does nothing.
+enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
+# Default fraction of the output width used by each column.
+# Between 0.1 and 1.0.
+column_width = 0.6
+# Widths cycled on the focused column.
+# Each between 0.1 and 1.0. The list must not be empty.
+preset_column_widths = [0.33333, 0.5, 0.66667]
+# When false, the viewport moves only enough to reveal the focused column.
+center_focused_column = false
+# Group tiled windows behind a clickable tab bar.
+tab_grouping = false
+
+[appearance]
+# Logical pixels between windows and output edges.
+# At most 256.
+gaps = 15
+# The ring cannot be wider than the gap it sits in.
+focus_ring_width = 1
+focus_ring_color = "#0b3d91"
+# Rounded window corners in logical pixels; zero disables them.
+# At most 64.
+corner_radius = 8
+# Drop shadow behind windows. The radius is how far it reaches past the window
+# in logical pixels; zero, or a fully transparent shadow, disables it.
+# Limits: radius at most 64, offsets between -64 and 64, opacity from 0.0
+# to 1.0.
+shadow_radius = 12
+shadow_color = "#000000"
+shadow_opacity = 0.45
+shadow_offset_x = 0
+shadow_offset_y = 4
+# Smooth backdrop blur behind translucent windows.
+blur = true
+# At most 64. Zero also disables it.
+blur_radius = 8
+# Compositor-set window opacity. Applies to windows only, never to layer
+# surfaces such as bars and wallpapers, and never to the cursor.
+transparency = true
+# From 0.1 to 1.0.
+opacity = 0.95
+
+# Window movement and resize animations. The duration is in milliseconds,
+# at most 5000; the slowdown multiplier runs from 0.1 to 100.0.
+[animations]
+enabled = true
+duration_ms = 150
+# Multiplier for watching animations in slow motion; 3.0 runs them 3x slower.
+slowdown = 1.0
+
+[overview]
+# How far the workspaces shrink when the overview opens. 0.5 is half size.
+# Between 0.2 and 0.75.
+zoom = 0.5
+# Shown behind the workspace cards, where the desktop no longer reaches.
+backdrop_color = "#1c1c1c"
+
+[input]
+# Focus windows as the pointer enters them without moving the workspace viewport.
+focus_follows_mouse = false
+# Expose Wayland primary selection for middle-click paste.
+middle_click_paste = true
+
+# Desktop theme values are optional. Cursor, GTK and icon changes apply live;
+# Qt style and font changes apply at startup. The cursor size is between 1
+# and 256, and no value here may be left blank.
+#[theme]
+#cursor_theme = "Oxygen_Zion"
+#cursor_size = 24
+#icon_theme = "Papirus-Dark"
+#gtk_theme = "Breeze"
+#qt_style = "Breeze"
+#font = "Monofur Nerd Font Propo 12"
+
+# Hand-edited only. paw2-shell never writes this section, so drm_device and
+# connector stay yours for fixing a machine that will not start.
+[backend]
+# Automatically scan out compatible fullscreen buffers on the DRM primary plane.
+direct_scanout = true
+# Pin the GPU or the single output to drive. An absolute path is required
+# for the device, and a pinned connector cannot be combined with the
+# monitor entries below.
+# drm_device = "/dev/dri/card1"
+# connector = "DP-1"
+
+# Monitors are auto-detected and placed left to right. Add a [[monitors]] entry
+# only to pin a connector's mode, position, scale, rotation, or VRR policy; see the
+# README for the full example. Each connector may appear once, only one
+# monitor may take startup focus, and the scale must be positive.
+#[[monitors]]
+#connector = "DP-1"
+#focus_at_startup = true
+#resolution = [2560, 1440]
+#refresh = 120.0
+#position = [0, 0]
+#scale = 1.0
+# Rotation: normal, 90, 180, 270, flipped, flipped-90, flipped-180 or
+# flipped-270.
+#transform = "normal"
+# Variable refresh: automatic while a fullscreen window owns the output,
+# always to leave it on, never to disable it. Unlisted monitors are
+# automatic.
+#vrr = "automatic"
+
+[security]
+# Clients allowed to bind the privileged globals: the window list
+# (ext-foreign-toplevel-list-v1), per-window capture, and the clipboard manager
+# interface (ext-data-control-v1, which sees every copy as it happens).
+# Everything else can still capture whole outputs, so grim and wf-recorder work
+# without an entry. Matched against the basename of the connecting process's
+# executable, so a clipboard history tool needs whatever binary actually
+# connects - for `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
+privileged_clients = [
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal",
+  "wl-paste",
+  "wl-copy",
+]
+
+[autostart]
+# Commands are argv arrays and run once when Paw2 starts.
+# The first element is the executable. Use an explicit shell entry such as
+# ["sh", "-c", "..."] only when you need shell syntax.
+commands = [
+  # ["swaybg", "-i", "/absolute/path/to/wallpaper.png", "-m", "fill"],
+  # ["waybar"],
+]
+
+# Named application scratchpads launch on first use. `app_id` matches a
+# Wayland app_id or X11 WM_CLASS exactly, and may be configured once. The
+# edge is top, bottom, left or right. The size, and the optional position,
+# are percentages of the monitor and must fit inside 100 together; without a
+# position Paw2 centres the window against its edge. The margin is at most
+# 256 logical pixels.
+#[scratchpads.terminal]
+#command = ["kitty", "--class", "paw2-terminal"]
+#app_id = "paw2-terminal"
+#edge = "top"
+#size = [75, 60]
+#position = [12.5, 5]
+#margin = 24
+
+# Each action takes a list of trigger strings, and an empty list disables
+# it. Modifiers are Ctrl (or Control), Alt, Shift and Super (or logo),
+# joined with +. The trigger is an X keysym name, or one of WheelScrollUp,
+# WheelScrollDown, MouseLeft, MouseRight and MouseMiddle. Wheel triggers
+# fire once per detent and are consumed; touchpad scrolling is untouched.
+# No trigger may be assigned to two actions. Only tab_group_drag takes a
+# mouse button, and it requires one.
+[bindings]
+focus_left = ["Super+h", "Super+Left"]
+focus_right = ["Super+l", "Super+Right"]
+focus_up = ["Super+k", "Super+Up"]
+focus_down = ["Super+j", "Super+Down"]
+swap_left = ["Super+Shift+h", "Super+Shift+Left"]
+swap_right = ["Super+Shift+l", "Super+Shift+Right"]
+swap_up = ["Super+Shift+k", "Super+Shift+Up"]
+swap_down = ["Super+Shift+j", "Super+Shift+Down"]
+# Pull a lone neighbouring window into this column, or push a shared one
+# back out. In master-stack these change the number of master windows
+# instead.
+consume_or_expel_left = ["Super+bracketleft"]
+consume_or_expel_right = ["Super+bracketright"]
+# Tab groups, when they are enabled above: group the adjacent window,
+# expel the active tab again, walk the tabs, or drag one window onto
+# another to group them.
+tab_group_left = ["Super+Shift+bracketleft"]
+tab_group_right = ["Super+Shift+bracketright"]
+previous_tab = ["Super+Ctrl+bracketleft"]
+next_tab = ["Super+Ctrl+bracketright"]
+tab_group_drag = ["Super+Ctrl+MouseLeft"]
+cycle_column_width = ["Super+backslash"]
+cycle_layout = ["Super+Tab"]
+# Jump straight to one layout rather than cycling.
+switch_layout_scrolling = []
+switch_layout_dwindle = []
+switch_layout_master_stack = []
+switch_layout_monocle = []
+decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
+increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
+decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
+increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
+toggle_floating = ["Super+Shift+space"]
+close_window = ["Super+q", "Super+BackSpace"]
+toggle_fullscreen = ["Super+Shift+f"]
+toggle_overview = ["Super+o"]
+toggle_scratchpad_overview = ["Super+Shift+o"]
+focus_monitor_left = ["Super+comma"]
+focus_monitor_right = ["Super+period"]
+focus_monitor_up = []
+focus_monitor_down = []
+move_to_monitor_left = ["Super+Shift+comma"]
+move_to_monitor_right = ["Super+Shift+period"]
+move_to_monitor_up = ["Super+Ctrl+Shift+Up"]
+move_to_monitor_down = ["Super+Ctrl+Shift+Down"]
+quit = ["Super+Shift+Escape"]
+
+# Triggers mapped to argv arrays, launched on press. These must not
+# collide with the actions above.
+[bindings.commands]
+"Super+Return" = ["kitty", "--single-instance"]
+# "Super+d" = ["fuzzel"]
+# "Super+b" = ["firefox", "--new-window"]
+
+# Triggers mapped to a name from a scratchpad section above.
+[bindings.scratchpads]
+# "Super+grave" = "terminal"
+
+# Nine slots that hold any focused window: show or hide one, or assign and
+# release the focused window. Exactly nine lists each.
+[bindings.numbered_scratchpads]
+toggle = [
+  ["Super+Alt+1"], ["Super+Alt+2"], ["Super+Alt+3"],
+  ["Super+Alt+4"], ["Super+Alt+5"], ["Super+Alt+6"],
+  ["Super+Alt+7"], ["Super+Alt+8"], ["Super+Alt+9"],
+]
+assign = [
+  ["Super+Alt+Shift+1"], ["Super+Alt+Shift+2"], ["Super+Alt+Shift+3"],
+  ["Super+Alt+Shift+4"], ["Super+Alt+Shift+5"], ["Super+Alt+Shift+6"],
+  ["Super+Alt+Shift+7"], ["Super+Alt+Shift+8"], ["Super+Alt+Shift+9"],
+]
+
+# Nine workspaces per monitor. switch and move take exactly nine lists
+# each; previous and next wrap around.
+[bindings.workspace]
+switch = [
+  ["Super+1"], ["Super+2"], ["Super+3"],
+  ["Super+4"], ["Super+5"], ["Super+6"],
+  ["Super+7"], ["Super+8"], ["Super+9"],
+]
+move = [
+  ["Super+Shift+1"], ["Super+Shift+2"], ["Super+Shift+3"],
+  ["Super+Shift+4"], ["Super+Shift+5"], ["Super+Shift+6"],
+  ["Super+Shift+7"], ["Super+Shift+8"], ["Super+Shift+9"],
+]
+previous = ["Super+Page_Up"]
+next = ["Super+Page_Down"]
+move_previous = ["Super+Shift+Page_Up"]
+move_next = ["Super+Shift+Page_Down"]
