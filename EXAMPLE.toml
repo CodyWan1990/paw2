@@ -1,11 +1,24 @@
-# Paw2 configuration
+# Paw2 configuration reference
 #
-# This file is both the annotated reference and what Paw2 writes to
-# ~/.config/paw2/config.toml on first run. Every option Paw2 accepts is
-# here; sections that depend on your hardware are commented out.
+# Every option Paw2 accepts is here, set to a working value, with the default
+# it takes when you leave it out noted beside it. This file is documentation:
+# Paw2 never reads it. Copy the parts you want into ~/.config/paw2/config.toml.
+#
+# What you leave out is off. Paw2 ships almost nothing turned on - no gaps,
+# no rounded corners, no blur, no shadows, no animations - so this file read
+# top to bottom is closer to "everything at once" than to a starting point.
+#
+# Three things are not decoration and so start on regardless: middle-click
+# paste, direct scanout, and the privileged-client allowlist.
+#
+# The one exception is the built-in fallback, which is what a first run writes
+# to config.toml and what Paw2 falls back to when your config cannot be parsed:
+# focus and swap windows with Super+h/j/k/l, nine workspaces on Super+1..9 and
+# Super+Shift+1..9, close on Super+q, quit on Super+Shift+Escape, and a
+# terminal on Super+Return. Those stay bound unless you rebind them.
 #
 # Most settings apply within about half a second of saving. Backend,
-# monitor position, VRR, startup focus, autostart, middle-click paste, Qt
+# monitor position, VRR, startup focus, autostart, privileged clients, Qt
 # style and font need a restart. An invalid save is reported and the last
 # working configuration keeps running.
 #
@@ -13,9 +26,11 @@
 # Sizes are logical pixels unless noted. Unknown keys are rejected, so a
 # typo names itself rather than being silently ignored.
 #
-# Anything in ~/.config/paw2/config.d/*.toml applies over this file, one
+# Anything in ~/.config/paw2/config.d/*.toml applies over config.toml, one
 # whole section at a time. See the README for how that works.
 
+# A layout has to put windows somewhere, so this section's defaults are the
+# values below rather than nothing.
 [layout]
 # Layouts available to cycling, in cycle order.
 # Choose from scrolling, dwindle, master_stack and monocle. At least one,
@@ -32,43 +47,52 @@ center_focused_column = false
 # Group tiled windows behind a clickable tab bar.
 tab_grouping = false
 
+# Every switch here defaults to off. With corner_radius at 0 and no
+# transparency, Paw2 skips the window shader entirely - that is the gaming
+# path, and it is what you get without this section.
 [appearance]
 # Logical pixels between windows and output edges.
-# At most 256.
+# At most 256. Default: 0.
 gaps = 15
-# The ring cannot be wider than the gap it sits in.
+# The ring cannot be wider than the gap it sits in. Default: 0, so a ring
+# needs gaps to sit in as well as a width.
 focus_ring_width = 1
 focus_ring_color = "#0b3d91"
 # Rounded window corners in logical pixels; zero disables them.
-# At most 64.
+# At most 64. Default: 0.
 corner_radius = 8
 # Drop shadow behind windows. The radius is how far it reaches past the window
 # in logical pixels; zero, or a fully transparent shadow, disables it.
 # Limits: radius at most 64, offsets between -64 and 64, opacity from 0.0
-# to 1.0.
+# to 1.0. Default: radius 0, so no shadow.
 shadow_radius = 12
 shadow_color = "#000000"
 shadow_opacity = 0.45
 shadow_offset_x = 0
 shadow_offset_y = 4
-# Smooth backdrop blur behind translucent windows.
+# Smooth backdrop blur behind translucent windows. Default: false.
 blur = true
-# At most 64. Zero also disables it.
+# At most 64. Zero also disables it. Default: 0.
 blur_radius = 8
 # Compositor-set window opacity. Applies to windows only, never to layer
 # surfaces such as bars and wallpapers, and never to the cursor.
+# Default: false.
 transparency = true
-# From 0.1 to 1.0.
+# From 0.1 to 1.0. Default: 1.0.
 opacity = 0.95
 
 # Window movement and resize animations. The duration is in milliseconds,
 # at most 5000; the slowdown multiplier runs from 0.1 to 100.0.
+# Default: disabled, at these same timings - so `enabled = true` alone is
+# enough to switch them on.
 [animations]
 enabled = true
 duration_ms = 150
 # Multiplier for watching animations in slow motion; 3.0 runs them 3x slower.
 slowdown = 1.0
 
+# How the overview draws itself once you bind toggle_overview; the values
+# below are also its defaults.
 [overview]
 # How far the workspaces shrink when the overview opens. 0.5 is half size.
 # Between 0.2 and 0.75.
@@ -81,9 +105,12 @@ backdrop_color = "#1c1c1c"
 scratchpad_position = "centered"
 
 [input]
-# Focus windows as the pointer enters them without moving the workspace viewport.
+# Focus windows as the pointer enters them without moving the workspace
+# viewport. Default: false.
 focus_follows_mouse = false
-# Expose Wayland primary selection for middle-click paste.
+# Expose Wayland primary selection for middle-click paste. Default: true.
+# Turning it off applies on save for new clients and for XWayland; a clipboard
+# manager that already bound ext-data-control keeps its access until restart.
 middle_click_paste = true
 
 # Desktop theme values are optional. Cursor, GTK and icon changes apply live;
@@ -100,7 +127,8 @@ middle_click_paste = true
 # Hand-edited only. paw2-shell never writes this section, so drm_device and
 # connector stay yours for fixing a machine that will not start.
 [backend]
-# Automatically scan out compatible fullscreen buffers on the DRM primary plane.
+# Automatically scan out compatible fullscreen buffers on the DRM primary
+# plane. Default: true - this one is a gaming path, not decoration.
 direct_scanout = true
 # Pin the GPU or the single output to drive. An absolute path is required
 # for the device, and a pinned connector cannot be combined with the
@@ -135,6 +163,7 @@ direct_scanout = true
 # without an entry. Matched against the basename of the connecting process's
 # executable, so a clipboard history tool needs whatever binary actually
 # connects - for `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
+# The four below are also the default; naming this key replaces the list.
 privileged_clients = [
   "xdg-desktop-portal-wlr",
   "xdg-desktop-portal",
@@ -172,6 +201,12 @@ commands = [
 # fire once per detent and are consumed; touchpad scrolling is untouched.
 # No trigger may be assigned to two actions. Only tab_group_drag takes a
 # mouse button, and it requires one.
+#
+# An action you do not name here is unbound, with one exception: the fallback
+# set - focus_left/right/up/down, swap_left/right/up/down, close_window, quit,
+# the nine workspace switch and move slots, and Super+Return - keeps its keys
+# unless you name it and give it different ones. Name it with an empty list to
+# take even those away.
 [bindings]
 focus_left = ["Super+h", "Super+Left"]
 focus_right = ["Super+l", "Super+Right"]

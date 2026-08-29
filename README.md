@@ -22,7 +22,7 @@ Paw2 is early software. Expect rough edges.
 - [Features](#features)
 - [Install](#install)
 - [Running](#running)
-- [Default keys](#default-keys)
+- [Keys](#keys)
 - [Configuration](#configuration)
 - [Layouts](#layouts)
 - [Overview and scratchpads](#overview-and-scratchpads)
@@ -97,6 +97,7 @@ install -Dm755 target/release/paw2 /usr/local/bin/paw2
 install -Dm644 packaging/paw2.desktop /usr/share/wayland-sessions/paw2.desktop
 install -Dm644 packaging/paw2-portals.conf /usr/share/xdg-desktop-portal/paw2-portals.conf
 install -Dm644 packaging/paw2-session.target /usr/lib/systemd/user/paw2-session.target
+install -Dm644 EXAMPLE.toml /usr/share/doc/paw2/EXAMPLE.toml
 ```
 
 Then, as your normal user:
@@ -133,19 +134,25 @@ virtual terminals.
 
 ---
 
-## Default keys
+## Keys
 
-`Super` is the modifier throughout. Everything here is remappable — see
+`Super` is the modifier throughout, and everything here is remappable — see
 [Bindings](#bindings).
+
+Paw2 binds almost none of this out of the box. Rows marked **†** are the
+built-in fallback — enough to move around, open a terminal and log out again,
+and the only keys that survive a config that fails to parse. Everything else
+waits until you bind it in `config.toml`;
+[`EXAMPLE.toml`](EXAMPLE.toml) has the keys below ready to copy.
 
 ### Windows
 
 | Keys | Action |
 | --- | --- |
-| `Super+h/j/k/l` or arrows | Focus left / down / up / right |
-| `Super+Shift+` those | Swap the focused window that way |
+| `Super+h/j/k/l` or arrows **†** | Focus left / down / up / right |
+| `Super+Shift+` those **†** | Swap the focused window that way |
 | `Super+Ctrl+` those | Resize the column or row by 5% |
-| `Super+q`, `Super+BackSpace` | Close window |
+| `Super+q`, `Super+BackSpace` **†** | Close window |
 | `Super+Shift+space` | Toggle floating |
 | `Super+Shift+f` | Toggle fullscreen |
 | `Super+backslash` | Cycle preset column widths |
@@ -156,8 +163,8 @@ virtual terminals.
 | Keys | Action |
 | --- | --- |
 | `Super+Tab` | Cycle layout |
-| `Super+1`–`9` | Switch workspace |
-| `Super+Shift+1`–`9` | Move window to workspace |
+| `Super+1`–`9` **†** | Switch workspace |
+| `Super+Shift+1`–`9` **†** | Move window to workspace |
 | `Super+Page_Up` / `Page_Down` | Previous / next workspace |
 | `Super+,` / `Super+.` | Focus monitor left / right |
 | `Super+Shift+,` / `Super+Shift+.` | Move window to that monitor |
@@ -178,26 +185,37 @@ virtual terminals.
 
 | Keys | Action |
 | --- | --- |
-| `Super+LeftDrag` | Move a window, or resize from an edge or divider |
-| `Super+Return` | Terminal (`kitty --single-instance` by default) |
-| `Super+Shift+Escape` | Quit Paw2 |
+| `Super+LeftDrag` **†** | Move a window, or resize from an edge or divider. Built into the pointer, not a binding |
+| `Super+Return` **†** | Terminal (`kitty --single-instance`) |
+| `Super+Shift+Escape` **†** | Quit Paw2 |
 
 ---
 
 ## Configuration
 
 On first run Paw2 writes `paw2/config.toml` under `$XDG_CONFIG_HOME` (normally
-`~/.config/paw2/config.toml`). It is a copy of **[`EXAMPLE.toml`](EXAMPLE.toml)**
-— every option Paw2 accepts, annotated, with the hardware-specific sections
-commented out. Read that file for the literal values and copy from it; this
-section explains what they mean.
+`~/.config/paw2/config.toml`). It holds the built-in fallback and nothing else:
+window and workspace navigation, close, quit and a terminal. **Everything you
+do not set is off** — no gaps, no rounded corners, no blur, no shadows, no
+animations, and none of the other actions bound. The exceptions are
+`middle_click_paste`, `direct_scanout` and `privileged_clients`, which are not
+decoration and so start on.
+
+**[`EXAMPLE.toml`](EXAMPLE.toml)** (installed as
+`/usr/share/doc/paw2/EXAMPLE.toml`) is the reference: every option Paw2 accepts,
+annotated, set to a working value with its default noted beside it. Copy the
+parts you want; this section explains what they mean.
+
+The fallback is also what Paw2 runs when your config cannot be parsed, so those
+keys always work. Rebinding one in `config.toml` replaces it; giving it an empty
+list takes it away.
 
 Most settings reload **within about half a second of saving**. An invalid save
 is reported and the last working configuration keeps running.
 
 | Reloads live | Needs a restart |
 | --- | --- |
-| Bindings, commands, layout, appearance, animations, overview, `focus_follows_mouse`, monitor resolution / refresh / scale / transform, cursor / GTK / icon theme | Backend, monitor position, VRR, `focus_at_startup`, autostart, `middle_click_paste`, Qt style and font |
+| Bindings, commands, layout, appearance, animations, overview, `focus_follows_mouse`, `middle_click_paste`, monitor resolution / refresh / scale / transform, cursor / GTK / icon theme | Backend, monitor position, VRR, `focus_at_startup`, autostart, `privileged_clients`, Qt style and font |
 
 Colours are `#RRGGBB` — six hex digits, no alpha and no shorthand. Sizes are
 logical pixels unless noted. Unknown keys are rejected rather than ignored, so a
@@ -217,18 +235,18 @@ typo names itself.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `gaps` | `15` | Space between windows and output edges. At most `256`. |
-| `focus_ring_width` | `1` | Ring around the focused window. Cannot exceed `gaps`; `0` disables it. |
+| `gaps` | `0` | Space between windows and output edges. At most `256`. |
+| `focus_ring_width` | `0` | Ring around the focused window. Cannot exceed `gaps`; `0` disables it. |
 | `focus_ring_color` | `#0b3d91` | Ring colour. |
-| `corner_radius` | `8` | Rounded window corners. At most `64`; `0` disables. |
-| `shadow_radius` | `12` | How far the shadow reaches past the window. At most `64`; `0` disables. |
+| `corner_radius` | `0` | Rounded window corners. At most `64`; `0` disables. |
+| `shadow_radius` | `0` | How far the shadow reaches past the window. At most `64`; `0` disables. |
 | `shadow_color` | `#000000` | Shadow colour. |
 | `shadow_opacity` | `0.45` | `0.0`–`1.0`. Fully transparent also disables the shadow. |
 | `shadow_offset_x` / `_y` | `0` / `4` | Between `-64` and `64`. |
-| `blur` | `true` | Backdrop blur behind translucent windows. |
-| `blur_radius` | `8` | At most `64`; `0` also disables it. |
-| `transparency` | `true` | Compositor-set window transparency. |
-| `opacity` | `0.95` | `0.1`–`1.0`. |
+| `blur` | `false` | Backdrop blur behind translucent windows. |
+| `blur_radius` | `0` | At most `64`; `0` also disables it. |
+| `transparency` | `false` | Compositor-set window transparency. |
+| `opacity` | `1.0` | `0.1`–`1.0`. |
 
 Transparency and blur apply to window areas that clients do not declare opaque,
 clipped to the XDG window geometry. Protocol-aware clients can request their own
@@ -239,7 +257,7 @@ wallpapers, or to the cursor.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Window movement and resize animations. |
+| `enabled` | `false` | Window movement and resize animations. |
 | `duration_ms` | `150` | At most `5000`. |
 | `slowdown` | `1.0` | Multiplies the duration. `0.1`–`100.0`, for watching in slow motion. |
 
@@ -255,7 +273,7 @@ wallpapers, or to the cursor.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `focus_follows_mouse` | `false` | Focus windows as the pointer enters them. Never scrolls the viewport or raises floating windows. |
-| `middle_click_paste` | `true` | Exposes the Wayland and X11 primary selection. Disabling it does not swallow ordinary middle clicks. |
+| `middle_click_paste` | `true` | Exposes the Wayland and X11 primary selection. Disabling it does not swallow ordinary middle clicks, and applies on save — though a clipboard manager already bound to `ext-data-control` keeps its access until Paw2 restarts. |
 
 ### `[theme]`
 
@@ -339,9 +357,11 @@ Each entry describes one application window. None are configured by default.
 
 ### Bindings
 
-Every action takes a list of trigger strings; an empty list disables it.
-[`EXAMPLE.toml`](EXAMPLE.toml) lists all 39 of them with their defaults, and
-[Default keys](#default-keys) above shows what they do.
+Every action takes a list of trigger strings; an empty list disables it. An
+action you never name is unbound, unless it is in the fallback set — those keep
+their keys until you name them. [`EXAMPLE.toml`](EXAMPLE.toml) lists all 39
+actions with a working trigger for each, and [Keys](#keys) above shows what
+they do.
 
 Modifiers are `Ctrl` (or `Control`), `Alt`, `Shift` and `Super` (or `logo`),
 joined with `+`. The trigger is an X keysym name, or one of `WheelScrollUp`,

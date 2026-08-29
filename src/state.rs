@@ -92,6 +92,10 @@ pub struct Paw2 {
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    /// Read by the primary-selection global's visibility filter on every bind,
+    /// so `[input] middle_click_paste` takes effect on save. See
+    /// [`Paw2::set_middle_click_paste`] for what a live change does not reach.
+    primary_selection_enabled: Arc<AtomicBool>,
     pub data_control_state: DataControlState,
     pub _viewporter_state: ViewporterState,
     pub _single_pixel_buffer_state: SinglePixelBufferState,
@@ -161,9 +165,13 @@ impl Paw2 {
         PointerConstraintsState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let middle_click_paste = config.input.middle_click_paste;
+        // Shared rather than captured by value: the filter runs on every bind,
+        // so reading it live is what lets the setting apply without a restart.
+        let primary_selection_enabled = Arc::new(AtomicBool::new(middle_click_paste));
+        let enabled = Arc::clone(&primary_selection_enabled);
         let primary_selection_state =
             PrimarySelectionState::new_with_filter::<Self, _>(&display_handle, move |_| {
-                middle_click_paste
+                enabled.load(Ordering::Relaxed)
             });
         // Clipboard managers read every copy the moment it happens, so this sits
         // behind the same allowlist as the window list rather than being there
@@ -217,6 +225,7 @@ impl Paw2 {
             seat_state,
             data_device_state,
             primary_selection_state,
+            primary_selection_enabled,
             data_control_state,
             _viewporter_state: viewporter_state,
             _single_pixel_buffer_state: single_pixel_buffer_state,
@@ -244,6 +253,20 @@ impl Paw2 {
     pub fn begin_shutdown(&mut self) {
         start_shutdown();
         self.loop_signal.stop();
+    }
+
+    /// Follow `[input] middle_click_paste` after a reload.
+    ///
+    /// The primary-selection global's filter reads the shared flag on every
+    /// bind, and `xwayland.rs` reads `self.config` per call, so both follow
+    /// immediately. Two things do not: a client already holding the global
+    /// keeps it, and `ext-data-control`'s primary-selection arm was decided
+    /// when `DataControlState` was built. So turning it off shuts the door on
+    /// everything new, but a privileged clipboard manager that bound at startup
+    /// keeps its access until Paw2 restarts.
+    pub fn set_middle_click_paste(&self, enabled: bool) {
+        self.primary_selection_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn enable_background_effects(&mut self) {

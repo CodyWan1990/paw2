@@ -24,10 +24,73 @@ const OVERLAY_DIR: &str = "config.d";
 pub(crate) const NUMBERED_SCRATCHPAD_COUNT: usize = 9;
 pub(crate) const NUMBERED_SCRATCHPAD_PREFIX: &str = "__paw2_numbered_";
 
-/// The annotated file at the repo root, which is also what a first run writes
-/// to `config.toml`. One copy: editing it changes the shipped defaults, the
-/// merge base and the example users read, together.
-const DEFAULT_CONFIG: &str = include_str!("../EXAMPLE.toml");
+/// What Paw2 runs with no configuration: the base layer of every merge, the
+/// config a first run writes, and what it falls back to when the user's config
+/// cannot be parsed. Deliberately no more than enough to not be stuck - move
+/// between windows and workspaces, open a terminal, close a window, log out.
+///
+/// Everything else stays off until a config turns it on. `EXAMPLE.toml` at the
+/// repo root is the annotated reference for what can be turned on; it is
+/// documentation, not what Paw2 ships as settings.
+///
+/// The `Default` impls below have to produce exactly this, because a
+/// `config.d/` drop-in that owns a section whole never sees this text.
+/// `the_fallback_and_the_compiled_defaults_agree` holds the two together.
+const FALLBACK_CONFIG: &str = r#"# Paw2's built-in fallback: enough to move around, open a terminal and log
+# out again. Almost everything Paw2 can do beyond this is off until you turn it
+# on here - gaps, rounded corners, blur, shadows, animations, the overview,
+# scratchpads, and the rest of the keybindings.
+#
+# The exceptions are the three sections at the bottom. Primary selection,
+# fullscreen scanout and the privileged-client allowlist are not decoration:
+# a session missing them reads as broken rather than as minimal.
+#
+# The annotated reference for all of it is /usr/share/doc/paw2/EXAMPLE.toml.
+
+[bindings]
+focus_left = ["Super+h", "Super+Left"]
+focus_right = ["Super+l", "Super+Right"]
+focus_up = ["Super+k", "Super+Up"]
+focus_down = ["Super+j", "Super+Down"]
+swap_left = ["Super+Shift+h", "Super+Shift+Left"]
+swap_right = ["Super+Shift+l", "Super+Shift+Right"]
+swap_up = ["Super+Shift+k", "Super+Shift+Up"]
+swap_down = ["Super+Shift+j", "Super+Shift+Down"]
+close_window = ["Super+q", "Super+BackSpace"]
+quit = ["Super+Shift+Escape"]
+
+# Triggers mapped to argv arrays, launched on press.
+[bindings.commands]
+"Super+Return" = ["kitty", "--single-instance"]
+
+# Nine workspaces per monitor. switch and move take exactly nine lists each.
+[bindings.workspace]
+switch = [
+  ["Super+1"], ["Super+2"], ["Super+3"],
+  ["Super+4"], ["Super+5"], ["Super+6"],
+  ["Super+7"], ["Super+8"], ["Super+9"],
+]
+move = [
+  ["Super+Shift+1"], ["Super+Shift+2"], ["Super+Shift+3"],
+  ["Super+Shift+4"], ["Super+Shift+5"], ["Super+Shift+6"],
+  ["Super+Shift+7"], ["Super+Shift+8"], ["Super+Shift+9"],
+]
+
+[input]
+focus_follows_mouse = false
+middle_click_paste = true
+
+[backend]
+direct_scanout = true
+
+[security]
+privileged_clients = [
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal",
+  "wl-paste",
+  "wl-copy",
+]
+"#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -143,8 +206,9 @@ impl LayoutMode {
 }
 
 /// Every field defaults, so a `config.d/` drop-in that owns `[layout]` may name
-/// only the keys it has a control for. The values match `DEFAULT_CONFIG`, which
-/// `parses_the_default_config` holds them to.
+/// only the keys it has a control for. Unlike the cosmetic sections these
+/// defaults are not "off": a layout has to place windows somewhere, and
+/// `enabled_layouts` may not be empty.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutConfig {
@@ -236,6 +300,10 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             focus_follows_mouse: false,
+            // Primary selection is what every other desktop does; a session
+            // that silently lost middle-click paste reads as broken, not as
+            // minimal. It sits with `direct_scanout` and `privileged_clients`
+            // on the short list of defaults that are not decoration.
             middle_click_paste: true,
         }
     }
@@ -376,14 +444,13 @@ impl Config {
         let restart_required = self.backend != updated.backend
             || monitors_require_restart(&self.monitors, &updated.monitors)
             || self.autostart != updated.autostart
-            || self.input.middle_click_paste != updated.input.middle_click_paste
             || self.security != updated.security
             || theme_requires_restart(&self.theme, &updated.theme);
         self.layout = updated.layout;
         self.appearance = updated.appearance;
         self.animations = updated.animations;
         self.overview = updated.overview;
-        self.input.focus_follows_mouse = updated.input.focus_follows_mouse;
+        self.input = updated.input;
         self.theme.cursor_theme = updated.theme.cursor_theme;
         self.theme.cursor_size = updated.theme.cursor_size;
         self.theme.icon_theme = updated.theme.icon_theme;
@@ -586,16 +653,15 @@ impl ConfigWatcher {
         Some((layers.len(), newest))
     }
 
-    /// Read every layer and merge it over the compiled defaults.
+    /// Read every layer and merge it over the compiled fallback.
     ///
-    /// Starting from `DEFAULT_CONFIG` rather than an empty document is what
-    /// makes a partial drop-in legal: `RawConfig` denies unknown fields and
-    /// requires `layout` and `bindings`, and the base layer always supplies
-    /// them. It also means the merged document is the complete effective
-    /// config, with no second copy of the defaults anywhere.
+    /// Starting from `FALLBACK_CONFIG` rather than an empty document is what
+    /// keeps the fallback bindings alive under a config that never mentions
+    /// them, and it means the merged document is the effective config - which
+    /// is what the shell is handed over IPC.
     fn read(layers: &[PathBuf]) -> io::Result<(toml::Value, Vec<String>)> {
         let mut document =
-            toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML");
+            toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML");
         let mut sources = Vec::with_capacity(layers.len());
         for (index, layer) in layers.iter().enumerate() {
             let source = fs::read_to_string(layer)
@@ -771,6 +837,7 @@ impl Binding {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default)]
     layout: LayoutConfig,
     #[serde(default)]
     appearance: RawAppearance,
@@ -792,6 +859,7 @@ struct RawConfig {
     overview: RawOverview,
     #[serde(default)]
     scratchpads: BTreeMap<String, RawScratchpad>,
+    #[serde(default)]
     bindings: RawBindings,
 }
 
@@ -840,19 +908,19 @@ struct RawAppearance {
 impl Default for RawAppearance {
     fn default() -> Self {
         Self {
-            gaps: 15,
-            focus_ring_width: 1,
+            gaps: 0,
+            focus_ring_width: 0,
             focus_ring_color: "#0b3d91".into(),
-            corner_radius: 8,
-            shadow_radius: 12,
+            corner_radius: 0,
+            shadow_radius: 0,
             shadow_color: "#000000".into(),
             shadow_opacity: 0.45,
             shadow_offset_x: 0,
             shadow_offset_y: 4,
-            blur: true,
-            blur_radius: 8,
-            transparency: true,
-            opacity: 0.95,
+            blur: false,
+            blur_radius: 0,
+            transparency: false,
+            opacity: 1.0,
         }
     }
 }
@@ -868,7 +936,7 @@ struct RawAnimations {
 impl Default for RawAnimations {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             duration_ms: 150,
             slowdown: 1.0,
         }
@@ -893,7 +961,7 @@ impl Default for RawOverview {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default)]
 struct RawBindings {
     /// Action name to key list, validated against `DEFAULT_BINDINGS`.
@@ -905,9 +973,31 @@ struct RawBindings {
     workspace: RawWorkspaceBindings,
 }
 
-/// Every directly bindable action: its config key and its out-of-the-box keys,
-/// space separated. An action the config does not mention keeps the keys listed
-/// here, so a config written before that action existed still gets it.
+impl Default for RawBindings {
+    fn default() -> Self {
+        Self {
+            actions: BTreeMap::new(),
+            // The one command in the fallback, so a `config.d/` drop-in that
+            // owns `[bindings]` cannot leave the session with no terminal.
+            commands: BTreeMap::from([(
+                "Super+Return".into(),
+                vec!["kitty".into(), "--single-instance".into()],
+            )]),
+            scratchpads: BTreeMap::new(),
+            numbered_scratchpads: RawNumberedScratchpadBindings::default(),
+            workspace: RawWorkspaceBindings::default(),
+        }
+    }
+}
+
+/// Every directly bindable action: its config key and its fallback keys, space
+/// separated. An action the config does not mention gets the keys listed here,
+/// which for everything outside [`FALLBACK_CONFIG`]'s set is nothing at all -
+/// unmentioned is unbound.
+///
+/// These have to stay in step with `FALLBACK_CONFIG`: that text is what a
+/// `config.toml` merges over, and this column is what a `config.d/` drop-in
+/// that owns `[bindings]` whole falls back to.
 #[rustfmt::skip]
 const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("focus_left",             Action::FocusLeft,            "Super+h Super+Left"),
@@ -918,15 +1008,15 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("swap_right",             Action::SwapRight,            "Super+Shift+l Super+Shift+Right"),
     ("swap_up",                Action::SwapUp,               "Super+Shift+k Super+Shift+Up"),
     ("swap_down",              Action::SwapDown,             "Super+Shift+j Super+Shift+Down"),
-    ("consume_or_expel_left",  Action::ConsumeOrExpelLeft,   "Super+bracketleft"),
-    ("consume_or_expel_right", Action::ConsumeOrExpelRight,  "Super+bracketright"),
-    ("tab_group_left",         Action::TabGroupLeft,          "Super+Shift+bracketleft"),
-    ("tab_group_right",        Action::TabGroupRight,         "Super+Shift+bracketright"),
-    ("previous_tab",           Action::PreviousTab,           "Super+Ctrl+bracketleft"),
-    ("next_tab",               Action::NextTab,               "Super+Ctrl+bracketright"),
-    ("tab_group_drag",         Action::TabGroupDrag,          "Super+Ctrl+MouseLeft"),
-    ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
-    ("cycle_layout",           Action::CycleLayout,          "Super+Tab"),
+    ("consume_or_expel_left",  Action::ConsumeOrExpelLeft,   ""),
+    ("consume_or_expel_right", Action::ConsumeOrExpelRight,  ""),
+    ("tab_group_left",         Action::TabGroupLeft,          ""),
+    ("tab_group_right",        Action::TabGroupRight,         ""),
+    ("previous_tab",           Action::PreviousTab,           ""),
+    ("next_tab",               Action::NextTab,               ""),
+    ("tab_group_drag",         Action::TabGroupDrag,          ""),
+    ("cycle_column_width",     Action::CycleColumnWidth,     ""),
+    ("cycle_layout",           Action::CycleLayout,          ""),
     ("switch_layout_scrolling", Action::SwitchLayout(LayoutMode::Scrolling), ""),
     ("switch_layout_dwindle", Action::SwitchLayout(LayoutMode::Dwindle), ""),
     ("switch_layout_master_stack", Action::SwitchLayout(LayoutMode::MasterStack), ""),
@@ -935,19 +1025,19 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
     ("decrease_row_height",    Action::DecreaseRowHeight,    ""),
     ("increase_row_height",    Action::IncreaseRowHeight,    ""),
-    ("toggle_floating",        Action::ToggleFloating,       "Super+Shift+space"),
+    ("toggle_floating",        Action::ToggleFloating,       ""),
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
-    ("toggle_fullscreen",      Action::ToggleFullscreen,     "Super+Shift+f"),
-    ("toggle_overview",        Action::ToggleOverview,       "Super+o"),
-    ("toggle_scratchpad_overview", Action::ToggleScratchpadOverview, "Super+Shift+o"),
-    ("focus_monitor_left",     Action::FocusMonitorLeft,     "Super+comma"),
-    ("focus_monitor_right",    Action::FocusMonitorRight,    "Super+period"),
+    ("toggle_fullscreen",      Action::ToggleFullscreen,     ""),
+    ("toggle_overview",        Action::ToggleOverview,       ""),
+    ("toggle_scratchpad_overview", Action::ToggleScratchpadOverview, ""),
+    ("focus_monitor_left",     Action::FocusMonitorLeft,     ""),
+    ("focus_monitor_right",    Action::FocusMonitorRight,    ""),
     ("focus_monitor_up",       Action::FocusMonitorUp,       ""),
     ("focus_monitor_down",     Action::FocusMonitorDown,     ""),
-    ("move_to_monitor_left",   Action::MoveToMonitorLeft,    "Super+Shift+comma"),
-    ("move_to_monitor_right",  Action::MoveToMonitorRight,   "Super+Shift+period"),
-    ("move_to_monitor_up",     Action::MoveToMonitorUp,      "Super+Ctrl+Shift+Up"),
-    ("move_to_monitor_down",   Action::MoveToMonitorDown,    "Super+Ctrl+Shift+Down"),
+    ("move_to_monitor_left",   Action::MoveToMonitorLeft,    ""),
+    ("move_to_monitor_right",  Action::MoveToMonitorRight,   ""),
+    ("move_to_monitor_up",     Action::MoveToMonitorUp,      ""),
+    ("move_to_monitor_down",   Action::MoveToMonitorDown,    ""),
     ("quit",                   Action::Quit,                 "Super+Shift+Escape"),
 ];
 
@@ -971,10 +1061,10 @@ impl Default for RawWorkspaceBindings {
             r#move: (1..=9)
                 .map(|number| vec![format!("Super+Shift+{number}")])
                 .collect(),
-            previous: vec!["Super+Page_Up".into()],
-            next: vec!["Super+Page_Down".into()],
-            move_previous: vec!["Super+Shift+Page_Up".into()],
-            move_next: vec!["Super+Shift+Page_Down".into()],
+            previous: Vec::new(),
+            next: Vec::new(),
+            move_previous: Vec::new(),
+            move_next: Vec::new(),
         }
     }
 }
@@ -989,12 +1079,8 @@ struct RawNumberedScratchpadBindings {
 impl Default for RawNumberedScratchpadBindings {
     fn default() -> Self {
         Self {
-            toggle: (1..=9)
-                .map(|number| vec![format!("Super+Alt+{number}")])
-                .collect(),
-            assign: (1..=9)
-                .map(|number| vec![format!("Super+Alt+Shift+{number}")])
-                .collect(),
+            toggle: vec![Vec::new(); NUMBERED_SCRATCHPAD_COUNT],
+            assign: vec![Vec::new(); NUMBERED_SCRATCHPAD_COUNT],
         }
     }
 }
@@ -1097,16 +1183,16 @@ pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
             // What Paw2 is running, so a shell has something to show beside the
             // error rather than an empty document.
             watcher.document =
-                toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML");
+                toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML");
             Ok((defaults(), watcher, Some(error)))
         }
     }
 }
 
 /// The compiled defaults, as a `Config`. Also the base layer of every merge,
-/// so `parse(DEFAULT_CONFIG)` is already covered by the tests.
+/// so `parse(FALLBACK_CONFIG)` is already covered by the tests.
 fn defaults() -> Config {
-    parse_value(toml::from_str(DEFAULT_CONFIG).expect("the compiled default config is valid TOML"))
+    parse_value(toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML"))
         .expect("the compiled default config is valid")
 }
 
@@ -1138,7 +1224,7 @@ fn create_default(path: &Path) -> io::Result<()> {
     }
 
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => file.write_all(DEFAULT_CONFIG.as_bytes()),
+        Ok(mut file) => file.write_all(FALLBACK_CONFIG.as_bytes()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
@@ -1184,7 +1270,10 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         return Err("appearance.gaps must be at most 256".into());
     }
     if raw.appearance.focus_ring_width > raw.appearance.gaps {
-        return Err("appearance.focus_ring_width cannot exceed appearance.gaps".into());
+        return Err(
+            "appearance.focus_ring_width cannot exceed appearance.gaps, which defaults to 0 - set gaps as well"
+                .into(),
+        );
     }
     if raw.appearance.blur_radius > 64 {
         return Err("appearance.blur_radius must be at most 64".into());
@@ -1621,7 +1710,13 @@ const PRIVILEGED: &str = r#"privileged_clients = [
   "wl-copy",
 ]"#;
 
-/// Appended to `DEFAULT_CONFIG` by the tests that need configured monitors.
+/// The annotated reference at the repo root. It names every option, so the
+/// tests use it as the document to mutate one value in - and compiling it here
+/// means a typo in the reference fails the test run.
+#[cfg(test)]
+const EXAMPLE_CONFIG: &str = include_str!("../EXAMPLE.toml");
+
+/// Appended to `EXAMPLE_CONFIG` by the tests that need configured monitors.
 #[cfg(test)]
 const MONITORS: &str = r#"
 [[monitors]]
@@ -1660,7 +1755,7 @@ mod tests {
 
     #[test]
     fn defaults_and_validation() {
-        let config = parse(DEFAULT_CONFIG).unwrap();
+        let config = parse(EXAMPLE_CONFIG).unwrap();
         assert_eq!(config.bindings.len(), 87);
         let one = xkb::keysym_from_name("1", xkb::KEYSYM_CASE_INSENSITIVE);
         assert_eq!(
@@ -1703,7 +1798,7 @@ mod tests {
             BTN_LEFT,
         ));
         let enabled =
-            parse(&DEFAULT_CONFIG.replace("tab_grouping = false", "tab_grouping = true")).unwrap();
+            parse(&EXAMPLE_CONFIG.replace("tab_grouping = false", "tab_grouping = true")).unwrap();
         assert_eq!(
             enabled.action(&group_modifiers, bracket_left),
             Some(Action::TabGroupLeft)
@@ -1717,7 +1812,7 @@ mod tests {
             BTN_LEFT,
         ));
         assert!(
-            parse(&DEFAULT_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.replace(
                 "tab_group_drag = [\"Super+Ctrl+MouseLeft\"]",
                 "tab_group_drag = [\"Super+Ctrl+x\"]",
             ))
@@ -1725,7 +1820,7 @@ mod tests {
             .contains("must use a mouse button")
         );
         assert!(
-            parse(&DEFAULT_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.replace(
                 "focus_left = [\"Super+h\", \"Super+Left\"]",
                 "focus_left = [\"Super+MouseRight\"]",
             ))
@@ -1753,7 +1848,7 @@ mod tests {
             ),
             Some(Action::ToggleOverview)
         );
-        let disabled = parse(&DEFAULT_CONFIG.replace(
+        let disabled = parse(&EXAMPLE_CONFIG.replace(
             "toggle_floating = [\"Super+Shift+space\"]",
             "toggle_floating = []",
         ))
@@ -1829,12 +1924,12 @@ mod tests {
             [28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0, 1.0]
         );
         assert!(
-            parse(&DEFAULT_CONFIG.replace("zoom = 0.5", "zoom = 0.9"))
+            parse(&EXAMPLE_CONFIG.replace("zoom = 0.5", "zoom = 0.9"))
                 .unwrap_err()
                 .contains("overview.zoom must be between")
         );
         assert!(
-            parse(&DEFAULT_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.replace(
                 r##"backdrop_color = "#1c1c1c""##,
                 r#"backdrop_color = "grey""#
             ))
@@ -1845,7 +1940,7 @@ mod tests {
             config.overview.scratchpad_position,
             ScratchpadOverviewPosition::Centered
         );
-        let left = parse(&DEFAULT_CONFIG.replace(
+        let left = parse(&EXAMPLE_CONFIG.replace(
             "scratchpad_position = \"centered\"",
             "scratchpad_position = \"left\"",
         ))
@@ -1857,7 +1952,7 @@ mod tests {
 
         // A config written before the overview existed still gets its defaults.
         let legacy_overview = parse(
-            &DEFAULT_CONFIG
+            &EXAMPLE_CONFIG
                 .replace("zoom = 0.5\n", "")
                 .replace(r##"backdrop_color = "#1c1c1c""##, ""),
         )
@@ -1876,7 +1971,7 @@ mod tests {
             ]
         );
         assert!(
-            parse(&DEFAULT_CONFIG.replace(PRIVILEGED, r#"privileged_clients = ["  "]"#))
+            parse(&EXAMPLE_CONFIG.replace(PRIVILEGED, r#"privileged_clients = ["  "]"#))
                 .unwrap_err()
                 .contains("cannot be empty")
         );
@@ -1886,7 +1981,7 @@ mod tests {
         assert_eq!(config.startup_monitor(), None);
         assert!(config.autostart.is_empty());
 
-        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let with_monitors = format!("{EXAMPLE_CONFIG}{MONITORS}");
         let monitored = parse(&with_monitors).unwrap();
         assert_eq!(monitored.monitors.len(), 2);
         assert_eq!(monitored.monitors[0].connector, "DP-2");
@@ -1896,7 +1991,7 @@ mod tests {
         assert_eq!(monitored.monitors[0].scale, 1.0);
         assert_eq!(monitored.monitors[1].transform, Transform::Normal);
         let default_scale = parse(&format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replace("scale = 1.0\n", "")
         ))
         .unwrap();
@@ -1933,14 +2028,14 @@ mod tests {
             None
         );
 
-        let invalid_width = DEFAULT_CONFIG.replace("column_width = 0.6", "column_width = 2.0");
+        let invalid_width = EXAMPLE_CONFIG.replace("column_width = 0.6", "column_width = 2.0");
         assert!(
             parse(&invalid_width)
                 .unwrap_err()
                 .contains("between 0.1 and 1.0")
         );
 
-        let no_layouts = DEFAULT_CONFIG.replace(
+        let no_layouts = EXAMPLE_CONFIG.replace(
             "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
             "enabled_layouts = []",
         );
@@ -1949,19 +2044,19 @@ mod tests {
                 .unwrap_err()
                 .contains("must not be empty")
         );
-        let duplicate_layout = DEFAULT_CONFIG.replace(
+        let duplicate_layout = EXAMPLE_CONFIG.replace(
             "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
             "enabled_layouts = [\"scrolling\", \"scrolling\"]",
         );
         assert!(parse(&duplicate_layout).unwrap_err().contains("duplicates"));
-        let unknown_layout = DEFAULT_CONFIG.replace("\"dwindle\"", "\"grid\"");
+        let unknown_layout = EXAMPLE_CONFIG.replace("\"dwindle\"", "\"grid\"");
         assert!(
             parse(&unknown_layout)
                 .unwrap_err()
                 .contains("unknown variant")
         );
 
-        let invalid_presets = DEFAULT_CONFIG.replace(
+        let invalid_presets = EXAMPLE_CONFIG.replace(
             "preset_column_widths = [0.33333, 0.5, 0.66667]",
             "preset_column_widths = []",
         );
@@ -1971,27 +2066,27 @@ mod tests {
                 .contains("preset_column_widths")
         );
 
-        let invalid_color = DEFAULT_CONFIG.replace("#0b3d91", "blue");
+        let invalid_color = EXAMPLE_CONFIG.replace("#0b3d91", "blue");
         assert!(parse(&invalid_color).unwrap_err().contains("#RRGGBB"));
 
-        let invalid_ring = DEFAULT_CONFIG.replace("focus_ring_width = 1", "focus_ring_width = 16");
+        let invalid_ring = EXAMPLE_CONFIG.replace("focus_ring_width = 1", "focus_ring_width = 16");
         assert!(parse(&invalid_ring).unwrap_err().contains("cannot exceed"));
 
-        let invalid_corner = DEFAULT_CONFIG.replace("corner_radius = 8", "corner_radius = 65");
+        let invalid_corner = EXAMPLE_CONFIG.replace("corner_radius = 8", "corner_radius = 65");
         assert!(
             parse(&invalid_corner)
                 .unwrap_err()
                 .contains("corner_radius")
         );
 
-        let invalid_shadow = DEFAULT_CONFIG.replace("shadow_radius = 12", "shadow_radius = 65");
+        let invalid_shadow = EXAMPLE_CONFIG.replace("shadow_radius = 12", "shadow_radius = 65");
         assert!(
             parse(&invalid_shadow)
                 .unwrap_err()
                 .contains("shadow_radius")
         );
 
-        let invalid_offset = DEFAULT_CONFIG.replace("shadow_offset_y = 4", "shadow_offset_y = -65");
+        let invalid_offset = EXAMPLE_CONFIG.replace("shadow_offset_y = 4", "shadow_offset_y = -65");
         assert!(
             parse(&invalid_offset)
                 .unwrap_err()
@@ -2001,66 +2096,66 @@ mod tests {
         // The colour error has to name the key that is wrong, not the first key
         // that happens to be a colour.
         let invalid_shadow_color =
-            DEFAULT_CONFIG.replace(r##"shadow_color = "#000000""##, r#"shadow_color = "black""#);
+            EXAMPLE_CONFIG.replace(r##"shadow_color = "#000000""##, r#"shadow_color = "black""#);
         assert!(
             parse(&invalid_shadow_color)
                 .unwrap_err()
                 .contains("shadow_color")
         );
 
-        let invalid_opacity = DEFAULT_CONFIG.replace("opacity = 0.95", "opacity = 1.5");
+        let invalid_opacity = EXAMPLE_CONFIG.replace("opacity = 0.95", "opacity = 1.5");
         assert!(parse(&invalid_opacity).unwrap_err().contains("opacity"));
 
-        let invalid_duration = DEFAULT_CONFIG.replace("duration_ms = 150", "duration_ms = 5001");
+        let invalid_duration = EXAMPLE_CONFIG.replace("duration_ms = 150", "duration_ms = 5001");
         assert!(
             parse(&invalid_duration)
                 .unwrap_err()
                 .contains("duration_ms")
         );
 
-        let invalid_slowdown = DEFAULT_CONFIG.replace("slowdown = 1.0", "slowdown = 0.0");
+        let invalid_slowdown = EXAMPLE_CONFIG.replace("slowdown = 1.0", "slowdown = 0.0");
         assert!(parse(&invalid_slowdown).unwrap_err().contains("slowdown"));
 
         // slowdown scales duration; the renderer only ever sees the product.
-        let slowed = DEFAULT_CONFIG.replace("slowdown = 1.0", "slowdown = 3.0");
+        let slowed = EXAMPLE_CONFIG.replace("slowdown = 1.0", "slowdown = 3.0");
         assert_eq!(
             parse(&slowed).unwrap().animations.duration,
             Duration::from_millis(450)
         );
 
         // Both switches independently disable their effect.
-        let no_blur = DEFAULT_CONFIG.replace("blur = true", "blur = false");
+        let no_blur = EXAMPLE_CONFIG.replace("blur = true", "blur = false");
         assert!(!parse(&no_blur).unwrap().appearance.blur_enabled());
-        let opaque = DEFAULT_CONFIG.replace("transparency = true", "transparency = false");
+        let opaque = EXAMPLE_CONFIG.replace("transparency = true", "transparency = false");
         assert_eq!(parse(&opaque).unwrap().appearance.window_opacity(), 1.0);
         let no_scanout =
-            parse(&DEFAULT_CONFIG.replace("direct_scanout = true", "direct_scanout = false"))
+            parse(&EXAMPLE_CONFIG.replace("direct_scanout = true", "direct_scanout = false"))
                 .unwrap();
         assert!(!no_scanout.backend.direct_scanout);
-        let mut active = parse(DEFAULT_CONFIG).unwrap();
+        let mut active = parse(EXAMPLE_CONFIG).unwrap();
         assert!(active.apply_runtime(no_scanout));
         assert!(active.backend.direct_scanout);
-        let no_animation = DEFAULT_CONFIG.replace("enabled = true", "enabled = false");
+        let no_animation = EXAMPLE_CONFIG.replace("enabled = true", "enabled = false");
         assert!(!parse(&no_animation).unwrap().animations.active());
 
         let themed = parse(&format!(
-            "{DEFAULT_CONFIG}\n[theme]\ncursor_theme = \"Oxygen_Zion\"\ncursor_size = 24\nicon_theme = \"Papirus-Dark\"\ngtk_theme = \"Breeze\"\nqt_style = \"Breeze\"\nfont = \"Sans 11\"\n"
+            "{EXAMPLE_CONFIG}\n[theme]\ncursor_theme = \"Oxygen_Zion\"\ncursor_size = 24\nicon_theme = \"Papirus-Dark\"\ngtk_theme = \"Breeze\"\nqt_style = \"Breeze\"\nfont = \"Sans 11\"\n"
         ))
         .unwrap();
         assert_eq!(themed.theme.cursor_size, Some(24));
         assert_eq!(themed.theme.qt_style.as_deref(), Some("Breeze"));
         assert!(
-            parse(&format!("{DEFAULT_CONFIG}\n[theme]\ncursor_size = 0\n"))
+            parse(&format!("{EXAMPLE_CONFIG}\n[theme]\ncursor_size = 0\n"))
                 .unwrap_err()
                 .contains("between 1 and 256")
         );
         assert!(
-            parse(&format!("{DEFAULT_CONFIG}\n[theme]\nfont = \" \"\n"))
+            parse(&format!("{EXAMPLE_CONFIG}\n[theme]\nfont = \" \"\n"))
                 .unwrap_err()
                 .contains("cannot be empty")
         );
 
-        let ambiguous = DEFAULT_CONFIG.replace(
+        let ambiguous = EXAMPLE_CONFIG.replace(
             "focus_right = [\"Super+l\", \"Super+Right\"]",
             "focus_right = [\"Super+h\"]",
         );
@@ -2070,21 +2165,21 @@ mod tests {
                 .contains("more than one action")
         );
 
-        let unknown_action = DEFAULT_CONFIG.replace("focus_left = ", "focus_lft = ");
+        let unknown_action = EXAMPLE_CONFIG.replace("focus_left = ", "focus_lft = ");
         assert!(
             parse(&unknown_action)
                 .unwrap_err()
                 .contains("unknown binding action")
         );
 
-        let invalid_binding = DEFAULT_CONFIG.replace("Super+h", "Hyper+h");
+        let invalid_binding = EXAMPLE_CONFIG.replace("Super+h", "Hyper+h");
         assert!(
             parse(&invalid_binding)
                 .unwrap_err()
                 .contains("unknown modifier")
         );
 
-        let wheel_bindings = DEFAULT_CONFIG
+        let wheel_bindings = EXAMPLE_CONFIG
             .replace(
                 "focus_left = [\"Super+h\", \"Super+Left\"]",
                 "focus_left = [\"Super+h\", \"Super+Left\", \"Super+WheelScrollUp\"]",
@@ -2135,7 +2230,7 @@ mod tests {
         );
 
         let invalid_transform = format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replacen("transform = \"normal\"", "transform = \"sideways\"", 1)
         );
         assert!(
@@ -2145,7 +2240,7 @@ mod tests {
         );
         for scale in ["0.0", "nan"] {
             let invalid_scale = format!(
-                "{DEFAULT_CONFIG}{}",
+                "{EXAMPLE_CONFIG}{}",
                 MONITORS.replacen("scale = 1.0", &format!("scale = {scale}"), 1)
             );
             assert!(
@@ -2156,7 +2251,7 @@ mod tests {
         }
 
         let duplicate = format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replace("connector = \"DP-1\"", "connector = \"DP-2\"")
         );
         assert!(
@@ -2166,7 +2261,7 @@ mod tests {
         );
 
         let startup_monitor = format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replace("# focus_at_startup = true", "focus_at_startup = true")
         );
         assert_eq!(
@@ -2183,9 +2278,11 @@ mod tests {
                 .contains("only one monitor")
         );
 
-        // A config predating every optional section still parses to the defaults.
-        let legacy = without_section(DEFAULT_CONFIG, "[appearance]");
+        // A config predating every optional section falls back to the compiled
+        // defaults, which are the off state - not to the reference's values.
+        let legacy = without_section(EXAMPLE_CONFIG, "[appearance]");
         let legacy = without_section(&legacy, "[animations]");
+        let legacy = without_section(&legacy, "[input]");
         let legacy = without_section(&legacy, "[security]");
         let legacy = without_section(&legacy, "[backend]")
             .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
@@ -2193,24 +2290,36 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 87);
-        // Whole-struct comparison: the built-in defaults and the values written
-        // into DEFAULT_CONFIG must not drift apart.
-        assert_eq!(legacy.appearance, config.appearance);
-        assert_eq!(legacy.animations, config.animations);
-        assert_eq!(legacy.input, config.input);
+        // `close_window` and `quit` are in the fallback set, so dropping them
+        // hands them back. `toggle_fullscreen` and `focus_monitor_left` are
+        // not, so dropping them leaves them unbound: 87 - 2.
+        assert_eq!(legacy.bindings.len(), 85);
+        // Whole-struct comparison: the built-in defaults and FALLBACK_CONFIG
+        // must not drift apart.
+        let fallback = parse(FALLBACK_CONFIG).unwrap();
+        assert_eq!(legacy.appearance, fallback.appearance);
+        assert_eq!(legacy.animations, fallback.animations);
+        assert_eq!(legacy.input, fallback.input);
         assert_eq!(legacy.backend, config.backend);
         assert_eq!(legacy.security, config.security);
         assert!(legacy.monitors.is_empty());
+        let logo = ModifiersState {
+            logo: true,
+            ..Default::default()
+        };
         assert_eq!(
             legacy.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("comma", xkb::KEYSYM_CASE_INSENSITIVE),
+                &logo,
+                xkb::keysym_from_name("q", xkb::KEYSYM_CASE_INSENSITIVE)
             ),
-            Some(Action::FocusMonitorLeft)
+            Some(Action::CloseWindow)
+        );
+        assert_eq!(
+            legacy.action(
+                &logo,
+                xkb::keysym_from_name("comma", xkb::KEYSYM_CASE_INSENSITIVE)
+            ),
+            None
         );
 
         let pre_workspace_config = r#"
@@ -2226,9 +2335,12 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 74);
+        // The four it names, the fallback keys for the actions it does not
+        // (focus/swap up and down, close, quit), the nine workspace switch and
+        // nine move slots, and the fallback terminal.
+        assert_eq!(config.bindings.len(), 4 + 11 + 18 + 1);
 
-        let old_monitor_bindings = DEFAULT_CONFIG
+        let old_monitor_bindings = EXAMPLE_CONFIG
             .replace(
                 "decrease_row_height = [\"Super+Ctrl+k\", \"Super+Ctrl+Up\"]\n",
                 "",
@@ -2247,7 +2359,7 @@ swap_right = ["Super+Shift+l"]
             );
         assert!(parse(&old_monitor_bindings).is_ok());
 
-        let invalid_workspaces = DEFAULT_CONFIG.replace(
+        let invalid_workspaces = EXAMPLE_CONFIG.replace(
             "  [\"Super+7\"], [\"Super+8\"], [\"Super+9\"],\n]",
             "  [\"Super+7\"], [\"Super+8\"],\n]",
         );
@@ -2256,7 +2368,7 @@ swap_right = ["Super+Shift+l"]
                 .unwrap_err()
                 .contains("exactly 9")
         );
-        let invalid_scratchpads = DEFAULT_CONFIG.replace(
+        let invalid_scratchpads = EXAMPLE_CONFIG.replace(
             "  [\"Super+Alt+7\"], [\"Super+Alt+8\"], [\"Super+Alt+9\"],\n]",
             "  [\"Super+Alt+7\"], [\"Super+Alt+8\"],\n]",
         );
@@ -2267,6 +2379,73 @@ swap_right = ["Super+Shift+l"]
         );
     }
 
+    /// The two halves of the fallback have to say the same thing: the
+    /// `FALLBACK_CONFIG` text, which a `config.toml` merges over, and the
+    /// `Default` impls, which are all a `config.d/` drop-in that owns a section
+    /// whole ever sees. Nothing else stops them drifting apart.
+    #[test]
+    fn the_fallback_and_the_compiled_defaults_agree() {
+        let fallback = parse(FALLBACK_CONFIG).unwrap();
+        let empty = parse("").unwrap();
+
+        assert_eq!(fallback.bindings, empty.bindings);
+        assert_eq!(fallback.binding_commands, empty.binding_commands);
+        assert_eq!(fallback.appearance, empty.appearance);
+        assert_eq!(fallback.animations, empty.animations);
+        assert_eq!(fallback.input, empty.input);
+        assert_eq!(fallback.layout, empty.layout);
+        assert_eq!(fallback.overview, empty.overview);
+        assert_eq!(fallback.backend, empty.backend);
+        assert_eq!(fallback.security, empty.security);
+    }
+
+    /// What a session that lost its config is left holding: move around, open a
+    /// terminal, close a window, log out. Nothing decorative, and nothing that
+    /// needs a second keypress to explain itself.
+    #[test]
+    fn the_fallback_is_navigation_and_a_terminal() {
+        let fallback = parse(FALLBACK_CONFIG).unwrap();
+
+        assert_eq!(fallback.appearance.gaps, 0);
+        assert_eq!(fallback.appearance.focus_ring_width, 0);
+        assert_eq!(fallback.appearance.corner_radius, 0);
+        assert!(!fallback.appearance.blur_enabled());
+        assert!(!fallback.appearance.shadow_enabled());
+        assert_eq!(fallback.appearance.window_opacity(), 1.0);
+        assert!(!fallback.animations.active());
+        // Not decoration, so the fallback keeps these three on.
+        assert!(fallback.input.middle_click_paste);
+        assert!(fallback.backend.direct_scanout);
+        assert_eq!(fallback.security, SecurityConfig::default());
+        assert!(fallback.autostart.is_empty());
+        assert!(fallback.scratchpads.is_empty());
+
+        assert_eq!(fallback.binding_commands, [["kitty", "--single-instance"]]);
+        // Four focus, four swap, close and quit; then nine workspace switch and
+        // nine move slots, and the terminal.
+        assert_eq!(fallback.bindings.len(), 8 * 2 + 2 + 1 + 18 + 1);
+
+        let logo = ModifiersState {
+            logo: true,
+            ..Default::default()
+        };
+        let key = |name| xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE);
+        assert_eq!(fallback.action(&logo, key("h")), Some(Action::FocusLeft));
+        assert_eq!(
+            fallback.action(&logo, key("1")),
+            Some(Action::SwitchWorkspace(0))
+        );
+        assert_eq!(fallback.action(&logo, key("q")), Some(Action::CloseWindow));
+        assert_eq!(
+            fallback.action(&logo, key("Return")),
+            Some(Action::LaunchCommand(0))
+        );
+        // Everything past "not stuck" waits for a config.
+        assert_eq!(fallback.action(&logo, key("o")), None);
+        assert_eq!(fallback.action(&logo, key("Tab")), None);
+        assert_eq!(fallback.action(&logo, key("backslash")), None);
+    }
+
     #[test]
     fn vrr_policy_matches_fullscreen_state() {
         assert!(!VrrPolicy::Never.enabled(true));
@@ -2274,7 +2453,7 @@ swap_right = ["Super+Shift+l"]
         assert!(VrrPolicy::Automatic.enabled(true));
         assert!(VrrPolicy::Always.enabled(false));
 
-        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let with_monitors = format!("{EXAMPLE_CONFIG}{MONITORS}");
         let config =
             parse(&with_monitors.replace("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
         assert_eq!(config.monitors[0].vrr, VrrPolicy::Never);
@@ -2290,7 +2469,7 @@ swap_right = ["Super+Shift+l"]
 
     #[test]
     fn parses_and_validates_autostart() {
-        let configured = DEFAULT_CONFIG.replace(
+        let configured = EXAMPLE_CONFIG.replace(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[\"swaybg\", \"-m\", \"fill\"], [\"waybar\"]]",
         );
@@ -2302,13 +2481,13 @@ swap_right = ["Super+Shift+l"]
             ]
         );
 
-        let empty = DEFAULT_CONFIG.replace(
+        let empty = EXAMPLE_CONFIG.replace(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[]]",
         );
         assert!(parse(&empty).unwrap_err().contains("contain an executable"));
 
-        let blank = DEFAULT_CONFIG.replace(
+        let blank = EXAMPLE_CONFIG.replace(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[\"  \"]]",
         );
@@ -2317,7 +2496,7 @@ swap_right = ["Super+Shift+l"]
 
     #[test]
     fn parses_and_validates_command_bindings() {
-        let configured = DEFAULT_CONFIG.replace(
+        let configured = EXAMPLE_CONFIG.replace(
             "# \"Super+d\" = [\"fuzzel\"]",
             "\"Super+d\" = [\"fuzzel\", \"--show-actions\"]",
         );
@@ -2340,15 +2519,15 @@ swap_right = ["Super+Shift+l"]
             Some(Action::LaunchCommand(1))
         );
 
-        let empty = DEFAULT_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = []");
+        let empty = EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = []");
         assert!(parse(&empty).unwrap_err().contains("contain an executable"));
 
         let blank =
-            DEFAULT_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = [\"  \"]");
+            EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = [\"  \"]");
         assert!(parse(&blank).unwrap_err().contains("contain an executable"));
 
         let duplicate =
-            DEFAULT_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+h\" = [\"fuzzel\"]");
+            EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+h\" = [\"fuzzel\"]");
         assert!(
             parse(&duplicate)
                 .unwrap_err()
@@ -2364,7 +2543,7 @@ swap_right = ["Super+Shift+l"]
             .as_nanos();
         let root = env::temp_dir().join(format!("paw2-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(root.join(OVERLAY_DIR)).unwrap();
-        fs::write(root.join("config.toml"), DEFAULT_CONFIG).unwrap();
+        fs::write(root.join("config.toml"), EXAMPLE_CONFIG).unwrap();
         root
     }
 
@@ -2424,9 +2603,8 @@ swap_right = ["Super+Shift+l"]
     #[test]
     fn the_last_drop_in_to_name_a_section_owns_it_whole() {
         let root = config_tree("overlay-order");
-        // Neither drop-in carries `layout` or `bindings`, which `RawConfig`
-        // requires: this only parses because the compiled defaults are the
-        // bottom layer.
+        // Neither drop-in carries `layout` or `bindings`; the compiled
+        // fallback is the bottom layer under both.
         fs::write(
             root.join(OVERLAY_DIR).join("10-first.toml"),
             "[appearance]\ngaps = 40\ncorner_radius = 3\n",
@@ -2443,7 +2621,7 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(config.appearance.gaps, 41);
         // ... whole: the earlier drop-in's corner_radius goes with it, back to
         // the compiled default rather than lingering under the new owner.
-        assert_eq!(config.appearance.corner_radius, 8);
+        assert_eq!(config.appearance.corner_radius, 0);
         // A section nobody claimed is still config.toml's.
         assert_eq!(config.layout.column_width, 0.6);
 
@@ -2456,7 +2634,7 @@ swap_right = ["Super+Shift+l"]
         // config.toml sets both halves of the section, as a hand-written one does.
         fs::write(
             root.join("config.toml"),
-            DEFAULT_CONFIG
+            EXAMPLE_CONFIG
                 .replace("gaps = 15", "gaps = 40")
                 .replace("focus_follows_mouse = false", "focus_follows_mouse = true")
                 .replace(
@@ -2545,7 +2723,7 @@ swap_right = ["Super+Shift+l"]
         // `autostart` with it - so the shell that would have shown the error
         // was the one thing that could not start.
         let root = config_tree("overlay-rejected");
-        // A fragment, not a whole config: every layer merges over DEFAULT_CONFIG.
+        // A fragment, not a whole config: every layer merges over FALLBACK_CONFIG.
         fs::write(
             root.join("config.toml"),
             "[autostart]\ncommands = [[\"qs\", \"-c\", \"paw2-shell\"]]\n",
@@ -2562,14 +2740,12 @@ swap_right = ["Super+Shift+l"]
         // is what a shell is shown.
         let config = watcher.base_only().unwrap();
         assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
-        assert_eq!(config.appearance.focus_ring_width, 1);
-        assert_eq!(
-            watcher.document()["appearance"]["focus_ring_width"].as_integer(),
-            Some(1)
-        );
+        assert_eq!(config.appearance.focus_ring_width, 0);
+        // The rejected section never reaches the document a shell is shown.
+        assert!(watcher.document().get("appearance").is_none());
 
         // Fixing the drop-in recovers the full merge, with config.toml untouched.
-        fs::write(&drop_in, "[appearance]\nfocus_ring_width = 3\n").unwrap();
+        fs::write(&drop_in, "[appearance]\ngaps = 40\nfocus_ring_width = 3\n").unwrap();
         let config = watcher.reload().unwrap().unwrap();
         assert_eq!(config.appearance.focus_ring_width, 3);
         assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
@@ -2587,7 +2763,7 @@ swap_right = ["Super+Shift+l"]
         let path = root.join("paw2/config.toml");
 
         create_default(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
+        assert_eq!(fs::read_to_string(&path).unwrap(), FALLBACK_CONFIG);
 
         fs::write(&path, "custom = true").unwrap();
         create_default(&path).unwrap();
@@ -2605,7 +2781,7 @@ swap_right = ["Super+Shift+l"]
         let root = env::temp_dir().join(format!("paw2-reload-test-{}-{nonce}", std::process::id()));
         let path = root.join("config.toml");
         fs::create_dir_all(&root).unwrap();
-        let with_monitors = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let with_monitors = format!("{EXAMPLE_CONFIG}{MONITORS}");
         fs::write(&path, &with_monitors).unwrap();
 
         let mut watcher = ConfigWatcher {
@@ -2653,11 +2829,16 @@ swap_right = ["Super+Shift+l"]
         assert!(active.apply_runtime(updated));
         assert_eq!(active.security, SecurityConfig::default());
 
+        // Turning primary selection off reaches the running config without a
+        // restart; `Paw2::set_middle_click_paste` carries it to the global.
         let updated = parse(
             &with_monitors.replace("middle_click_paste = true", "middle_click_paste = false"),
         )
         .unwrap();
-        assert!(active.apply_runtime(updated));
+        assert!(!active.apply_runtime(updated));
+        assert!(!active.input.middle_click_paste);
+        let updated = parse(&with_monitors).unwrap();
+        assert!(!active.apply_runtime(updated));
         assert!(active.input.middle_click_paste);
 
         let updated = parse(
@@ -2704,10 +2885,10 @@ swap_right = ["Super+Shift+l"]
 
     #[test]
     fn reloads_live_monitor_fields_but_preserves_restart_only_fields() {
-        let source = format!("{DEFAULT_CONFIG}{MONITORS}");
+        let source = format!("{EXAMPLE_CONFIG}{MONITORS}");
         let mut active = parse(&source).unwrap();
         let updated = parse(&format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS
                 .replacen("resolution = [2560, 1440]", "resolution = [1920, 1080]", 1)
                 .replacen("refresh = 120.0", "refresh = 144.0", 1)
@@ -2723,7 +2904,7 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(active.monitors[0].transform, Transform::_90);
 
         let updated = parse(&format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replacen("position = [0, 0]", "position = [100, 0]", 1)
         ))
         .unwrap();
@@ -2733,7 +2914,7 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(active.monitors[0].transform, Transform::Normal);
 
         let updated = parse(&format!(
-            "{DEFAULT_CONFIG}{}",
+            "{EXAMPLE_CONFIG}{}",
             MONITORS.replacen("vrr = \"automatic\"", "vrr = \"always\"", 1)
         ))
         .unwrap();
@@ -2745,7 +2926,7 @@ swap_right = ["Super+Shift+l"]
     fn parses_and_validates_scratchpads() {
         let source = format!(
             "{}\n[scratchpads.term]\ncommand = [\"kitty\", \"--class\", \"paw-term\"]\napp_id = \"paw-term\"\nedge = \"bottom\"\nsize = [70, 55]\nposition = [15, 20]\nmargin = 12\n",
-            DEFAULT_CONFIG.replace(
+            EXAMPLE_CONFIG.replace(
                 "# \"Super+grave\" = \"terminal\"",
                 "\"Super+grave\" = \"term\""
             )

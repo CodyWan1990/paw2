@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     apply_gsettings_updates(desktop_theme_changes);
                     let restart_required = state.config.apply_runtime(config);
+                    state.set_middle_click_paste(state.config.input.middle_click_paste);
                     state.reconcile_scratchpads();
                     state.reconcile_tab_grouping();
                     state.relayout(true);
@@ -101,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("reloaded configuration");
                     if restart_required {
                         tracing::warn!(
-                            "backend, monitor placement, VRR, startup focus, autostart, input protocol, Qt style, and font changes require restarting Paw2"
+                            "backend, monitor placement, VRR, startup focus, autostart, privileged clients, Qt style, and font changes require restarting Paw2"
                         );
                     }
                 }
