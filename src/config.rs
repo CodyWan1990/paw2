@@ -33,6 +33,8 @@ column_width = 0.6
 preset_column_widths = [0.33333, 0.5, 0.66667]
 # When false, the viewport moves only enough to reveal the focused column.
 center_focused_column = false
+# Group tiled windows behind a clickable tab bar.
+tab_grouping = false
 
 [appearance]
 # Logical pixels between windows and output edges.
@@ -148,6 +150,11 @@ swap_up = ["Super+Shift+k", "Super+Shift+Up"]
 swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
+tab_group_left = ["Super+Shift+bracketleft"]
+tab_group_right = ["Super+Shift+bracketright"]
+previous_tab = ["Super+Ctrl+bracketleft"]
+next_tab = ["Super+Ctrl+bracketright"]
+tab_group_drag = ["Super+Ctrl+MouseLeft"]
 cycle_column_width = ["Super+backslash"]
 cycle_layout = ["Super+Tab"]
 switch_layout_scrolling = []
@@ -210,6 +217,11 @@ pub enum Action {
     SwapDown,
     ConsumeOrExpelLeft,
     ConsumeOrExpelRight,
+    TabGroupLeft,
+    TabGroupRight,
+    PreviousTab,
+    NextTab,
+    TabGroupDrag,
     CycleColumnWidth,
     CycleLayout,
     SwitchLayout(LayoutMode),
@@ -295,6 +307,7 @@ pub struct LayoutConfig {
     pub column_width: f64,
     pub preset_column_widths: Vec<f64>,
     pub center_focused_column: bool,
+    pub tab_grouping: bool,
 }
 
 impl Default for LayoutConfig {
@@ -304,6 +317,7 @@ impl Default for LayoutConfig {
             column_width: 0.6,
             preset_column_widths: default_preset_column_widths(),
             center_focused_column: false,
+            tab_grouping: false,
         }
     }
 }
@@ -488,6 +502,7 @@ impl Config {
 
     pub fn action(&self, modifiers: &ModifiersState, keysym: Keysym) -> Option<Action> {
         self.triggered(modifiers, BindingTrigger::Key(keysym))
+            .filter(|action| self.layout.tab_grouping || !action.is_tab_grouping())
     }
 
     pub fn wheel_action(
@@ -496,6 +511,13 @@ impl Config {
         direction: ScrollDirection,
     ) -> Option<Action> {
         self.triggered(modifiers, BindingTrigger::Wheel(direction))
+            .filter(|action| self.layout.tab_grouping || !action.is_tab_grouping())
+    }
+
+    pub fn tab_group_drag(&self, modifiers: &ModifiersState, button: u32) -> bool {
+        self.layout.tab_grouping
+            && self.triggered(modifiers, BindingTrigger::Button(button))
+                == Some(Action::TabGroupDrag)
     }
 
     fn triggered(&self, modifiers: &ModifiersState, trigger: BindingTrigger) -> Option<Action> {
@@ -524,6 +546,19 @@ impl Config {
         self.scratchpads = updated.scratchpads;
         self.bindings = updated.bindings;
         restart_required
+    }
+}
+
+impl Action {
+    fn is_tab_grouping(self) -> bool {
+        matches!(
+            self,
+            Self::TabGroupLeft
+                | Self::TabGroupRight
+                | Self::PreviousTab
+                | Self::NextTab
+                | Self::TabGroupDrag
+        )
     }
 }
 
@@ -810,7 +845,12 @@ struct Binding {
 enum BindingTrigger {
     Key(Keysym),
     Wheel(ScrollDirection),
+    Button(u32),
 }
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollDirection {
@@ -836,6 +876,9 @@ impl Binding {
                 trigger = Some(match part.to_ascii_lowercase().as_str() {
                     "wheelscrollup" => BindingTrigger::Wheel(ScrollDirection::Up),
                     "wheelscrolldown" => BindingTrigger::Wheel(ScrollDirection::Down),
+                    "mouseleft" => BindingTrigger::Button(BTN_LEFT),
+                    "mouseright" => BindingTrigger::Button(BTN_RIGHT),
+                    "mousemiddle" => BindingTrigger::Button(BTN_MIDDLE),
                     _ => {
                         let keysym = xkb::keysym_from_name(part, xkb::KEYSYM_CASE_INSENSITIVE);
                         if keysym.raw() == keysyms::KEY_NoSymbol {
@@ -1027,6 +1070,11 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("swap_down",              Action::SwapDown,             "Super+Shift+j Super+Shift+Down"),
     ("consume_or_expel_left",  Action::ConsumeOrExpelLeft,   "Super+bracketleft"),
     ("consume_or_expel_right", Action::ConsumeOrExpelRight,  "Super+bracketright"),
+    ("tab_group_left",         Action::TabGroupLeft,          "Super+Shift+bracketleft"),
+    ("tab_group_right",        Action::TabGroupRight,         "Super+Shift+bracketright"),
+    ("previous_tab",           Action::PreviousTab,           "Super+Ctrl+bracketleft"),
+    ("next_tab",               Action::NextTab,               "Super+Ctrl+bracketright"),
+    ("tab_group_drag",         Action::TabGroupDrag,          "Super+Ctrl+MouseLeft"),
     ("cycle_column_width",     Action::CycleColumnWidth,     "Super+backslash"),
     ("cycle_layout",           Action::CycleLayout,          "Super+Tab"),
     ("switch_layout_scrolling", Action::SwitchLayout(LayoutMode::Scrolling), ""),
@@ -1597,6 +1645,20 @@ fn add_binding(
     action: Action,
 ) -> Result<(), String> {
     let binding = Binding::parse(value)?;
+    match (binding.trigger, action) {
+        (BindingTrigger::Button(_), Action::TabGroupDrag) => {}
+        (BindingTrigger::Button(_), _) => {
+            return Err(format!(
+                "binding `{value}` uses a mouse button for a non-drag action"
+            ));
+        }
+        (_, Action::TabGroupDrag) => {
+            return Err(format!(
+                "binding `{value}` for tab_group_drag must use a mouse button"
+            ));
+        }
+        _ => {}
+    }
     if let Some((_, existing_action)) = bindings.iter().find(|(item, _)| *item == binding) {
         if *existing_action != action {
             return Err(format!(
@@ -1704,7 +1766,53 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 64);
+        assert_eq!(config.bindings.len(), 69);
+        let group_modifiers = ModifiersState {
+            shift: true,
+            logo: true,
+            ..Default::default()
+        };
+        let bracket_left = xkb::keysym_from_name("bracketleft", xkb::KEYSYM_CASE_INSENSITIVE);
+        assert!(!config.layout.tab_grouping);
+        assert_eq!(config.action(&group_modifiers, bracket_left), None);
+        assert!(!config.tab_group_drag(
+            &ModifiersState {
+                ctrl: true,
+                logo: true,
+                ..Default::default()
+            },
+            BTN_LEFT,
+        ));
+        let enabled =
+            parse(&DEFAULT_CONFIG.replace("tab_grouping = false", "tab_grouping = true")).unwrap();
+        assert_eq!(
+            enabled.action(&group_modifiers, bracket_left),
+            Some(Action::TabGroupLeft)
+        );
+        assert!(enabled.tab_group_drag(
+            &ModifiersState {
+                ctrl: true,
+                logo: true,
+                ..Default::default()
+            },
+            BTN_LEFT,
+        ));
+        assert!(
+            parse(&DEFAULT_CONFIG.replace(
+                "tab_group_drag = [\"Super+Ctrl+MouseLeft\"]",
+                "tab_group_drag = [\"Super+Ctrl+x\"]",
+            ))
+            .unwrap_err()
+            .contains("must use a mouse button")
+        );
+        assert!(
+            parse(&DEFAULT_CONFIG.replace(
+                "focus_left = [\"Super+h\", \"Super+Left\"]",
+                "focus_left = [\"Super+MouseRight\"]",
+            ))
+            .unwrap_err()
+            .contains("non-drag action")
+        );
         assert_eq!(
             config.action(
                 &ModifiersState {
@@ -2152,7 +2260,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 64);
+        assert_eq!(legacy.bindings.len(), 69);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -2185,7 +2293,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 51);
+        assert_eq!(config.bindings.len(), 56);
 
         let old_monitor_bindings = DEFAULT_CONFIG
             .replace(

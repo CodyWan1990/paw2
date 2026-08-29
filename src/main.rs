@@ -85,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     apply_gsettings_updates(desktop_theme_changes);
                     let restart_required = state.config.apply_runtime(config);
                     state.reconcile_scratchpads();
+                    state.reconcile_tab_grouping();
                     state.relayout(true);
                     drm::redraw(state);
                     state.ipc.publish_config(

@@ -291,7 +291,7 @@ impl Paw2 {
             };
             let window_location = self
                 .window_render_state(&output, &root_id)
-                .map(|(geometry, _)| output_geometry.loc + geometry.loc);
+                .map(|state| output_geometry.loc + state.client.loc);
             let layer_location = || {
                 let layers = layer_map_for_output(&output);
                 let layer = layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;

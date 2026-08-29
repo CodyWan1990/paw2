@@ -16,6 +16,7 @@ of it, and Paw2 neither needs nor waits for it.
 - Wayland application rendering through XDG shell and linux-dmabuf
 - Rootless XWayland support for Steam and X11 games
 - Per-workspace scrolling, dwindle, master-stack, and monocle tiling layouts
+- Optional clickable tab groups for tiled windows in every layout
 - Centered client-sized launcher and dialog windows
 - Dedicated fullscreen path with scanout-friendly rendering and presentation timing
 - Automatic per-monitor VRR for fullscreen games
@@ -105,6 +106,7 @@ enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
 column_width = 0.6
 preset_column_widths = [0.33333, 0.5, 0.66667]
 center_focused_column = false
+tab_grouping = false
 
 [appearance]
 gaps = 15
@@ -175,6 +177,11 @@ swap_up = ["Super+Shift+k", "Super+Shift+Up"]
 swap_down = ["Super+Shift+j", "Super+Shift+Down"]
 consume_or_expel_left = ["Super+bracketleft"]
 consume_or_expel_right = ["Super+bracketright"]
+tab_group_left = ["Super+Shift+bracketleft"]
+tab_group_right = ["Super+Shift+bracketright"]
+previous_tab = ["Super+Ctrl+bracketleft"]
+next_tab = ["Super+Ctrl+bracketright"]
+tab_group_drag = ["Super+Ctrl+MouseLeft"]
 cycle_column_width = ["Super+backslash"]
 cycle_layout = ["Super+Tab"]
 switch_layout_scrolling = []
@@ -224,6 +231,13 @@ next = ["Super+Page_Down"]
 move_previous = ["Super+Shift+Page_Up"]
 move_next = ["Super+Shift+Page_Down"]
 ```
+
+Set `layout.tab_grouping = true` to enable session-only groups. The grouping
+bindings swallow the adjacent tiled window; repeating one while grouped expels
+the active tab in that direction. Tabs can also be selected with a left click
+or grouped by dropping one tiled window directly onto another with the
+configured `tab_group_drag` chord. Floating, fullscreen, and scratchpad windows
+are never grouped.
 
 Each `[scratchpads.NAME]` entry describes one application window. `command` is
 an argv array launched on first use, while `app_id` exactly matches either a

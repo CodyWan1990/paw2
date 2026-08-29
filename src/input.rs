@@ -144,7 +144,7 @@ impl PointerGrab<Paw2> for MouseGrab {
         event: &ButtonEvent,
     ) {
         handle.button(data, event);
-        if !handle.current_pressed().contains(&BTN_LEFT) {
+        if !handle.current_pressed().contains(&self.start_data.button) {
             // PointerGrab callbacks already hold Smithay's pointer lock. Use
             // the location delivered by motion instead of locking it again.
             data.finish_mouse_operation(&self.operation, self.location);
@@ -534,10 +534,57 @@ impl Paw2 {
                     return;
                 }
 
+                let modifiers = self.seat.get_keyboard().unwrap().modifier_state();
+                let tab = self.tab_at(location);
+                if event.state() == ButtonState::Pressed
+                    && !pointer.is_grabbed()
+                    && self.config.tab_group_drag(&modifiers, event.button_code())
+                    && let Some(window) = tab.clone().or_else(|| self.window_under(location))
+                {
+                    self.focus_output_at(location);
+                    self.focus_window(&window);
+                    if let Some(operation) = self.begin_tab_group_drag(window, location) {
+                        pointer.set_grab(
+                            self,
+                            MouseGrab {
+                                start_data: GrabStartData {
+                                    focus: None,
+                                    button: event.button_code(),
+                                    location,
+                                },
+                                operation,
+                                location,
+                            },
+                            serial,
+                            Focus::Clear,
+                        );
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button: event.button_code(),
+                                state: event.state(),
+                                serial,
+                                time: event.time_msec(),
+                            },
+                        );
+                        pointer.frame(self);
+                        return;
+                    }
+                }
+
+                if event.state() == ButtonState::Pressed
+                    && event.button_code() == BTN_LEFT
+                    && let Some(window) = tab
+                {
+                    self.focus_output_at(location);
+                    self.focus_window(&window);
+                    return;
+                }
+
                 if event.state() == ButtonState::Pressed
                     && event.button_code() == BTN_LEFT
                     && !pointer.is_grabbed()
-                    && self.seat.get_keyboard().unwrap().modifier_state().logo
+                    && modifiers.logo
                     && let Some(window) = self.window_under(location)
                 {
                     self.focus_output_at(location);

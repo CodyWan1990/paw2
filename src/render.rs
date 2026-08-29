@@ -3,6 +3,11 @@ use std::{
     collections::HashMap,
 };
 
+use fontdue::{
+    Font, FontSettings,
+    layout::{CoordinateSystem, HorizontalAlign, Layout, LayoutSettings, TextStyle, VerticalAlign},
+};
+
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -10,7 +15,7 @@ use smithay::{
             Bind, BlitFrame, Frame, FrameContext, Offscreen, Renderer, Texture, TextureFilter,
             element::{
                 AsRenderElements, Element, Id, Kind, RenderElement,
-                memory::MemoryRenderBufferRenderElement,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 solid::SolidColorRenderElement,
                 surface::WaylandSurfaceRenderElement,
                 utils::{
@@ -45,7 +50,7 @@ use smithay::{
 
 use crate::{
     config::AppearanceConfig,
-    layout::{is_exclusive_keyboard_layer, overview_screen_rect},
+    layout::{WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
     state::Paw2,
 };
 
@@ -329,6 +334,110 @@ fn zoomed(
     })
 }
 
+fn tab_buffer(
+    font: &Font,
+    size: Size<i32, Physical>,
+    scale: f32,
+    titles: &[String],
+    active: usize,
+    focus_color: [f32; 4],
+) -> MemoryRenderBuffer {
+    let width = size.w as usize;
+    let height = size.h as usize;
+    let mut pixels = vec![0_u8; width * height * 4];
+    let font_size = 13.0 * scale;
+    let padding = (8.0 * scale).round() as usize;
+    for (index, title) in titles.iter().enumerate() {
+        let start = index * width / titles.len();
+        let end = (index + 1) * width / titles.len();
+        let color = if index == active {
+            focus_color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+        } else {
+            [31, 31, 36, 255]
+        };
+        for y in 0..height {
+            for x in start..end {
+                let pixel = (y * width + x) * 4;
+                pixels[pixel..pixel + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+            }
+        }
+
+        let available = end.saturating_sub(start + padding * 2) as f32;
+        let title = fitted_tab_title(font, title, font_size, available);
+        let mut layout = Layout::new(CoordinateSystem::PositiveYDown);
+        layout.reset(&LayoutSettings {
+            x: (start + padding) as f32,
+            y: 0.0,
+            max_width: Some(available),
+            max_height: Some(height as f32),
+            horizontal_align: HorizontalAlign::Center,
+            vertical_align: VerticalAlign::Middle,
+            ..LayoutSettings::default()
+        });
+        layout.append(&[font], &TextStyle::new(&title, font_size, 0));
+        for glyph in layout.glyphs() {
+            let (_, coverage) = font.rasterize_config(glyph.key);
+            for glyph_y in 0..glyph.height {
+                for glyph_x in 0..glyph.width {
+                    let x = glyph.x.round() as i32 + glyph_x as i32;
+                    let y = glyph.y.round() as i32 + glyph_y as i32;
+                    if x < start as i32 || x >= end as i32 || y < 0 || y >= size.h {
+                        continue;
+                    }
+                    let alpha = coverage[glyph_y * glyph.width + glyph_x] as u16;
+                    let pixel = (y as usize * width + x as usize) * 4;
+                    for channel in &mut pixels[pixel..pixel + 3] {
+                        *channel = (((*channel as u16) * (255 - alpha) + 255 * alpha) / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Argb8888,
+        (size.w, size.h),
+        1,
+        Transform::Normal,
+        None,
+    )
+}
+
+fn fitted_tab_title(font: &Font, title: &str, size: f32, available: f32) -> String {
+    let clean = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let width = |text: &str| {
+        text.chars()
+            .map(|character| font.metrics(character, size).advance_width)
+            .sum::<f32>()
+    };
+    if width(&clean) <= available {
+        return clean;
+    }
+    let ellipsis = '…';
+    let limit = (available - font.metrics(ellipsis, size).advance_width).max(0.0);
+    let mut fitted = String::new();
+    let mut used = 0.0;
+    for character in clean.chars() {
+        let advance = font.metrics(character, size).advance_width;
+        if used + advance > limit {
+            break;
+        }
+        fitted.push(character);
+        used += advance;
+    }
+    fitted.push(ellipsis);
+    fitted
+}
+
 /// What the output is wiped to before anything is drawn: black behind a
 /// fullscreen window, the configured backdrop behind the overview's cards, and
 /// otherwise the near-black that shows through gaps.
@@ -369,6 +478,17 @@ pub struct Effects {
     /// is open.
     overview_shadows: [Option<(i32, PixelShaderElement)>; crate::layout::WORKSPACE_COUNT],
     overview_ring: Option<((i32, i32), PixelShaderElement)>,
+    tab_font: Font,
+    tab_buffers: HashMap<(String, usize), TabBuffer>,
+}
+
+struct TabBuffer {
+    size: Size<i32, Physical>,
+    scale: u64,
+    active: usize,
+    titles: Vec<String>,
+    generation: usize,
+    buffer: MemoryRenderBuffer,
 }
 
 impl Effects {
@@ -398,6 +518,12 @@ impl Effects {
             overview_cards: std::array::from_fn(|_| Id::new()),
             overview_shadows: std::array::from_fn(|_| None),
             overview_ring: None,
+            tab_font: Font::from_bytes(
+                include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+                FontSettings::default(),
+            )
+            .expect("bundled Noto Sans must be a valid font"),
+            tab_buffers: HashMap::new(),
         }
     }
 
@@ -530,10 +656,8 @@ impl Effects {
                 .transform_size(output.current_mode().unwrap().size),
         );
         let mut elements = Vec::with_capacity(space_elements.len() + 4);
-        elements.extend(
-            self.focus_ring(state, output)
-                .map(PawRenderElements::Shader),
-        );
+        let mut focus_ring = self.focus_ring(state, output);
+        let mut tab_elements = self.tab_elements(renderer, state, output, scale);
 
         let output_name = output.name();
         let mut shadowed = Vec::new();
@@ -546,7 +670,22 @@ impl Effects {
             if shadow.is_some() {
                 shadowed.push(element.id().clone());
             }
+            let focused = focus_ring
+                .as_ref()
+                .is_some_and(|(_, id)| id == element.id());
+            let tab = tab_elements
+                .iter()
+                .position(|(root, _)| root == element.id())
+                .map(|index| tab_elements.remove(index).1);
             elements.push(self.window_element(element, scale, window_state));
+            elements.extend(tab.map(PawRenderElements::Memory));
+            if focused {
+                elements.extend(
+                    focus_ring
+                        .take()
+                        .map(|(ring, _)| PawRenderElements::Shader(ring)),
+                );
+            }
             elements.extend(blur.into_iter().map(PawRenderElements::Blur));
             // Last, so it draws first and everything else lands on top of it.
             elements.extend(shadow.map(PawRenderElements::Shader));
@@ -557,6 +696,71 @@ impl Effects {
         self.shadows
             .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
         Ok(elements)
+    }
+
+    fn tab_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        state: &Paw2,
+        output: &Output,
+        scale: Scale<f64>,
+    ) -> Vec<(Id, MemoryRenderBufferRenderElement<GlesRenderer>)> {
+        let output_name = output.name();
+        let bars = state.tab_bars(output);
+        let active_ids = bars.iter().map(|bar| bar.id).collect::<Vec<_>>();
+        self.tab_buffers
+            .retain(|(name, id), _| *name != output_name || active_ids.contains(id));
+        bars.into_iter()
+            .filter_map(|bar| {
+                let size = bar.geometry.size.to_f64().to_physical(scale).to_i32_round();
+                if size.w <= 0 || size.h <= 0 {
+                    return None;
+                }
+                let key = (output_name.clone(), bar.id);
+                let scale_bits = scale.x.to_bits();
+                let cached = self.tab_buffers.get(&key).is_some_and(|cached| {
+                    cached.size == size
+                        && cached.scale == scale_bits
+                        && cached.active == bar.active
+                        && cached.titles == bar.titles
+                        && cached.generation == self.generation
+                });
+                if !cached {
+                    let buffer = tab_buffer(
+                        &self.tab_font,
+                        size,
+                        scale.x as f32,
+                        &bar.titles,
+                        bar.active,
+                        self.appearance.focus_ring_color,
+                    );
+                    self.tab_buffers.insert(
+                        key.clone(),
+                        TabBuffer {
+                            size,
+                            scale: scale_bits,
+                            active: bar.active,
+                            titles: bar.titles,
+                            generation: self.generation,
+                            buffer,
+                        },
+                    );
+                }
+                let buffer = &self.tab_buffers.get(&key)?.buffer;
+                let position = bar.geometry.loc.to_f64().to_physical(scale);
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    position,
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )
+                .ok()
+                .map(|element| (bar.root, element))
+            })
+            .collect()
     }
 
     fn scratchpad_overview_elements(
@@ -820,7 +1024,7 @@ impl Effects {
         &self,
         element: SpaceElements,
         scale: Scale<f64>,
-        window_state: Option<(Rectangle<i32, Logical>, f32)>,
+        window_state: Option<WindowRenderState>,
     ) -> PawRenderElements {
         let radius = self.appearance.corner_radius as f64 * scale.x;
         if !matches!(element, SpaceElements::Element(_)) || !window_effects(&self.appearance) {
@@ -829,7 +1033,12 @@ impl Effects {
         let Some(program) = self.window_program.clone() else {
             return PawRenderElements::Space(element);
         };
-        let Some((window, opacity)) = window_state else {
+        let Some(WindowRenderState {
+            client: window,
+            opacity,
+            ..
+        }) = window_state
+        else {
             return PawRenderElements::Space(element);
         };
         let window = window.to_f64().to_physical(scale).to_i32_round();
@@ -856,7 +1065,7 @@ impl Effects {
         element: &SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
         scale: Scale<f64>,
         output_bounds: Rectangle<i32, Physical>,
-        window_state: Option<(Rectangle<i32, Logical>, f32)>,
+        window_state: Option<WindowRenderState>,
     ) -> Vec<BlurElement> {
         if !self.appearance.blur_enabled() {
             return Vec::new();
@@ -880,7 +1089,11 @@ impl Effects {
                 })
                 .collect()
             } else if matches!(element, SpaceRenderElements::Element(_)) {
-                let Some((window_geometry, _)) = window_state else {
+                let Some(WindowRenderState {
+                    client: window_geometry,
+                    ..
+                }) = window_state
+                else {
                     return Vec::new();
                 };
                 let window_geometry = window_geometry.to_f64().to_physical(scale).to_i32_round();
@@ -917,14 +1130,14 @@ impl Effects {
             .collect()
     }
 
-    fn focus_ring(&mut self, state: &Paw2, output: &Output) -> Option<PixelShaderElement> {
+    fn focus_ring(&mut self, state: &Paw2, output: &Output) -> Option<(PixelShaderElement, Id)> {
         let appearance = self.appearance;
         let width = appearance.focus_ring_width;
         if width <= 0 || state.has_exclusive_keyboard_layer() {
             return None;
         }
         let program = self.ring_program.clone()?;
-        let mut window = state.focused_window_geometry(output)?;
+        let (mut window, root) = state.focused_window_render_state(output)?;
         window.loc -= state.output_geometry(output)?.loc;
         let area = ring_area(window, width);
         let ring = self.ring.get_or_insert_with(|| {
@@ -939,7 +1152,7 @@ impl Effects {
         });
         // Only bumps the commit counter when the area actually moved.
         ring.resize(area, None);
-        Some(ring.clone())
+        Some((ring.clone(), root))
     }
 
     /// The shadow for one window, or `None` for anything that is not a window's
@@ -949,14 +1162,14 @@ impl Effects {
         &mut self,
         output_name: &str,
         element: &Id,
-        window_state: Option<(Rectangle<i32, Logical>, f32)>,
+        window_state: Option<WindowRenderState>,
     ) -> Option<PixelShaderElement> {
         let appearance = self.appearance;
         if !appearance.shadow_enabled() {
             return None;
         }
         let program = self.shadow_program.clone()?;
-        let (window, _) = window_state?;
+        let window = window_state?.frame;
         let area = shadow_area(window, &appearance);
         let shadow = self
             .shadows
@@ -1719,5 +1932,18 @@ mod tests {
             (area.loc.x + area.size.w) - (window.loc.x + window.size.w),
             3
         );
+    }
+
+    #[test]
+    fn tab_titles_are_ellipsized_to_their_segment() {
+        let font = Font::from_bytes(
+            include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+            FontSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(fitted_tab_title(&font, "Paw2", 13.0, 200.0), "Paw2");
+        let fitted = fitted_tab_title(&font, "A very long window title", 13.0, 35.0);
+        assert!(fitted.ends_with('…'));
+        assert!(fitted.len() < "A very long window title".len());
     }
 }

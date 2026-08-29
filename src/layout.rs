@@ -53,6 +53,7 @@ enum Direction {
 
 pub const WORKSPACE_COUNT: usize = 9;
 const MIN_ROW_HEIGHT: i32 = 48;
+pub(crate) const TAB_BAR_HEIGHT: i32 = 24;
 /// Screen-space distance between workspace cards once the overview is fully
 /// open. It scales with the opening progress, so at rest the active card lands
 /// exactly on the output rectangle and the transition has no seam.
@@ -118,6 +119,21 @@ pub(crate) struct OverviewWorkspace {
     pub windows: Vec<OverviewWindow>,
 }
 
+pub(crate) struct TabBar {
+    pub id: usize,
+    pub root: Id,
+    pub geometry: Rectangle<i32, Logical>,
+    pub titles: Vec<String>,
+    pub active: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WindowRenderState {
+    pub client: Rectangle<i32, Logical>,
+    pub frame: Rectangle<i32, Logical>,
+    pub opacity: f32,
+}
+
 struct Column<T = Window> {
     windows: Vec<T>,
     row_weights: Vec<f64>,
@@ -127,11 +143,20 @@ struct Column<T = Window> {
 
 struct WindowGroup {
     windows: Vec<Window>,
+    tiled: Vec<Window>,
     row_weights: Vec<f64>,
     focused: usize,
     width: Option<f64>,
     fullscreen: Option<Window>,
     floating: bool,
+    tab_groups: Vec<TabGroup>,
+}
+
+#[derive(Clone)]
+struct TabGroup<T = Window> {
+    id: usize,
+    windows: Vec<T>,
+    active: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +192,7 @@ pub(crate) enum MouseOperation {
     },
     MoveTiled {
         window: Window,
+        tab_group: bool,
         origin_output: String,
         origin_workspace: usize,
         origin_geometry: Rectangle<i32, Logical>,
@@ -234,6 +260,7 @@ struct Workspace {
     /// rather than lose one window's focus.
     focused: Option<usize>,
     columns: Vec<Column>,
+    tab_groups: Vec<TabGroup>,
     offset: i32,
     fullscreen: Option<Window>,
     layout: LayoutMode,
@@ -249,6 +276,7 @@ impl Default for Workspace {
             windows: Vec::new(),
             focused: None,
             columns: Vec::new(),
+            tab_groups: Vec::new(),
             offset: 0,
             fullscreen: None,
             layout: LayoutMode::Scrolling,
@@ -287,17 +315,18 @@ impl Workspace {
         if group.floating {
             self.add(group.windows[0].clone(), true);
         } else {
-            let focused = group.windows.get(group.focused).cloned();
+            let focused = group.tiled.get(group.focused).cloned();
             self.windows.extend(group.windows.iter().cloned());
             self.columns.insert(
                 column_index.min(self.columns.len()),
                 Column {
-                    windows: group.windows,
+                    windows: group.tiled,
                     row_weights: group.row_weights,
                     focused: group.focused,
                     width: group.width,
                 },
             );
+            self.tab_groups.extend(group.tab_groups);
             self.focused = focused.and_then(|window| self.window_index(&window));
         }
         if self.fullscreen.is_none() {
@@ -320,6 +349,29 @@ impl Workspace {
     }
 
     fn focus_window(&mut self, window: &Window) {
+        if let Some(group_index) = self
+            .tab_groups
+            .iter()
+            .position(|group| group.windows.contains(window))
+        {
+            let group = &self.tab_groups[group_index];
+            let active = group.windows[group.active].clone();
+            let next = group
+                .windows
+                .iter()
+                .position(|item| item == window)
+                .unwrap();
+            if active != *window
+                && let Some(tile) = self
+                    .columns
+                    .iter_mut()
+                    .flat_map(|column| &mut column.windows)
+                    .find(|tile| **tile == active)
+            {
+                *tile = window.clone();
+                self.tab_groups[group_index].active = next;
+            }
+        }
         self.focused = self.window_index(window);
         if let Some(column) = self
             .columns
@@ -335,6 +387,13 @@ impl Workspace {
     }
 
     fn remove_from_column(&mut self, window: &Window) -> Option<Option<f64>> {
+        if let Some((active, width)) = self.detach_tab(window) {
+            return active.then_some(width);
+        }
+        self.remove_tile_from_column(window)
+    }
+
+    fn remove_tile_from_column(&mut self, window: &Window) -> Option<Option<f64>> {
         let column_index = self
             .columns
             .iter()
@@ -354,6 +413,166 @@ impl Workspace {
             self.columns.remove(column_index);
         }
         Some(width)
+    }
+
+    /// Removes one member without disturbing the tile occupied by the rest of
+    /// its group. The boolean says whether the removed member occupied that
+    /// tile, which callers need when turning only the active tab floating.
+    fn detach_tab(&mut self, window: &Window) -> Option<(bool, Option<f64>)> {
+        let group_index = self
+            .tab_groups
+            .iter()
+            .position(|group| group.windows.contains(window))?;
+        let member = self.tab_groups[group_index]
+            .windows
+            .iter()
+            .position(|item| item == window)?;
+        let active_window =
+            self.tab_groups[group_index].windows[self.tab_groups[group_index].active].clone();
+        let active = member == self.tab_groups[group_index].active;
+        let column_index = self
+            .columns
+            .iter()
+            .position(|column| column.windows.contains(&active_window));
+        let width = column_index.and_then(|index| self.columns[index].width);
+
+        let group = &mut self.tab_groups[group_index];
+        group.windows.remove(member);
+        group.active = focus_after_removal(Some(group.active), member, group.windows.len())
+            .unwrap_or_default();
+        if active
+            && let Some(column_index) = column_index
+            && let Some(tile) = self.columns[column_index]
+                .windows
+                .iter_mut()
+                .find(|tile| **tile == active_window)
+            && let Some(next) = group.windows.get(group.active)
+        {
+            *tile = next.clone();
+        }
+        if group.windows.len() < 2 {
+            self.tab_groups.remove(group_index);
+        }
+        Some((active, width))
+    }
+
+    fn tab_group_index(&self, window: &Window) -> Option<usize> {
+        self.tab_groups
+            .iter()
+            .position(|group| group.windows.contains(window))
+    }
+
+    fn cycle_tab(&mut self, delta: i32) -> bool {
+        let focused = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .cloned();
+        let Some(group_index) = focused
+            .as_ref()
+            .and_then(|window| self.tab_group_index(window))
+        else {
+            return false;
+        };
+        let len = self.tab_groups[group_index].windows.len();
+        let current = self.tab_groups[group_index].active as i32;
+        let next = (current + delta).rem_euclid(len as i32) as usize;
+        let window = self.tab_groups[group_index].windows[next].clone();
+        self.focus_window(&window);
+        true
+    }
+
+    fn group_or_expel_tab(&mut self, target: Option<Window>, delta: i32) -> bool {
+        let Some(focused) = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .cloned()
+        else {
+            return false;
+        };
+        if self.tab_group_index(&focused).is_some() {
+            let Some(column) = self
+                .columns
+                .iter()
+                .position(|column| column.windows.contains(&focused))
+            else {
+                return false;
+            };
+            self.detach_tab(&focused);
+            let index = if delta < 0 { column } else { column + 1 };
+            self.columns
+                .insert(index.min(self.columns.len()), Column::new(focused.clone()));
+            self.focus_window(&focused);
+            return true;
+        }
+
+        let Some(target) = target.filter(|target| *target != focused) else {
+            return false;
+        };
+        if self.remove_tile_from_column(&focused).is_none() {
+            return false;
+        }
+        self.add_tab(focused, target)
+    }
+
+    fn add_tab(&mut self, focused: Window, target: Window) -> bool {
+        if let Some(group_index) = self.tab_group_index(&target) {
+            let old =
+                self.tab_groups[group_index].windows[self.tab_groups[group_index].active].clone();
+            self.tab_groups[group_index].windows.push(focused.clone());
+            self.tab_groups[group_index].active = self.tab_groups[group_index].windows.len() - 1;
+            if let Some(tile) = self
+                .columns
+                .iter_mut()
+                .flat_map(|column| &mut column.windows)
+                .find(|tile| **tile == old)
+            {
+                *tile = focused.clone();
+            }
+        } else if let Some(tile) = self
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.windows)
+            .find(|tile| **tile == target)
+        {
+            *tile = focused.clone();
+            self.tab_groups.push(TabGroup {
+                id: target.id(),
+                windows: vec![target, focused.clone()],
+                active: 1,
+            });
+        } else {
+            return false;
+        }
+        self.focus_window(&focused);
+        true
+    }
+
+    fn dissolve_tab_groups(&mut self) -> bool {
+        if self.tab_groups.is_empty() {
+            return false;
+        }
+        let focused = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .cloned();
+        for group in std::mem::take(&mut self.tab_groups) {
+            let active = group.windows[group.active].clone();
+            let Some(column) = self
+                .columns
+                .iter()
+                .position(|column| column.windows.contains(&active))
+            else {
+                continue;
+            };
+            self.remove_tile_from_column(&active);
+            for (offset, window) in group.windows.into_iter().enumerate() {
+                self.columns.insert(column + offset, Column::new(window));
+            }
+        }
+        if let Some(focused) = focused {
+            self.focus_window(&focused);
+        }
+        true
     }
 
     fn remove_where(&mut self, predicate: impl Fn(&Window) -> bool) -> Option<Window> {
@@ -386,15 +605,34 @@ impl Workspace {
             let (window, fullscreen) = self.take_focused()?;
             return Some(WindowGroup {
                 windows: vec![window.clone()],
+                tiled: vec![window.clone()],
                 row_weights: vec![1.0],
                 focused: 0,
                 width: None,
                 fullscreen: fullscreen.then_some(window),
                 floating: true,
+                tab_groups: Vec::new(),
             });
         };
         let column = self.columns.remove(column_index);
-        for window in &column.windows {
+        let tab_groups = self
+            .tab_groups
+            .extract_if(.., |group| {
+                column
+                    .windows
+                    .iter()
+                    .any(|window| group.windows.contains(window))
+            })
+            .collect::<Vec<_>>();
+        let mut windows = column.windows.clone();
+        for group in &tab_groups {
+            for window in &group.windows {
+                if !windows.contains(window) {
+                    windows.push(window.clone());
+                }
+            }
+        }
+        for window in &windows {
             let index = self.window_index(window).unwrap();
             self.windows.remove(index);
         }
@@ -409,12 +647,14 @@ impl Workspace {
             .or_else(|| (!self.windows.is_empty()).then_some(0));
         debug_assert!(column.windows.contains(&focused_window));
         Some(WindowGroup {
-            windows: column.windows,
+            windows,
+            tiled: column.windows,
             row_weights: column.row_weights,
             focused: column.focused,
             width: column.width,
             fullscreen,
             floating: false,
+            tab_groups,
         })
     }
 
@@ -641,6 +881,7 @@ impl Workspace {
             .columns
             .iter()
             .any(|column| column.windows.contains(window))
+            && self.tab_group_index(window).is_none()
     }
 
     fn overview_window(&self) -> Option<usize> {
@@ -1650,7 +1891,7 @@ impl Paw2 {
             {
                 return Some(operation);
             }
-            return self.begin_tiled_drag(window, location);
+            return self.begin_tiled_drag(window, location, false);
         }
         let geometry = monitor.space.element_geometry(&window)?;
         let column = workspace
@@ -1686,13 +1927,14 @@ impl Paw2 {
         if x.is_some() || y.is_some() {
             return Some(MouseOperation::ResizeTiled { window, x, y });
         }
-        self.begin_tiled_drag(window, location)
+        self.begin_tiled_drag(window, location, false)
     }
 
     fn begin_tiled_drag(
         &mut self,
         window: Window,
         location: Point<f64, Logical>,
+        tab_group: bool,
     ) -> Option<MouseOperation> {
         let monitor_index = self
             .scroller
@@ -1725,12 +1967,25 @@ impl Paw2 {
         self.scroller.drag_preview = Some(window.id());
         Some(MouseOperation::MoveTiled {
             window,
+            tab_group,
             origin_output: monitor.name.clone(),
             origin_workspace,
             origin_geometry,
             preview_size,
             grab_offset,
         })
+    }
+
+    pub(crate) fn begin_tab_group_drag(
+        &mut self,
+        window: Window,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let tiled = self.scroller.monitors.iter().any(|monitor| {
+            let workspace = monitor.active();
+            workspace.fullscreen.is_none() && !workspace.is_floating(&window)
+        });
+        tiled.then(|| self.begin_tiled_drag(window, location, true))?
     }
 
     fn begin_layout_resize(
@@ -2115,6 +2370,7 @@ impl Paw2 {
         }
         let MouseOperation::MoveTiled {
             window,
+            tab_group,
             origin_output,
             origin_workspace,
             origin_geometry,
@@ -2132,6 +2388,10 @@ impl Paw2 {
             self.scroller.drag_preview = None;
             return;
         };
+        if *tab_group {
+            self.finish_tab_group_drag(window, source, *origin_workspace, pointer);
+            return;
+        }
         let Some(target) = self.scroller.monitors.iter().position(|monitor| {
             monitor
                 .space
@@ -2183,12 +2443,14 @@ impl Paw2 {
                 match column {
                     Some(index) => target_workspace.add_group_at(
                         WindowGroup {
-                            windows: vec![window],
+                            windows: vec![window.clone()],
+                            tiled: vec![window],
                             row_weights: vec![1.0],
                             focused: 0,
                             width: None,
                             fullscreen: None,
                             floating: false,
+                            tab_groups: Vec::new(),
                         },
                         index,
                     ),
@@ -2202,6 +2464,76 @@ impl Paw2 {
         self.scroller.drag_preview = None;
         for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
             if index != target {
+                monitor.space.unmap_elem(window);
+            }
+        }
+        self.relayout(true);
+        self.sync_focus();
+    }
+
+    fn finish_tab_group_drag(
+        &mut self,
+        window: &Window,
+        source: usize,
+        origin_workspace: usize,
+        pointer: Point<f64, Logical>,
+    ) {
+        let target_monitor = self.scroller.monitors.iter().position(|monitor| {
+            monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.to_f64().contains(pointer))
+        });
+        let Some(target_monitor) = target_monitor else {
+            self.restore_tiled_drag(window, source);
+            return;
+        };
+        let monitor = &self.scroller.monitors[target_monitor];
+        let workspace = monitor.active();
+        if workspace.fullscreen.is_some() {
+            self.restore_tiled_drag(window, source);
+            return;
+        }
+        let target_window = self
+            .tab_at(pointer)
+            .filter(|target| target != window && workspace.windows.contains(target))
+            .or_else(|| {
+                workspace
+                    .columns
+                    .iter()
+                    .flat_map(|column| column.windows.iter())
+                    .rev()
+                    .find(|target| {
+                        *target != window
+                            && monitor
+                                .space
+                                .element_geometry(target)
+                                .is_some_and(|geometry| geometry.to_f64().contains(pointer))
+                    })
+                    .cloned()
+            });
+        let Some(target_window) = target_window else {
+            self.restore_tiled_drag(window, source);
+            return;
+        };
+        let moved = self.scroller.monitors[source].workspaces[origin_workspace]
+            .remove_where(|candidate| candidate == window);
+        let Some(moved) = moved else {
+            self.restore_tiled_drag(window, source);
+            return;
+        };
+        let workspace = self.scroller.monitors[target_monitor].active_mut();
+        workspace.windows.push(moved.clone());
+        if !workspace.add_tab(moved.clone(), target_window) {
+            workspace.windows.pop();
+            self.scroller.monitors[source].workspaces[origin_workspace].add(moved, false);
+            self.restore_tiled_drag(window, source);
+            return;
+        }
+        self.scroller.focused_output = Some(self.scroller.monitors[target_monitor].name.clone());
+        self.scroller.drag_preview = None;
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            if index != target_monitor {
                 monitor.space.unmap_elem(window);
             }
         }
@@ -3466,6 +3798,13 @@ impl Paw2 {
             Action::IncreaseRowHeight => {
                 self.layout_action(|workspace| workspace.adjust_row_height(0.05))
             }
+            Action::TabGroupLeft => self.tab_group_direction(-1),
+            Action::TabGroupRight => self.tab_group_direction(1),
+            Action::PreviousTab => self.layout_action(|workspace| workspace.cycle_tab(-1)),
+            Action::NextTab => self.layout_action(|workspace| workspace.cycle_tab(1)),
+            // Mouse-only: input starts the grab directly so this never reaches
+            // the keyboard action dispatcher.
+            Action::TabGroupDrag => false,
             Action::ToggleFloating => self.toggle_floating(),
             Action::CloseWindow => {
                 let scratchpad = self
@@ -3571,6 +3910,53 @@ impl Paw2 {
 
     fn layout_action(&mut self, action: impl FnOnce(&mut Workspace) -> bool) -> bool {
         self.scroller.active_workspace().is_some_and(action)
+    }
+
+    fn tab_group_direction(&mut self, delta: i32) -> bool {
+        let Some(workspace) = self.scroller.active_workspace() else {
+            return false;
+        };
+        let Some(source) = workspace
+            .focused
+            .and_then(|index| workspace.windows.get(index))
+            .cloned()
+        else {
+            return false;
+        };
+        if workspace.tab_group_index(&source).is_some() {
+            return self.layout_action(|workspace| workspace.group_or_expel_tab(None, delta));
+        }
+        if !self.directional_layout_action(true, delta, false) {
+            return false;
+        }
+        let target = self
+            .scroller
+            .active_workspace()
+            .and_then(|workspace| workspace.focused)
+            .and_then(|index| self.scroller.active_workspace()?.windows.get(index))
+            .cloned();
+        self.layout_action(|workspace| {
+            workspace.focus_window(&source);
+            workspace.group_or_expel_tab(target, delta)
+        })
+    }
+
+    pub(crate) fn reconcile_tab_grouping(&mut self) {
+        if self.config.layout.tab_grouping {
+            return;
+        }
+        let mut changed = false;
+        for workspace in self
+            .scroller
+            .monitors
+            .iter_mut()
+            .flat_map(|monitor| &mut monitor.workspaces)
+        {
+            changed |= workspace.dissolve_tab_groups();
+        }
+        if changed {
+            self.sync_focus();
+        }
     }
 
     fn directional_layout_action(&mut self, horizontal: bool, delta: i32, swap: bool) -> bool {
@@ -4405,12 +4791,15 @@ impl Paw2 {
             .collect()
     }
 
-    pub fn focused_window_geometry(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
+    pub fn focused_window_render_state(
+        &self,
+        output: &Output,
+    ) -> Option<(Rectangle<i32, Logical>, Id)> {
         let monitor = self.scroller.monitor_for(output)?;
         if self.scroller.focused_output.as_deref() != Some(monitor.name.as_str()) {
             return None;
         }
-        if let Some(window) = self
+        let window = if let Some(window) = self
             .scroller
             .focused_scratchpad
             .as_ref()
@@ -4418,11 +4807,123 @@ impl Paw2 {
             .filter(|runtime| runtime.visible && runtime.output.as_deref() == Some(&monitor.name))
             .and_then(|runtime| runtime.window.as_ref())
         {
-            return monitor.space.element_geometry(window);
+            window
+        } else {
+            let workspace = monitor.active();
+            workspace.windows.get(workspace.focused?)?
+        };
+        let client = monitor.space.element_geometry(window)?;
+        let frame = monitor
+            .active()
+            .tab_group_index(window)
+            .map_or(client, |_| tab_outer_rectangle(client));
+        Some((frame, Id::from_wayland_resource(&window_surface(window)?)))
+    }
+
+    pub(crate) fn tab_bars(&self, output: &Output) -> Vec<TabBar> {
+        if self.overview_visible() || self.scratchpad_overview_visible_on(output) {
+            return Vec::new();
         }
-        let workspace = monitor.active();
-        let window = workspace.windows.get(workspace.focused?)?;
-        monitor.space.element_geometry(window)
+        let Some(monitor) = self.scroller.monitor_for(output) else {
+            return Vec::new();
+        };
+        let Some(output_location) = monitor
+            .space
+            .output_geometry(output)
+            .map(|geometry| geometry.loc)
+        else {
+            return Vec::new();
+        };
+        monitor
+            .active()
+            .tab_groups
+            .iter()
+            .filter_map(|group| {
+                let active = group.windows.get(group.active)?;
+                let client = monitor.space.element_geometry(active)?;
+                let mut geometry = tab_outer_rectangle(client);
+                geometry.size.h = TAB_BAR_HEIGHT;
+                geometry.loc -= output_location;
+                Some(TabBar {
+                    id: group.id,
+                    root: Id::from_wayland_resource(&window_surface(active)?),
+                    geometry,
+                    titles: group
+                        .windows
+                        .iter()
+                        .map(|window| {
+                            let (title, app_id) = crate::screencopy::window_metadata(window);
+                            if title.is_empty() { app_id } else { title }
+                        })
+                        .collect(),
+                    active: group.active,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
+        if !self.config.layout.tab_grouping {
+            return None;
+        }
+        let monitor = self.monitor_at(position)?;
+        let output_location = monitor.space.output_geometry(&monitor.output)?.loc;
+        let local = position - output_location.to_f64();
+        let layers = layer_map_for_output(&monitor.output);
+        if layers.layer_under(Layer::Overlay, local).is_some()
+            || layers.layer_under(Layer::Top, local).is_some()
+        {
+            return None;
+        }
+        drop(layers);
+        self.uncovered_tab_at(position)
+    }
+
+    /// Tab hit testing used while `surface_under` already holds Smithay's
+    /// per-output layer-map lock. This must not acquire that lock itself.
+    fn uncovered_tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
+        if !self.config.layout.tab_grouping {
+            return None;
+        }
+        let monitor = self.monitor_at(position)?;
+        let output_location = monitor.space.output_geometry(&monitor.output)?.loc;
+        let covering = monitor
+            .space
+            .element_under(position)
+            .map(|(window, _)| window);
+        for bar in self.tab_bars(&monitor.output) {
+            let mut geometry = bar.geometry;
+            geometry.loc += output_location;
+            if !geometry.to_f64().contains(position) {
+                continue;
+            }
+            let group = monitor
+                .active()
+                .tab_groups
+                .iter()
+                .find(|group| group.id == bar.id)?;
+            if covering.is_some_and(|window| !group.windows.contains(window)) {
+                return None;
+            }
+            let relative = (position.x - f64::from(geometry.loc.x)).max(0.0);
+            return group
+                .windows
+                .get(tab_index_at(
+                    relative,
+                    geometry.size.w,
+                    group.windows.len(),
+                )?)
+                .cloned();
+        }
+        None
+    }
+
+    fn active_tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
+        let member = self.tab_at(position)?;
+        let monitor = self.monitor_at(position)?;
+        let group = monitor.active().tab_group_index(&member)?;
+        let tab_group = &monitor.active().tab_groups[group];
+        tab_group.windows.get(tab_group.active).cloned()
     }
 
     pub fn fullscreen_window(&self, output: &Output) -> Option<&Window> {
@@ -4473,11 +4974,7 @@ impl Paw2 {
     // ponytail: linear scan per element, so O(n^2) per frame in window count.
     // Never runs on the fullscreen path and n is small; index by surface id if a
     // workspace ever holds enough windows for it to show up in a profile.
-    pub fn window_render_state(
-        &self,
-        output: &Output,
-        element: &Id,
-    ) -> Option<(Rectangle<i32, Logical>, f32)> {
+    pub fn window_render_state(&self, output: &Output, element: &Id) -> Option<WindowRenderState> {
         let monitor = self.scroller.monitor_for(output)?;
         let window = self
             .scroller
@@ -4505,8 +5002,12 @@ impl Paw2 {
         {
             return None;
         }
-        let mut geometry = monitor.space.element_geometry(window)?;
-        geometry.loc -= monitor.space.output_geometry(output)?.loc;
+        let mut client = monitor.space.element_geometry(window)?;
+        client.loc -= monitor.space.output_geometry(output)?.loc;
+        let frame = monitor
+            .active()
+            .tab_group_index(window)
+            .map_or(client, |_| tab_outer_rectangle(client));
         let fade = self
             .scroller
             .animations
@@ -4514,7 +5015,11 @@ impl Paw2 {
             .map_or(1.0, |animation| {
                 animation.opacity(self.start_time.elapsed())
             });
-        Some((geometry, self.config.appearance.window_opacity() * fade))
+        Some(WindowRenderState {
+            client,
+            frame,
+            opacity: self.config.appearance.window_opacity() * fade,
+        })
     }
 
     /// Runs `ready` over every surface on the output and clears the commit
@@ -4776,6 +5281,9 @@ impl Paw2 {
 
     pub fn window_under(&self, position: Point<f64, Logical>) -> Option<Window> {
         let monitor = self.monitor_at(position)?;
+        if let Some(window) = self.active_tab_at(position) {
+            return Some(window);
+        }
         if let Some((window, _)) = monitor.space.element_under(position)
             && self.scratchpad_name_for_window(window).is_some()
         {
@@ -4845,6 +5353,9 @@ impl Paw2 {
         let overlay = layers
             .layer_under(Layer::Overlay, local)
             .and_then(layer_surface);
+        let top = layers
+            .layer_under(Layer::Top, local)
+            .and_then(layer_surface);
         let scratchpad = monitor
             .space
             .element_under(position)
@@ -4869,12 +5380,11 @@ impl Paw2 {
                     })
             });
         }
+        if overlay.is_none() && top.is_none() && self.uncovered_tab_at(position).is_some() {
+            return None;
+        }
         overlay
-            .or_else(|| {
-                layers
-                    .layer_under(Layer::Top, local)
-                    .and_then(layer_surface)
-            })
+            .or(top)
             .or_else(|| {
                 monitor
                     .space
@@ -4954,6 +5464,22 @@ impl Paw2 {
                 ..
             } = monitor;
             let workspace = &mut workspaces[*active_workspace];
+            let tabbed = workspace
+                .tab_groups
+                .iter()
+                .filter_map(|group| group.windows.get(group.active))
+                .map(Window::id)
+                .collect::<Vec<_>>();
+            for window in workspace.tab_groups.iter().flat_map(|group| {
+                group
+                    .windows
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != group.active)
+                    .map(|(_, window)| window)
+            }) {
+                space.unmap_elem(window);
+            }
             let floating_locations = workspace
                 .windows
                 .iter()
@@ -5016,6 +5542,11 @@ impl Paw2 {
                 // Sizes the window, then glides it from wherever it currently sits.
                 let mut place =
                     |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
+                        let rectangle = if tabbed.contains(&window.id()) {
+                            tab_client_rectangle(rectangle)
+                        } else {
+                            rectangle
+                        };
                         configure_window(window, rectangle, client_sized);
                         let current = space.element_location(window);
                         let position = start_motion(
@@ -5874,6 +6405,11 @@ fn overview_window_placements(
         .collect()
     };
 
+    for (window, rectangle) in &mut placements {
+        if workspace.tab_group_index(window).is_some() {
+            *rectangle = tab_client_rectangle(*rectangle);
+        }
+    }
     placements.extend(
         workspace
             .windows
@@ -5887,6 +6423,25 @@ fn overview_window_placements(
             }),
     );
     placements
+}
+
+fn tab_client_rectangle(mut outer: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let height = TAB_BAR_HEIGHT.min((outer.size.h - 1).max(0));
+    outer.loc.y += height;
+    outer.size.h -= height;
+    outer
+}
+
+fn tab_outer_rectangle(mut client: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    client.loc.y -= TAB_BAR_HEIGHT;
+    client.size.h += TAB_BAR_HEIGHT;
+    client
+}
+
+fn tab_index_at(position: f64, width: i32, count: usize) -> Option<usize> {
+    (count > 0).then(|| {
+        ((position.max(0.0) * count as f64 / f64::from(width.max(1))) as usize).min(count - 1)
+    })
 }
 
 fn work_area(
@@ -6505,6 +7060,16 @@ mod tests {
                 serial_number: "Unknown".into(),
             },
         )
+    }
+
+    #[test]
+    fn tab_hit_selects_each_segment_and_clamps_the_far_edge() {
+        assert_eq!(tab_index_at(0.0, 300, 3), Some(0));
+        assert_eq!(tab_index_at(99.9, 300, 3), Some(0));
+        assert_eq!(tab_index_at(100.0, 300, 3), Some(1));
+        assert_eq!(tab_index_at(200.0, 300, 3), Some(2));
+        assert_eq!(tab_index_at(300.0, 300, 3), Some(2));
+        assert_eq!(tab_index_at(0.0, 300, 0), None);
     }
 
     #[test]
