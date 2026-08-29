@@ -99,6 +99,25 @@ pub enum ScratchpadEdge {
     Right,
 }
 
+/// Where the scratchpad overview strip sits, and which way it scrolls.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScratchpadOverviewPosition {
+    #[default]
+    Centered,
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl ScratchpadOverviewPosition {
+    /// Left and right stack the cards down the screen; the rest run across it.
+    pub fn horizontal(self) -> bool {
+        !matches!(self, Self::Left | Self::Right)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScratchpadConfig {
     pub name: String,
@@ -196,6 +215,7 @@ pub struct AnimationConfig {
 pub struct OverviewConfig {
     pub zoom: f64,
     pub backdrop_color: [f32; 4],
+    pub scratchpad_position: ScratchpadOverviewPosition,
 }
 
 impl AnimationConfig {
@@ -362,6 +382,7 @@ impl Config {
         self.layout = updated.layout;
         self.appearance = updated.appearance;
         self.animations = updated.animations;
+        self.overview = updated.overview;
         self.input.focus_follows_mouse = updated.input.focus_follows_mouse;
         self.theme.cursor_theme = updated.theme.cursor_theme;
         self.theme.cursor_size = updated.theme.cursor_size;
@@ -859,6 +880,7 @@ impl Default for RawAnimations {
 struct RawOverview {
     zoom: f64,
     backdrop_color: String,
+    scratchpad_position: ScratchpadOverviewPosition,
 }
 
 impl Default for RawOverview {
@@ -866,6 +888,7 @@ impl Default for RawOverview {
         Self {
             zoom: 0.5,
             backdrop_color: "#1c1c1c".into(),
+            scratchpad_position: ScratchpadOverviewPosition::Centered,
         }
     }
 }
@@ -1497,6 +1520,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         overview: OverviewConfig {
             zoom: raw.overview.zoom,
             backdrop_color,
+            scratchpad_position: raw.overview.scratchpad_position,
         },
         input: raw.input,
         theme: raw.theme,
@@ -1817,6 +1841,20 @@ mod tests {
             .unwrap_err()
             .contains("overview.backdrop_color must use #RRGGBB")
         );
+        assert_eq!(
+            config.overview.scratchpad_position,
+            ScratchpadOverviewPosition::Centered
+        );
+        let left = parse(&DEFAULT_CONFIG.replace(
+            "scratchpad_position = \"centered\"",
+            "scratchpad_position = \"left\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            left.overview.scratchpad_position,
+            ScratchpadOverviewPosition::Left
+        );
+
         // A config written before the overview existed still gets its defaults.
         let legacy_overview = parse(
             &DEFAULT_CONFIG

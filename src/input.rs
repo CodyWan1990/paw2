@@ -32,31 +32,23 @@ enum KeyAction {
 }
 
 enum ScratchpadOverviewKey {
-    Move { horizontal: bool, delta: i32 },
+    Move(i32),
     Confirm,
     Cancel,
 }
 
+/// The strip is one line whichever way it runs, so both axes step it and the
+/// user never has to remember which way the cards are laid out.
 fn scratchpad_overview_key(keysym: Keysym) -> Option<ScratchpadOverviewKey> {
     match keysym.raw() {
-        keysyms::KEY_Left | keysyms::KEY_h => Some(ScratchpadOverviewKey::Move {
-            horizontal: true,
-            delta: -1,
-        }),
-        keysyms::KEY_Right | keysyms::KEY_l | keysyms::KEY_Tab => {
-            Some(ScratchpadOverviewKey::Move {
-                horizontal: true,
-                delta: 1,
-            })
+        keysyms::KEY_Left | keysyms::KEY_h | keysyms::KEY_Up | keysyms::KEY_k => {
+            Some(ScratchpadOverviewKey::Move(-1))
         }
-        keysyms::KEY_Up | keysyms::KEY_k => Some(ScratchpadOverviewKey::Move {
-            horizontal: false,
-            delta: -1,
-        }),
-        keysyms::KEY_Down | keysyms::KEY_j => Some(ScratchpadOverviewKey::Move {
-            horizontal: false,
-            delta: 1,
-        }),
+        keysyms::KEY_Right
+        | keysyms::KEY_l
+        | keysyms::KEY_Tab
+        | keysyms::KEY_Down
+        | keysyms::KEY_j => Some(ScratchpadOverviewKey::Move(1)),
         keysyms::KEY_Return | keysyms::KEY_KP_Enter => Some(ScratchpadOverviewKey::Confirm),
         keysyms::KEY_Escape => Some(ScratchpadOverviewKey::Cancel),
         _ => None,
@@ -286,23 +278,22 @@ impl Paw2 {
                         if key_state == KeyState::Pressed {
                             let overview = state.overview_active();
                             let scratchpad_overview = state.scratchpad_overview_active();
+                            // An open overview claims its navigation keys first,
+                            // then everything else falls through to the normal
+                            // bindings - so the key that opened it closes it.
                             let action = if scratchpad_overview {
                                 scratchpad_overview_key(keysym).map(KeyAction::ScratchpadOverview)
                             } else if overview {
-                                overview_key(modifiers, keysym)
-                                    .map(KeyAction::Overview)
-                                    .or_else(|| {
-                                        state
-                                            .config
-                                            .action(modifiers, keysym)
-                                            .map(KeyAction::Compositor)
-                                    })
+                                overview_key(modifiers, keysym).map(KeyAction::Overview)
                             } else {
+                                None
+                            }
+                            .or_else(|| {
                                 state
                                     .config
                                     .action(modifiers, keysym)
                                     .map(KeyAction::Compositor)
-                            };
+                            });
                             if overview || scratchpad_overview || action.is_some() {
                                 if !state.suppressed_keys.contains(&keysym) {
                                     state.suppressed_keys.push(keysym);
@@ -341,10 +332,9 @@ impl Paw2 {
                         }
                         KeyAction::Overview(OverviewKey::Confirm) => self.confirm_overview(),
                         KeyAction::Overview(OverviewKey::Cancel) => self.close_overview(),
-                        KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Move {
-                            horizontal,
-                            delta,
-                        }) => self.move_scratchpad_overview(horizontal, delta),
+                        KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Move(delta)) => {
+                            self.move_scratchpad_overview(delta)
+                        }
                         KeyAction::ScratchpadOverview(ScratchpadOverviewKey::Confirm) => {
                             self.confirm_scratchpad_overview()
                         }
@@ -650,7 +640,7 @@ impl Paw2 {
                     if source == AxisSource::Wheel && amount != 0.0 {
                         let delta = if amount < 0.0 { -1 } else { 1 };
                         if self.scratchpad_overview_active() {
-                            self.move_scratchpad_overview(true, delta);
+                            self.move_scratchpad_overview(delta);
                         } else {
                             let location = self.seat.get_pointer().unwrap().current_location();
                             self.scroll_overview_at(location, delta);

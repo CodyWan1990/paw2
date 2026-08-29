@@ -75,6 +75,10 @@ slowdown = 1.0
 zoom = 0.5
 # Shown behind the workspace cards, where the desktop no longer reaches.
 backdrop_color = "#1c1c1c"
+# Where the scratchpad overview strip sits: centered, top, bottom, left or
+# right. centered, top and bottom scroll sideways; left and right scroll up and
+# down.
+scratchpad_position = "centered"
 
 [input]
 # Focus windows as the pointer enters them without moving the workspace viewport.

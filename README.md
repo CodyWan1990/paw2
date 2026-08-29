@@ -456,8 +456,15 @@ Numbered slots hold any focused window: `Super+Alt+Shift+1`–`9` assign or
 release a slot, `Super+Alt+1`–`9` show or hide it.
 
 `Super+Shift+o` opens the scratchpad overview — live previews of every
-configured and numbered scratchpad used this session, in a centred panel. Arrow
-or Vim keys, `Enter`, `Escape`, or the mouse.
+configured and numbered scratchpad used this session, in a single strip that
+scrolls with the selection. Arrow or Vim keys, the scroll wheel, `Enter`,
+`Escape`, or the mouse. `[overview] scratchpad_position` puts the strip
+`centered`, `top`, `bottom` (scrolling sideways), `left` or `right` (scrolling
+up and down).
+
+The strip keeps clear of bars and docks that claim an exclusive zone, stands off
+that edge by `appearance.gaps`, and wears the same border as the focused window.
+It shows as many whole previews as fit and scrolls the rest into view.
 
 To reset saved placement, send `{"cmd":"reset-scratchpad","name":"terminal"}` to
 the [control socket](#control-socket).

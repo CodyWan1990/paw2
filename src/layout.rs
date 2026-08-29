@@ -33,7 +33,7 @@ use smithay::{
 use crate::{
     config::{
         Action, Config, LayoutMode, NUMBERED_SCRATCHPAD_COUNT, NUMBERED_SCRATCHPAD_PREFIX,
-        ScratchpadConfig, ScratchpadEdge,
+        ScratchpadConfig, ScratchpadEdge, ScratchpadOverviewPosition,
     },
     state::Paw2,
 };
@@ -100,6 +100,15 @@ pub(crate) struct ScratchpadPreview {
     pub window: Window,
     pub card: Rectangle<i32, Logical>,
     pub selected: bool,
+    /// Position in the overview's name list. Cards scrolled out of the panel
+    /// are never built, so this is not the position in `previews`.
+    pub index: usize,
+}
+
+/// The scratchpad overview: a bordered panel and the cards currently inside it.
+pub(crate) struct ScratchpadStrip {
+    pub panel: Rectangle<i32, Logical>,
+    pub previews: Vec<ScratchpadPreview>,
 }
 
 /// A window as the overview shows it. `geometry` is where the window really
@@ -4307,17 +4316,12 @@ impl Paw2 {
         crate::drm::redraw(self);
     }
 
-    pub(crate) fn move_scratchpad_overview(&mut self, horizontal: bool, delta: i32) {
+    pub(crate) fn move_scratchpad_overview(&mut self, delta: i32) {
         let Some(selection) = &mut self.scroller.scratchpad_overview else {
             return;
         };
-        let step = if horizontal {
-            1
-        } else {
-            (selection.names.len() as f64).sqrt().ceil() as i32
-        };
-        selection.selected = (selection.selected as i32 + delta * step)
-            .rem_euclid(selection.names.len() as i32) as usize;
+        selection.selected =
+            (selection.selected as i32 + delta).rem_euclid(selection.names.len() as i32) as usize;
         crate::drm::redraw(self);
     }
 
@@ -4361,9 +4365,16 @@ impl Paw2 {
     pub(crate) fn scratchpad_overview_hit(&self, location: Point<f64, Logical>) -> Option<usize> {
         let output = self.default_output()?;
         let origin = self.output_geometry(&output)?.loc.to_f64();
-        self.scratchpad_previews(&output)
+        self.scratchpad_strip(&output)?
+            .previews
             .iter()
-            .position(|preview| preview.card.to_f64().contains(location - origin))
+            .find_map(|preview| {
+                preview
+                    .card
+                    .to_f64()
+                    .contains(location - origin)
+                    .then_some(preview.index)
+            })
     }
 
     pub(crate) fn select_scratchpad_overview(&mut self, index: usize) {
@@ -4493,6 +4504,7 @@ impl Paw2 {
         if self.has_exclusive_keyboard_layer() {
             return;
         }
+        self.close_scratchpad_overview();
         let monitor = self
             .scroller
             .focused_output
@@ -4937,19 +4949,25 @@ impl Paw2 {
             .collect()
     }
 
-    pub(crate) fn scratchpad_previews(&self, output: &Output) -> Vec<ScratchpadPreview> {
-        let Some(selection) = &self.scroller.scratchpad_overview else {
-            return Vec::new();
-        };
+    pub(crate) fn scratchpad_strip(&self, output: &Output) -> Option<ScratchpadStrip> {
+        let selection = self.scroller.scratchpad_overview.as_ref()?;
         if self.scroller.focused_output.as_deref() != Some(output.name().as_str()) {
-            return Vec::new();
+            return None;
         }
-        let Some(size) = self.output_geometry(output).map(|geometry| geometry.size) else {
-            return Vec::new();
-        };
-        scratchpad_cards(size, selection.names.len())
+        // The strip lives in the space bars and docks leave behind, held off
+        // that edge by the same gap a window keeps.
+        let area = inset_rectangle(
+            layer_map_for_output(output).non_exclusive_zone(),
+            self.config.appearance.gaps,
+        );
+        let (panel, cards) = scratchpad_strip_layout(
+            area,
+            selection.names.len(),
+            self.config.overview.scratchpad_position,
+            selection.selected,
+        );
+        let previews = cards
             .into_iter()
-            .enumerate()
             .filter_map(|(index, card)| {
                 let name = selection.names.get(index)?;
                 let window = self.scroller.scratchpads.get(name)?.window.clone()?;
@@ -4957,9 +4975,11 @@ impl Paw2 {
                     window,
                     card,
                     selected: index == selection.selected,
+                    index,
                 })
             })
-            .collect()
+            .collect();
+        Some(ScratchpadStrip { panel, previews })
     }
 
     pub fn focused_window_render_state(
@@ -6484,37 +6504,92 @@ fn overview_cards(
         .collect()
 }
 
-pub(crate) fn scratchpad_overview_rectangle(output: Size<i32, Logical>) -> Rectangle<i32, Logical> {
-    let size: Size<i32, Logical> = ((output.w * 3 / 4).max(1), (output.h / 2).max(1)).into();
-    Rectangle::new(
-        ((output.w - size.w) / 2, (output.h - size.h) / 2).into(),
-        size,
-    )
-}
+/// A card in the strip, paired with the scratchpad it shows.
+type ScratchpadCard = (usize, Rectangle<i32, Logical>);
 
-fn scratchpad_cards(output: Size<i32, Logical>, count: usize) -> Vec<Rectangle<i32, Logical>> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let panel = scratchpad_overview_rectangle(output);
-    let columns = (count as f64).sqrt().ceil() as i32;
-    let rows = (count as i32 + columns - 1) / columns;
+/// The scratchpad strip: a panel inside `area` holding one line of cards.
+///
+/// The panel hugs exactly the cards it can show, so it never draws a card that
+/// would be cut off and never leaves a bordered box half empty. `area` is the
+/// output's usable space already inset by the window gap, so the panel clears
+/// bars and docks and stands off the screen edge like a window does.
+fn scratchpad_strip_layout(
+    area: Rectangle<i32, Logical>,
+    count: usize,
+    position: ScratchpadOverviewPosition,
+    selected: usize,
+) -> (Rectangle<i32, Logical>, Vec<ScratchpadCard>) {
     let gap = OVERVIEW_GAP;
-    let width = ((panel.size.w - gap * (columns + 1)) / columns).max(1);
-    let height = ((panel.size.h - gap * (rows + 1)) / rows).max(1);
-    (0..count)
-        .map(|index| {
-            let index = index as i32;
-            Rectangle::new(
-                (
-                    panel.loc.x + gap + (index % columns) * (width + gap),
-                    panel.loc.y + gap + (index / columns) * (height + gap),
-                )
-                    .into(),
-                (width, height).into(),
+    let horizontal = position.horizontal();
+    // Cards keep the usable area's aspect ratio, so a preview reads as a
+    // shrunken screen rather than a stretched one.
+    let card: Size<i32, Logical> = if horizontal {
+        let height = (area.size.h / 3 - gap * 2).max(1);
+        ((height * area.size.w / area.size.h).max(1), height).into()
+    } else {
+        let width = (area.size.w / 3 - gap * 2).max(1);
+        (width, (width * area.size.h / area.size.w).max(1)).into()
+    };
+    let (along, across) = if horizontal {
+        (card.w, card.h)
+    } else {
+        (card.h, card.w)
+    };
+    let available = if horizontal { area.size.w } else { area.size.h };
+
+    let step = along + gap;
+    let visible = ((available - gap) / step).clamp(1, count as i32);
+    // One gap between every pair of cards plus one at each end.
+    let panel_along = visible * step + gap;
+    let panel_across = across + gap * 2;
+    let panel = if horizontal {
+        Rectangle::new(
+            (
+                area.loc.x + (area.size.w - panel_along) / 2,
+                area.loc.y + cross_offset(position, area.size.h, panel_across),
+            )
+                .into(),
+            (panel_along, panel_across).into(),
+        )
+    } else {
+        Rectangle::new(
+            (
+                area.loc.x + cross_offset(position, area.size.w, panel_across),
+                area.loc.y + (area.size.h - panel_along) / 2,
+            )
+                .into(),
+            (panel_across, panel_along).into(),
+        )
+    };
+
+    // Centre the selection, but stop at either end so the panel never shows
+    // empty space where the list has run out.
+    let first = (selected as i32 - visible / 2).clamp(0, count as i32 - visible);
+    let cards = (0..visible)
+        .map(|slot| {
+            let offset = gap + slot * step;
+            let location = if horizontal {
+                (panel.loc.x + offset, panel.loc.y + gap)
+            } else {
+                (panel.loc.x + gap, panel.loc.y + offset)
+            };
+            (
+                (first + slot) as usize,
+                Rectangle::new(location.into(), card),
             )
         })
-        .collect()
+        .collect();
+    (panel, cards)
+}
+
+/// Where the panel sits across its scroll axis: against the near edge, the far
+/// edge, or in the middle.
+fn cross_offset(position: ScratchpadOverviewPosition, available: i32, panel: i32) -> i32 {
+    match position {
+        ScratchpadOverviewPosition::Top | ScratchpadOverviewPosition::Left => 0,
+        ScratchpadOverviewPosition::Bottom | ScratchpadOverviewPosition::Right => available - panel,
+        ScratchpadOverviewPosition::Centered => (available - panel) / 2,
+    }
 }
 
 /// How far workspace contents shrink at this point in the transition: 1.0 while
@@ -8296,13 +8371,80 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_overview_cards_form_a_grid() {
-        let cards = scratchpad_cards((1000, 800).into(), 4);
-        let panel = scratchpad_overview_rectangle((1000, 800).into());
-        assert_eq!(panel, Rectangle::new((125, 200).into(), (750, 400).into()));
-        assert_eq!(cards.len(), 4);
-        assert!(cards.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
-        assert!(cards.iter().all(|card| panel.contains_rect(*card)));
+    fn scratchpad_strip_is_one_line_that_hugs_its_cards() {
+        let area = Rectangle::new((15, 15).into(), (970, 770).into());
+        let position = ScratchpadOverviewPosition::Centered;
+        let (panel, cards) = scratchpad_strip_layout(area, 3, position, 1);
+
+        assert_eq!(cards.len(), 3);
+        assert!(cards.iter().all(|(_, card)| panel.contains_rect(*card)));
+        // One row: same size, same y, marching right, no overlap.
+        assert!(cards.windows(2).all(|pair| pair[0].1.size == pair[1].1.size
+            && pair[0].1.loc.y == pair[1].1.loc.y
+            && pair[1].1.loc.x > pair[0].1.loc.x
+            && !pair[0].1.overlaps(pair[1].1)));
+        // The panel is exactly wide enough for the cards plus the gaps around
+        // them, and sits centred in the usable area.
+        let step = cards[0].1.size.w + OVERVIEW_GAP;
+        assert_eq!(panel.size.w, 3 * step + OVERVIEW_GAP);
+        assert_eq!(panel.size.h, cards[0].1.size.h + OVERVIEW_GAP * 2);
+        assert_eq!(panel.loc.x, area.loc.x + (area.size.w - panel.size.w) / 2);
+        assert_eq!(panel.loc.y, area.loc.y + (area.size.h - panel.size.h) / 2);
+    }
+
+    #[test]
+    fn scratchpad_strip_stays_inside_the_usable_area() {
+        // A 40px bar at the top, then the window gap.
+        let zone = Rectangle::new((0, 40).into(), (1000, 760).into());
+        let area = inset_rectangle(zone, 15);
+        for position in [
+            ScratchpadOverviewPosition::Top,
+            ScratchpadOverviewPosition::Bottom,
+            ScratchpadOverviewPosition::Centered,
+            ScratchpadOverviewPosition::Left,
+            ScratchpadOverviewPosition::Right,
+        ] {
+            let (panel, cards) = scratchpad_strip_layout(area, 4, position, 0);
+            assert!(area.contains_rect(panel), "{position:?} escaped the area");
+            // The border is drawn outside the panel, and the gap we inset by is
+            // never smaller than focus_ring_width, so it clears the bar too.
+            assert!(zone.contains_rect(inset_rectangle(panel, -15)));
+            assert!(cards.iter().all(|(_, card)| panel.contains_rect(*card)));
+        }
+
+        let (top, _) = scratchpad_strip_layout(area, 4, ScratchpadOverviewPosition::Top, 0);
+        assert_eq!(top.loc.y, area.loc.y);
+        let (bottom, _) = scratchpad_strip_layout(area, 4, ScratchpadOverviewPosition::Bottom, 0);
+        assert_eq!(bottom.loc.y + bottom.size.h, area.loc.y + area.size.h);
+        let (left, cards) = scratchpad_strip_layout(area, 3, ScratchpadOverviewPosition::Left, 0);
+        assert_eq!(left.loc.x, area.loc.x);
+        // Left stacks the cards down the screen instead of across it.
+        assert!(
+            cards
+                .windows(2)
+                .all(|pair| pair[0].1.loc.x == pair[1].1.loc.x && pair[1].1.loc.y > pair[0].1.loc.y)
+        );
+    }
+
+    #[test]
+    fn scratchpad_strip_shows_whole_cards_and_stops_at_both_ends() {
+        let area = Rectangle::new((15, 15).into(), (970, 770).into());
+        let position = ScratchpadOverviewPosition::Centered;
+        let count = 20;
+        let (panel, cards) = scratchpad_strip_layout(area, count, position, 0);
+        // Too many to fit, so the panel caps and only whole cards are built.
+        assert!(cards.len() < count);
+        assert!(panel.size.w <= area.size.w);
+        assert!(cards.iter().all(|(_, card)| panel.contains_rect(*card)));
+
+        // Clamped at the near end: the first card is index 0, not a blank slot.
+        assert_eq!(cards[0].0, 0);
+        // Clamped at the far end: the last card is the last scratchpad.
+        let (_, cards) = scratchpad_strip_layout(area, count, position, count - 1);
+        assert_eq!(cards.last().unwrap().0, count - 1);
+        // In the middle the selection is centred.
+        let (_, cards) = scratchpad_strip_layout(area, count, position, 10);
+        assert_eq!(cards[cards.len() / 2].0, 10);
     }
 
     #[test]

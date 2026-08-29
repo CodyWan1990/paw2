@@ -50,10 +50,7 @@ use smithay::{
 
 use crate::{
     config::AppearanceConfig,
-    layout::{
-        WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect,
-        scratchpad_overview_rectangle,
-    },
+    layout::{WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
     state::Paw2,
 };
 
@@ -481,6 +478,9 @@ pub struct Effects {
     /// is open.
     overview_shadows: [Option<(i32, PixelShaderElement)>; crate::layout::WORKSPACE_COUNT],
     overview_ring: Option<((i32, i32), PixelShaderElement)>,
+    /// The scratchpad panel's border needs its own slot: sharing one with
+    /// `overview_ring` would make the two evict each other every frame.
+    panel_ring: Option<((i32, i32), PixelShaderElement)>,
     tab_font: Font,
     tab_buffers: HashMap<(String, usize), TabBuffer>,
 }
@@ -521,6 +521,7 @@ impl Effects {
             overview_cards: std::array::from_fn(|_| Id::new()),
             overview_shadows: std::array::from_fn(|_| None),
             overview_ring: None,
+            panel_ring: None,
             tab_font: Font::from_bytes(
                 include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
                 FontSettings::default(),
@@ -566,6 +567,7 @@ impl Effects {
             }
             self.generation = self.generation.wrapping_add(1);
             self.overview_ring = None;
+            self.panel_ring = None;
             self.overview_shadows = std::array::from_fn(|_| None);
             if let Some(ring) = &mut self.ring {
                 ring.update_uniforms(ring_uniforms(&appearance));
@@ -643,6 +645,10 @@ impl Effects {
                 )
                 .map(PawRenderElements::Constrained),
             );
+            // The scratchpad strip reads this same layer map to find the usable
+            // area, and smithay's guard is a mutex: holding it across the call
+            // would deadlock.
+            drop(layers);
             return self.with_scratchpad_overview(renderer, state, output, elements);
         }
 
@@ -790,8 +796,11 @@ impl Effects {
         output: &Output,
     ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
         let scale = Scale::from(output.current_scale().fractional_scale());
+        let Some(strip) = state.scratchpad_strip(output) else {
+            return Ok(Vec::new());
+        };
         let mut elements = Vec::new();
-        for preview in state.scratchpad_previews(output) {
+        for preview in strip.previews {
             if preview.selected {
                 elements.extend(
                     self.overview_ring(preview.card, 1.0)
@@ -815,16 +824,12 @@ impl Effects {
                 .map(PawRenderElements::Constrained),
             );
         }
-        let Some(size) = state.output_geometry(output).map(|geometry| geometry.size) else {
-            return Ok(elements);
-        };
-        let panel = scratchpad_overview_rectangle(size)
-            .to_f64()
-            .to_physical(scale)
-            .to_i32_round();
+        // Border first: earlier elements draw on top, and the ring band overlaps
+        // the panel it outlines.
+        elements.extend(self.panel_ring(strip.panel).map(PawRenderElements::Shader));
         elements.push(PawRenderElements::Solid(SolidColorRenderElement::new(
             self.overview_cards[0].clone(),
-            panel,
+            strip.panel.to_f64().to_physical(scale).to_i32_round(),
             CommitCounter::default(),
             OVERVIEW_CARD,
             Kind::Unspecified,
@@ -983,34 +988,40 @@ impl Effects {
         window: Rectangle<i32, Logical>,
         zoom: f64,
     ) -> Option<PixelShaderElement> {
-        let appearance = self.appearance;
+        let radius = (f64::from(self.appearance.corner_radius) * zoom).round() as i32;
         let program = self.ring_program.clone()?;
-        let width = OVERVIEW_RING_WIDTH;
-        let radius = (f64::from(appearance.corner_radius) * zoom).round() as i32;
-        let area = ring_area(window, width);
-        let uniforms = || {
-            vec![
-                Uniform::new("corner_radius", radius as f32),
-                Uniform::new("ring_width", width as f32),
-                Uniform::new("ring_color", appearance.focus_ring_color),
-            ]
-        };
-        let ring = match &mut self.overview_ring {
-            Some((cached, ring)) if *cached == (width, radius) => ring,
-            slot => {
-                let ring = PixelShaderElement::new(
-                    program,
-                    area,
-                    None,
-                    1.0,
-                    uniforms(),
-                    Kind::Unspecified,
-                );
-                &mut slot.insert(((width, radius), ring)).1
-            }
-        };
-        ring.resize(area, None);
-        Some(ring.clone())
+        let color = self.appearance.focus_ring_color;
+        Some(cached_ring(
+            program,
+            &mut self.overview_ring,
+            window,
+            OVERVIEW_RING_WIDTH,
+            radius,
+            color,
+        ))
+    }
+
+    /// The border around the scratchpad panel, the same one the focused window
+    /// wears.
+    ///
+    /// ponytail: square corners, because the panel behind it is a plain solid
+    /// and a rounded ring would leave a nub poking out at each corner. Give the
+    /// panel the window shader if it ever needs real rounding.
+    fn panel_ring(&mut self, panel: Rectangle<i32, Logical>) -> Option<PixelShaderElement> {
+        let width = self.appearance.focus_ring_width;
+        if width <= 0 {
+            return None;
+        }
+        let program = self.ring_program.clone()?;
+        let color = self.appearance.focus_ring_color;
+        Some(cached_ring(
+            program,
+            &mut self.panel_ring,
+            panel,
+            width,
+            0,
+            color,
+        ))
     }
 
     /// The shadow that lifts one workspace card off the backdrop. Its spread is
@@ -1467,6 +1478,41 @@ fn pyramid_sizes(size: Size<i32, Buffer>, levels: usize) -> Vec<Size<i32, Buffer
         sizes.push(((previous.w / 2).max(1), (previous.h / 2).max(1)).into());
     }
     sizes
+}
+
+/// The ring shader drawn around `window`, reusing `slot` whenever the size it
+/// was built for still holds. A fresh `PixelShaderElement` carries a fresh id,
+/// which damages forever and stops the compositor ever idling, so every ring
+/// goes through here rather than being rebuilt per frame.
+fn cached_ring(
+    program: GlesPixelProgram,
+    slot: &mut Option<((i32, i32), PixelShaderElement)>,
+    window: Rectangle<i32, Logical>,
+    width: i32,
+    radius: i32,
+    color: [f32; 4],
+) -> PixelShaderElement {
+    let area = ring_area(window, width);
+    let ring = match slot {
+        Some((cached, ring)) if *cached == (width, radius) => ring,
+        slot => {
+            let ring = PixelShaderElement::new(
+                program,
+                area,
+                None,
+                1.0,
+                vec![
+                    Uniform::new("corner_radius", radius as f32),
+                    Uniform::new("ring_width", width as f32),
+                    Uniform::new("ring_color", color),
+                ],
+                Kind::Unspecified,
+            );
+            &mut slot.insert(((width, radius), ring)).1
+        }
+    };
+    ring.resize(area, None);
+    ring.clone()
 }
 
 /// The window rectangle grown by the ring width on every side.
