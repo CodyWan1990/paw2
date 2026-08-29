@@ -31,7 +31,10 @@ use smithay::{
 };
 
 use crate::{
-    config::{Action, Config, LayoutMode, ScratchpadConfig, ScratchpadEdge},
+    config::{
+        Action, Config, LayoutMode, NUMBERED_SCRATCHPAD_COUNT, NUMBERED_SCRATCHPAD_PREFIX,
+        ScratchpadConfig, ScratchpadEdge,
+    },
     state::Paw2,
 };
 
@@ -132,6 +135,7 @@ pub(crate) struct WindowRenderState {
     pub client: Rectangle<i32, Logical>,
     pub frame: Rectangle<i32, Logical>,
     pub opacity: f32,
+    pub scratchpad: bool,
 }
 
 struct Column<T = Window> {
@@ -1535,45 +1539,66 @@ fn configured_scratchpad_rectangle(
     config: &ScratchpadConfig,
     area: Rectangle<i32, Logical>,
 ) -> Rectangle<i32, Logical> {
+    scratchpad_rectangle_from_options(
+        config.size,
+        config.position,
+        config.edge,
+        config.margin,
+        area,
+    )
+}
+
+fn scratchpad_rectangle_from_options(
+    percent: [f64; 2],
+    position: Option<[f64; 2]>,
+    edge: ScratchpadEdge,
+    margin: i32,
+    area: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
     let size: Size<i32, Logical> = (
-        ((f64::from(area.size.w) * config.size[0] / 100.0)
+        ((f64::from(area.size.w) * percent[0] / 100.0)
             .round()
             .max(f64::from(MIN_ROW_HEIGHT)) as i32)
             .min(area.size.w.max(1)),
-        ((f64::from(area.size.h) * config.size[1] / 100.0)
+        ((f64::from(area.size.h) * percent[1] / 100.0)
             .round()
             .max(f64::from(MIN_ROW_HEIGHT)) as i32)
             .min(area.size.h.max(1)),
     )
         .into();
-    let location = if let Some([x, y]) = config.position {
+    let location = if let Some([x, y]) = position {
         (
             area.loc.x + (f64::from(area.size.w) * x / 100.0).round() as i32,
             area.loc.y + (f64::from(area.size.h) * y / 100.0).round() as i32,
         )
             .into()
     } else {
-        match config.edge {
-            ScratchpadEdge::Top => (
-                area.loc.x + (area.size.w - size.w) / 2,
-                area.loc.y + config.margin,
-            ),
+        match edge {
+            ScratchpadEdge::Top => (area.loc.x + (area.size.w - size.w) / 2, area.loc.y + margin),
             ScratchpadEdge::Bottom => (
                 area.loc.x + (area.size.w - size.w) / 2,
-                area.loc.y + area.size.h - size.h - config.margin,
+                area.loc.y + area.size.h - size.h - margin,
             ),
-            ScratchpadEdge::Left => (
-                area.loc.x + config.margin,
-                area.loc.y + (area.size.h - size.h) / 2,
-            ),
+            ScratchpadEdge::Left => (area.loc.x + margin, area.loc.y + (area.size.h - size.h) / 2),
             ScratchpadEdge::Right => (
-                area.loc.x + area.size.w - size.w - config.margin,
+                area.loc.x + area.size.w - size.w - margin,
                 area.loc.y + (area.size.h - size.h) / 2,
             ),
         }
         .into()
     };
     Rectangle::new(constrain_window(area, size, location), size)
+}
+
+fn numbered_scratchpad_name(index: usize) -> String {
+    format!("{NUMBERED_SCRATCHPAD_PREFIX}{index}")
+}
+
+fn numbered_scratchpad_index(name: &str) -> Option<usize> {
+    name.strip_prefix(NUMBERED_SCRATCHPAD_PREFIX)?
+        .parse::<usize>()
+        .ok()
+        .filter(|index| *index < NUMBERED_SCRATCHPAD_COUNT)
 }
 
 fn hidden_scratchpad_location(
@@ -1702,11 +1727,12 @@ impl Paw2 {
             .scratchpads
             .keys()
             .filter(|name| {
-                !self
-                    .config
-                    .scratchpads
-                    .iter()
-                    .any(|config| config.name == **name)
+                numbered_scratchpad_index(name).is_none()
+                    && !self
+                        .config
+                        .scratchpads
+                        .iter()
+                        .any(|config| config.name == **name)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1766,7 +1792,10 @@ impl Paw2 {
             .config
             .scratchpads
             .iter()
-            .find(|scratchpad| scratchpad.name == name)?;
+            .find(|scratchpad| scratchpad.name == name);
+        if config.is_none() && numbered_scratchpad_index(name).is_none() {
+            return None;
+        }
         let monitor = self.scroller.monitor(output)?;
         let output_geometry = monitor.space.output_geometry(&monitor.output)?;
         let area = work_area(
@@ -1779,7 +1808,20 @@ impl Paw2 {
             .get(name)
             .and_then(|outputs| outputs.get(output));
         let rectangle = saved.map_or_else(
-            || configured_scratchpad_rectangle(config, area),
+            || {
+                config.map_or_else(
+                    || {
+                        scratchpad_rectangle_from_options(
+                            [75.0, 60.0],
+                            None,
+                            ScratchpadEdge::Top,
+                            24,
+                            area,
+                        )
+                    },
+                    |config| configured_scratchpad_rectangle(config, area),
+                )
+            },
             |saved| {
                 let size: Size<i32, Logical> = (
                     saved.size[0].max(1).min(area.size.w.max(1)),
@@ -1791,6 +1833,15 @@ impl Paw2 {
             },
         );
         Some(rectangle)
+    }
+
+    fn scratchpad_edge(&self, name: &str) -> Option<ScratchpadEdge> {
+        self.config
+            .scratchpads
+            .iter()
+            .find(|scratchpad| scratchpad.name == name)
+            .map(|scratchpad| scratchpad.edge)
+            .or_else(|| numbered_scratchpad_index(name).map(|_| ScratchpadEdge::Top))
     }
 
     fn remember_scratchpad_geometry(&mut self, name: &str) {
@@ -2983,6 +3034,107 @@ impl Paw2 {
         }
     }
 
+    pub fn toggle_numbered_scratchpad(&mut self, index: usize) {
+        if index >= NUMBERED_SCRATCHPAD_COUNT {
+            return;
+        }
+        let name = numbered_scratchpad_name(index);
+        let Some(runtime) = self.scroller.scratchpads.get(&name) else {
+            return;
+        };
+        if runtime.visible && !runtime.hiding {
+            self.hide_scratchpad(&name);
+        } else {
+            self.show_scratchpad(&name);
+        }
+    }
+
+    pub fn assign_numbered_scratchpad(&mut self, index: usize) {
+        if index >= NUMBERED_SCRATCHPAD_COUNT {
+            return;
+        }
+        let name = numbered_scratchpad_name(index);
+        if self.scroller.focused_scratchpad.as_deref() == Some(&name) {
+            self.release_numbered_scratchpad(&name);
+            return;
+        }
+        if self
+            .scroller
+            .scratchpads
+            .get(&name)
+            .and_then(|runtime| runtime.window.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        let Some(output) = self.scroller.focused_output.clone() else {
+            return;
+        };
+        let Some(window) = self
+            .scroller
+            .monitor(&output)
+            .and_then(|monitor| {
+                monitor
+                    .active()
+                    .focused
+                    .and_then(|focused| monitor.active().windows.get(focused))
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let fullscreen = self
+            .scroller
+            .monitor(&output)
+            .is_some_and(|monitor| monitor.active().fullscreen.as_ref() == Some(&window));
+        let Some(window) = self
+            .scroller
+            .monitor_mut(&output)
+            .and_then(|monitor| monitor.remove_where(|candidate| candidate == &window))
+        else {
+            return;
+        };
+        if fullscreen {
+            self.set_window_fullscreen(&window, None);
+        }
+        self.scroller.scratchpads.insert(
+            name.clone(),
+            ScratchpadRuntime {
+                window: Some(window),
+                output: Some(output),
+                ..Default::default()
+            },
+        );
+        self.scroller.scratchpad_order.retain(|item| item != &name);
+        self.scroller.scratchpad_order.push(name);
+        self.relayout(true);
+        self.sync_focus();
+        self.ipc.touch();
+    }
+
+    fn release_numbered_scratchpad(&mut self, name: &str) {
+        let Some(runtime) = self.scroller.scratchpads.remove(name) else {
+            return;
+        };
+        let Some(window) = runtime.window else {
+            return;
+        };
+        self.scroller.animations.remove(&window.id());
+        for monitor in &mut self.scroller.monitors {
+            monitor.space.unmap_elem(&window);
+        }
+        self.scroller.scratchpad_order.retain(|item| item != name);
+        self.scroller.focused_scratchpad = None;
+        if let Some(monitor) = self.scroller.focused_mut() {
+            monitor.active_mut().add(window, true);
+        } else {
+            self.scroller.parked[0].add(window, true);
+        }
+        self.relayout(true);
+        self.sync_focus();
+        self.ipc.touch();
+    }
+
     pub fn show_scratchpad_by_name(&mut self, name: &str) {
         let Some(index) = self
             .config
@@ -3017,7 +3169,8 @@ impl Paw2 {
     }
 
     pub fn scratchpad_ipc_state(&self) -> Vec<crate::ipc::ScratchpadState> {
-        self.config
+        let mut scratchpads = self
+            .config
             .scratchpads
             .iter()
             .map(|config| {
@@ -3032,7 +3185,21 @@ impl Paw2 {
                     output: runtime.and_then(|runtime| runtime.output.clone()),
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        scratchpads.extend((0..NUMBERED_SCRATCHPAD_COUNT).filter_map(|index| {
+            let name = numbered_scratchpad_name(index);
+            let runtime = self.scroller.scratchpads.get(&name)?;
+            let window = runtime.window.as_ref()?;
+            let (_, app_id) = crate::screencopy::window_metadata(window);
+            Some(crate::ipc::ScratchpadState {
+                name: (index + 1).to_string(),
+                app_id,
+                loaded: true,
+                visible: runtime.visible,
+                output: runtime.output.clone(),
+            })
+        }));
+        scratchpads
     }
 
     fn show_scratchpad(&mut self, name: &str) {
@@ -3050,13 +3217,7 @@ impl Paw2 {
         let Some(rectangle) = self.scratchpad_rectangle(name, &output) else {
             return;
         };
-        let Some(edge) = self
-            .config
-            .scratchpads
-            .iter()
-            .find(|scratchpad| scratchpad.name == name)
-            .map(|scratchpad| scratchpad.edge)
-        else {
+        let Some(edge) = self.scratchpad_edge(name) else {
             return;
         };
         let previous_focus = self.scroller.focused_mut().and_then(|monitor| {
@@ -3135,13 +3296,7 @@ impl Paw2 {
         let Some(rectangle) = self.scratchpad_rectangle(name, &output) else {
             return;
         };
-        let Some(edge) = self
-            .config
-            .scratchpads
-            .iter()
-            .find(|scratchpad| scratchpad.name == name)
-            .map(|scratchpad| scratchpad.edge)
-        else {
+        let Some(edge) = self.scratchpad_edge(name) else {
             return;
         };
         let Some(monitor_index) = self
@@ -3842,6 +3997,14 @@ impl Paw2 {
                 self.toggle_scratchpad(index);
                 false
             }
+            Action::ToggleNumberedScratchpad(index) => {
+                self.toggle_numbered_scratchpad(index);
+                false
+            }
+            Action::AssignNumberedScratchpad(index) => {
+                self.assign_numbered_scratchpad(index);
+                false
+            }
             Action::ToggleScratchpadOverview => {
                 self.toggle_scratchpad_overview();
                 false
@@ -4123,6 +4286,14 @@ impl Paw2 {
                     .is_some()
             })
             .map(|config| config.name.clone())
+            .chain((0..NUMBERED_SCRATCHPAD_COUNT).filter_map(|index| {
+                let name = numbered_scratchpad_name(index);
+                self.scroller
+                    .scratchpads
+                    .get(&name)
+                    .and_then(|runtime| runtime.window.as_ref())
+                    .map(|_| name)
+            }))
             .collect::<Vec<_>>();
         if names.is_empty() {
             return;
@@ -5019,6 +5190,7 @@ impl Paw2 {
             client,
             frame,
             opacity: self.config.appearance.window_opacity() * fade,
+            scratchpad: self.scratchpad_name_for_window(window).is_some(),
         })
     }
 
@@ -6312,22 +6484,31 @@ fn overview_cards(
         .collect()
 }
 
+pub(crate) fn scratchpad_overview_rectangle(output: Size<i32, Logical>) -> Rectangle<i32, Logical> {
+    let size: Size<i32, Logical> = ((output.w * 3 / 4).max(1), (output.h / 2).max(1)).into();
+    Rectangle::new(
+        ((output.w - size.w) / 2, (output.h - size.h) / 2).into(),
+        size,
+    )
+}
+
 fn scratchpad_cards(output: Size<i32, Logical>, count: usize) -> Vec<Rectangle<i32, Logical>> {
     if count == 0 {
         return Vec::new();
     }
+    let panel = scratchpad_overview_rectangle(output);
     let columns = (count as f64).sqrt().ceil() as i32;
     let rows = (count as i32 + columns - 1) / columns;
     let gap = OVERVIEW_GAP;
-    let width = ((output.w - gap * (columns + 1)) / columns).max(1);
-    let height = ((output.h - gap * (rows + 1)) / rows).max(1);
+    let width = ((panel.size.w - gap * (columns + 1)) / columns).max(1);
+    let height = ((panel.size.h - gap * (rows + 1)) / rows).max(1);
     (0..count)
         .map(|index| {
             let index = index as i32;
             Rectangle::new(
                 (
-                    gap + (index % columns) * (width + gap),
-                    gap + (index / columns) * (height + gap),
+                    panel.loc.x + gap + (index % columns) * (width + gap),
+                    panel.loc.y + gap + (index / columns) * (height + gap),
                 )
                     .into(),
                 (width, height).into(),
@@ -8117,13 +8298,11 @@ mod tests {
     #[test]
     fn scratchpad_overview_cards_form_a_grid() {
         let cards = scratchpad_cards((1000, 800).into(), 4);
+        let panel = scratchpad_overview_rectangle((1000, 800).into());
+        assert_eq!(panel, Rectangle::new((125, 200).into(), (750, 400).into()));
         assert_eq!(cards.len(), 4);
         assert!(cards.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
-        assert!(
-            cards
-                .iter()
-                .all(|card| Rectangle::from_size((1000, 800).into()).contains_rect(*card))
-        );
+        assert!(cards.iter().all(|card| panel.contains_rect(*card)));
     }
 
     #[test]

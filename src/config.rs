@@ -21,6 +21,8 @@ use smithay::{
 /// so deleting this directory returns every section to `config.toml` exactly as
 /// its author left it.
 const OVERLAY_DIR: &str = "config.d";
+pub(crate) const NUMBERED_SCRATCHPAD_COUNT: usize = 9;
+pub(crate) const NUMBERED_SCRATCHPAD_PREFIX: &str = "__paw2_numbered_";
 
 const DEFAULT_CONFIG: &str = r##"# Paw2 configuration
 
@@ -188,6 +190,18 @@ quit = ["Super+Shift+Escape"]
 [bindings.scratchpads]
 # "Super+grave" = "terminal"
 
+[bindings.numbered_scratchpads]
+toggle = [
+  ["Super+Alt+1"], ["Super+Alt+2"], ["Super+Alt+3"],
+  ["Super+Alt+4"], ["Super+Alt+5"], ["Super+Alt+6"],
+  ["Super+Alt+7"], ["Super+Alt+8"], ["Super+Alt+9"],
+]
+assign = [
+  ["Super+Alt+Shift+1"], ["Super+Alt+Shift+2"], ["Super+Alt+Shift+3"],
+  ["Super+Alt+Shift+4"], ["Super+Alt+Shift+5"], ["Super+Alt+Shift+6"],
+  ["Super+Alt+Shift+7"], ["Super+Alt+Shift+8"], ["Super+Alt+Shift+9"],
+]
+
 [bindings.workspace]
 switch = [
   ["Super+1"], ["Super+2"], ["Super+3"],
@@ -234,6 +248,8 @@ pub enum Action {
     ToggleFullscreen,
     ToggleOverview,
     ToggleScratchpad(usize),
+    ToggleNumberedScratchpad(usize),
+    AssignNumberedScratchpad(usize),
     ToggleScratchpadOverview,
     FocusMonitorLeft,
     FocusMonitorRight,
@@ -1052,6 +1068,7 @@ struct RawBindings {
     actions: BTreeMap<String, Vec<String>>,
     commands: BTreeMap<String, Vec<String>>,
     scratchpads: BTreeMap<String, String>,
+    numbered_scratchpads: RawNumberedScratchpadBindings,
     workspace: RawWorkspaceBindings,
 }
 
@@ -1125,6 +1142,26 @@ impl Default for RawWorkspaceBindings {
             next: vec!["Super+Page_Down".into()],
             move_previous: vec!["Super+Shift+Page_Up".into()],
             move_next: vec!["Super+Shift+Page_Down".into()],
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawNumberedScratchpadBindings {
+    toggle: Vec<Vec<String>>,
+    assign: Vec<Vec<String>>,
+}
+
+impl Default for RawNumberedScratchpadBindings {
+    fn default() -> Self {
+        Self {
+            toggle: (1..=9)
+                .map(|number| vec![format!("Super+Alt+{number}")])
+                .collect(),
+            assign: (1..=9)
+                .map(|number| vec![format!("Super+Alt+Shift+{number}")])
+                .collect(),
         }
     }
 }
@@ -1472,6 +1509,9 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         if name.trim().is_empty() {
             return Err("scratchpad names cannot be empty".into());
         }
+        if name.starts_with(NUMBERED_SCRATCHPAD_PREFIX) {
+            return Err(format!("scratchpad name `{name}` is reserved"));
+        }
         if scratchpad.command.is_empty() || scratchpad.command[0].trim().is_empty() {
             return Err(format!(
                 "scratchpads.{name}.command must contain an executable"
@@ -1525,10 +1565,17 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
 
     let mut bindings = Vec::new();
     let workspace = raw.bindings.workspace;
+    let numbered_scratchpads = raw.bindings.numbered_scratchpads;
     let command_bindings = raw.bindings.commands;
     let scratchpad_bindings = raw.bindings.scratchpads;
     if workspace.switch.len() != 9 || workspace.r#move.len() != 9 {
         return Err("bindings.workspace switch and move must each contain exactly 9 lists".into());
+    }
+    if numbered_scratchpads.toggle.len() != 9 || numbered_scratchpads.assign.len() != 9 {
+        return Err(
+            "bindings.numbered_scratchpads toggle and assign must each contain exactly 9 lists"
+                .into(),
+        );
     }
     if let Some(unknown) = raw
         .bindings
@@ -1572,6 +1619,20 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
             .into_iter()
             .enumerate()
             .map(|(index, values)| (values, Action::MoveToWorkspace(index))),
+    );
+    configured.extend(
+        numbered_scratchpads
+            .toggle
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| (values, Action::ToggleNumberedScratchpad(index))),
+    );
+    configured.extend(
+        numbered_scratchpads
+            .assign
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| (values, Action::AssignNumberedScratchpad(index))),
     );
     for (values, action) in configured {
         for value in values {
@@ -1766,7 +1827,31 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let config = parse(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 69);
+        assert_eq!(config.bindings.len(), 87);
+        let one = xkb::keysym_from_name("1", xkb::KEYSYM_CASE_INSENSITIVE);
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    alt: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                one,
+            ),
+            Some(Action::ToggleNumberedScratchpad(0))
+        );
+        assert_eq!(
+            config.action(
+                &ModifiersState {
+                    alt: true,
+                    shift: true,
+                    logo: true,
+                    ..Default::default()
+                },
+                one,
+            ),
+            Some(Action::AssignNumberedScratchpad(0))
+        );
         let group_modifiers = ModifiersState {
             shift: true,
             logo: true,
@@ -2260,7 +2345,7 @@ mod tests {
             .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
             .replace("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
-        assert_eq!(legacy.bindings.len(), 69);
+        assert_eq!(legacy.bindings.len(), 87);
         // Whole-struct comparison: the built-in defaults and the values written
         // into DEFAULT_CONFIG must not drift apart.
         assert_eq!(legacy.appearance, config.appearance);
@@ -2293,7 +2378,7 @@ swap_right = ["Super+Shift+l"]
 "#;
         let config = parse(pre_workspace_config).unwrap();
         assert!(config.input.middle_click_paste);
-        assert_eq!(config.bindings.len(), 56);
+        assert_eq!(config.bindings.len(), 74);
 
         let old_monitor_bindings = DEFAULT_CONFIG
             .replace(
@@ -2322,6 +2407,15 @@ swap_right = ["Super+Shift+l"]
             parse(&invalid_workspaces)
                 .unwrap_err()
                 .contains("exactly 9")
+        );
+        let invalid_scratchpads = DEFAULT_CONFIG.replace(
+            "  [\"Super+Alt+7\"], [\"Super+Alt+8\"], [\"Super+Alt+9\"],\n]",
+            "  [\"Super+Alt+7\"], [\"Super+Alt+8\"],\n]",
+        );
+        assert!(
+            parse(&invalid_scratchpads)
+                .unwrap_err()
+                .contains("numbered_scratchpads")
         );
     }
 

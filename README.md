@@ -215,6 +215,18 @@ quit = ["Super+Shift+Escape"]
 [bindings.scratchpads]
 "Super+grave" = "terminal"
 
+[bindings.numbered_scratchpads]
+toggle = [
+  ["Super+Alt+1"], ["Super+Alt+2"], ["Super+Alt+3"],
+  ["Super+Alt+4"], ["Super+Alt+5"], ["Super+Alt+6"],
+  ["Super+Alt+7"], ["Super+Alt+8"], ["Super+Alt+9"],
+]
+assign = [
+  ["Super+Alt+Shift+1"], ["Super+Alt+Shift+2"], ["Super+Alt+Shift+3"],
+  ["Super+Alt+Shift+4"], ["Super+Alt+Shift+5"], ["Super+Alt+Shift+6"],
+  ["Super+Alt+Shift+7"], ["Super+Alt+Shift+8"], ["Super+Alt+Shift+9"],
+]
+
 [bindings.workspace]
 switch = [
   ["Super+1"], ["Super+2"], ["Super+3"],
@@ -249,10 +261,16 @@ against its configured edge using `margin` logical pixels.
 Scratchpads stay running while hidden. `Super+left-drag` moves them and resizes
 from an edge, and Paw2 remembers separate geometry for each monitor in
 `$XDG_STATE_HOME/paw2/scratchpads.json` (normally
-`~/.local/state/paw2/scratchpads.json`). The scratchpad overview shows live
-previews of every scratchpad used during the current session; use the arrow or
-Vim keys, Enter, Escape, or the mouse. A shell can reset saved placement by
-sending `{"cmd":"reset-scratchpad","name":"terminal"}` to `$PAW2_SOCKET`.
+`~/.local/state/paw2/scratchpads.json`). Numbered slots can hold any focused
+window: `Super+Alt+Shift+1` through `9` assign or release a slot, while
+`Super+Alt+1` through `9` show or hide it. Both sets are fully replaceable in
+`[bindings.numbered_scratchpads]`.
+
+The scratchpad overview shows live previews of every configured and numbered
+scratchpad used during the current session in a centred panel covering 75% of
+the monitor width and 50% of its height; use the arrow or Vim keys, Enter,
+Escape, or the mouse. A shell can reset saved placement by sending
+`{"cmd":"reset-scratchpad","name":"terminal"}` to `$PAW2_SOCKET`.
 
 Each workspace remembers its layout. `enabled_layouts` controls which layouts
 can be selected and their cycling order; it must contain at least one unique

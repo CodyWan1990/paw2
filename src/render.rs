@@ -50,7 +50,10 @@ use smithay::{
 
 use crate::{
     config::AppearanceConfig,
-    layout::{WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
+    layout::{
+        WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect,
+        scratchpad_overview_rectangle,
+    },
     state::Paw2,
 };
 
@@ -444,7 +447,7 @@ fn fitted_tab_title(font: &Font, title: &str, size: f32, available: f32) -> Stri
 pub fn clear_color(state: &Paw2, output: &Output) -> [f32; 4] {
     if state.renders_fullscreen(output) {
         [0.0, 0.0, 0.0, 1.0]
-    } else if state.overview_visible() || state.scratchpad_overview_visible_on(output) {
+    } else if state.overview_visible() {
         state.config.overview.backdrop_color
     } else {
         [0.04, 0.04, 0.05, 1.0]
@@ -573,9 +576,6 @@ impl Effects {
             }
         }
         state.advance_animations();
-        if state.scratchpad_overview_visible_on(output) {
-            return self.scratchpad_overview_elements(renderer, state, output);
-        }
         // Gated on visibility, not on input ownership: the closing animation
         // still has to be drawn after the overview has given focus back.
         if state.overview_visible() {
@@ -643,7 +643,7 @@ impl Effects {
                 )
                 .map(PawRenderElements::Constrained),
             );
-            return Ok(elements);
+            return self.with_scratchpad_overview(renderer, state, output, elements);
         }
 
         let Some(space) = state.space_for_output(output) else {
@@ -665,6 +665,11 @@ impl Effects {
             // Resolved once per element: the lookup walks every window on every
             // workspace, and all three consumers below want the same answer.
             let window_state = state.window_render_state(output, element.id());
+            if state.scratchpad_overview_visible_on(output)
+                && window_state.is_some_and(|window| window.scratchpad)
+            {
+                continue;
+            }
             let blur = self.blur_elements(state, &element, scale, output_bounds, window_state);
             let shadow = self.shadow_element(&output_name, element.id(), window_state);
             if shadow.is_some() {
@@ -695,7 +700,22 @@ impl Effects {
         // ponytail: linear lookup, bounded by the windows on one workspace.
         self.shadows
             .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
-        Ok(elements)
+        self.with_scratchpad_overview(renderer, state, output, elements)
+    }
+
+    fn with_scratchpad_overview(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        state: &Paw2,
+        output: &Output,
+        mut desktop: Vec<PawRenderElements>,
+    ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
+        if !state.scratchpad_overview_visible_on(output) {
+            return Ok(desktop);
+        }
+        let mut overview = self.scratchpad_overview_elements(renderer, state, output)?;
+        overview.append(&mut desktop);
+        Ok(overview)
     }
 
     fn tab_elements(
@@ -795,6 +815,20 @@ impl Effects {
                 .map(PawRenderElements::Constrained),
             );
         }
+        let Some(size) = state.output_geometry(output).map(|geometry| geometry.size) else {
+            return Ok(elements);
+        };
+        let panel = scratchpad_overview_rectangle(size)
+            .to_f64()
+            .to_physical(scale)
+            .to_i32_round();
+        elements.push(PawRenderElements::Solid(SolidColorRenderElement::new(
+            self.overview_cards[0].clone(),
+            panel,
+            CommitCounter::default(),
+            OVERVIEW_CARD,
+            Kind::Unspecified,
+        )));
         Ok(elements)
     }
 
