@@ -44,10 +44,16 @@ pub struct ScreencopyState {
     pub toplevel_capture_source: ToplevelCaptureSourceState,
     pub image_copy_capture: ImageCopyCaptureState,
     pub foreign_toplevel_list: ForeignToplevelListState,
+    /// Live capture sessions. Held, not read: `Session` closes itself on drop,
+    /// so letting one go here would stop a client's capture mid-stream.
     sessions: Vec<Session>,
     toplevels: HashMap<usize, (WeakWindow, ForeignToplevelHandle)>,
     pending: Vec<PendingCapture>,
 }
+
+/// Ceiling on undrained capture requests. Generous next to the handful of
+/// sessions a portal and a screenshot tool hold open at once.
+const MAX_PENDING_CAPTURES: usize = 64;
 
 pub(crate) struct PendingCapture {
     pub target: CaptureTarget,
@@ -79,17 +85,27 @@ impl ScreencopyState {
         }
     }
 
-    pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<PendingCapture> {
-        // A target whose weak handle no longer upgrades matches no output and no
-        // window, so without this it would sit in `pending` for the rest of the
-        // session. `fail_output` only covers the clean disconnect path.
-        let orphaned = self
-            .pending
-            .extract_if(.., |capture| !capture.target.is_alive())
-            .collect::<Vec<_>>();
-        for capture in orphaned {
+    /// Tell every pending capture matching `predicate` that it will not happen,
+    /// and drop it.
+    fn fail_matching(&mut self, predicate: impl FnMut(&mut PendingCapture) -> bool) {
+        for capture in self.pending.extract_if(.., predicate) {
             capture.frame.fail(CaptureFailureReason::Stopped);
         }
+    }
+
+    /// A target whose weak handle no longer upgrades matches no output and no
+    /// window, so without this it would sit in `pending` for the rest of the
+    /// session. `fail_output` only covers the clean disconnect path.
+    ///
+    /// Called from both drain paths: an output that never renders again - every
+    /// one suspended, say - would otherwise never run the sweep at all, which is
+    /// the leak it exists to prevent.
+    fn sweep_orphans(&mut self) {
+        self.fail_matching(|capture| !capture.target.is_alive());
+    }
+
+    pub(crate) fn take_for_output(&mut self, output: &Output) -> Vec<PendingCapture> {
+        self.sweep_orphans();
         self.pending
             .extract_if(.., |capture| match &capture.target {
                 CaptureTarget::Output(target) => target.upgrade().as_ref() == Some(output),
@@ -99,6 +115,7 @@ impl ScreencopyState {
     }
 
     pub(crate) fn take_window_captures(&mut self) -> Vec<PendingCapture> {
+        self.sweep_orphans();
         self.pending
             .extract_if(.., |capture| {
                 matches!(capture.target, CaptureTarget::Window(_))
@@ -133,20 +150,13 @@ impl Paw2 {
                 .foreign_toplevel_list
                 .remove_toplevel(&handle);
         }
-        let removed = self
-            .screencopy_state
-            .pending
-            .extract_if(.., |capture| {
-                matches!(
-                    &capture.target,
-                    CaptureTarget::Window(target)
-                        if target.upgrade().as_ref() == Some(window)
-                )
-            })
-            .collect::<Vec<_>>();
-        for capture in removed {
-            capture.frame.fail(CaptureFailureReason::Stopped);
-        }
+        self.screencopy_state.fail_matching(|capture| {
+            matches!(
+                &capture.target,
+                CaptureTarget::Window(target)
+                    if target.upgrade().as_ref() == Some(window)
+            )
+        });
     }
 
     /// The window behind a foreign-toplevel id, if it is still mapped.
@@ -211,17 +221,20 @@ fn capture_shm_formats() -> Vec<wl_shm::Format> {
 
 pub(crate) fn window_metadata(window: &Window) -> (String, String) {
     if let Some(surface) = window.toplevel() {
+        // Runs once per tab per frame, so a panic here would take the session
+        // down mid-composite. Absence is answered the same way the X11 branch
+        // below answers it rather than asserting another crate's invariant.
         return with_states(surface.wl_surface(), |states| {
-            let attributes = states
+            states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap();
-            (
-                attributes.title.clone().unwrap_or_default(),
-                attributes.app_id.clone().unwrap_or_default(),
-            )
+                .and_then(|data| data.lock().ok())
+                .map_or_else(Default::default, |attributes| {
+                    (
+                        attributes.title.clone().unwrap_or_default(),
+                        attributes.app_id.clone().unwrap_or_default(),
+                    )
+                })
         });
     }
     window.x11_surface().map_or_else(
@@ -298,6 +311,14 @@ impl ImageCopyCaptureHandler for Paw2 {
             frame.fail(CaptureFailureReason::Unknown);
             return;
         };
+        // Whole-output capture is open to every client, and a client can ask for
+        // many frames before the redraw below drains any of them. One redraw
+        // never owes more than a frame per live session, so a queue this deep
+        // means a client is not reading its own captures.
+        if self.screencopy_state.pending.len() >= MAX_PENDING_CAPTURES {
+            frame.fail(CaptureFailureReason::Stopped);
+            return;
+        }
         self.screencopy_state.pending.push(PendingCapture {
             target,
             frame,
