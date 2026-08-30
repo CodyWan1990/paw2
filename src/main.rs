@@ -116,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .publish_config(config_watcher.document(), Some(error.to_string()));
                 }
             }
+            reap_children();
             TimeoutAction::ToDuration(Duration::from_millis(500))
         },
     )?;
@@ -254,32 +255,46 @@ fn activation_environment() -> Vec<&'static str> {
     variables
 }
 
-fn import_activation_environment() {
-    let mut variables = vec!["--systemd"];
-    variables.extend(activation_environment());
-    let status = std::process::Command::new("dbus-update-activation-environment")
-        .args(variables)
-        .status();
-    match status {
+/// Run a session-integration helper to completion, logging rather than
+/// failing. None of these is worth the session: a desktop without a portal
+/// environment is degraded, a desktop that refused to start is not.
+fn run(command: &mut std::process::Command, step: &str) {
+    match command.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => tracing::warn!(%status, "could not import portal activation environment"),
-        Err(error) => tracing::warn!(?error, "could not run dbus-update-activation-environment"),
+        Ok(status) => tracing::warn!(%status, step, "session step failed"),
+        Err(error) => tracing::warn!(?error, step, "could not run session step"),
     }
 }
 
+/// Push variables into the D-Bus and systemd activation environment, so
+/// anything activated later - a portal, a user service - sees them.
+fn update_activation_environment<I, S>(variables: I, step: &str)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run(
+        std::process::Command::new("dbus-update-activation-environment")
+            .arg("--systemd")
+            .args(variables),
+        step,
+    );
+}
+
+fn import_activation_environment() {
+    update_activation_environment(
+        activation_environment(),
+        "import the portal activation environment",
+    );
+}
+
 fn update_cursor_activation_environment(settings: &cursor::CursorSettings) {
-    let variables = settings
-        .environment_values()
-        .map(|(name, value)| format!("{name}={value}"));
-    match std::process::Command::new("dbus-update-activation-environment")
-        .arg("--systemd")
-        .args(variables)
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => tracing::warn!(%status, "could not update the cursor launch environment"),
-        Err(error) => tracing::warn!(?error, "could not update the cursor launch environment"),
-    }
+    update_activation_environment(
+        settings
+            .environment_values()
+            .map(|(name, value)| format!("{name}={value}")),
+        "update the cursor launch environment",
+    );
 }
 
 /// Finish initializing the login daemon that `pam_gnome_keyring` unlocked.
@@ -325,12 +340,10 @@ fn update_graphical_session(action: &str) {
     if action == "start" {
         command.arg("--no-block");
     }
-    let status = command.args([action, "paw2-session.target"]).status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => tracing::warn!(%status, action, "could not update graphical session target"),
-        Err(error) => tracing::warn!(?error, action, "could not run systemctl"),
-    }
+    run(
+        command.args([action, "paw2-session.target"]),
+        "update the graphical session target",
+    );
 }
 
 /// `dbus-update-activation-environment` has no unset verb, but the systemd user
@@ -344,14 +357,10 @@ fn unset_activation_environment() {
             variables.push(name);
         }
     }
-    match std::process::Command::new("systemctl")
-        .args(variables)
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => tracing::warn!(%status, "could not clear the session environment"),
-        Err(error) => tracing::warn!(?error, "could not run systemctl to clear the environment"),
-    }
+    run(
+        std::process::Command::new("systemctl").args(variables),
+        "clear the session environment",
+    );
 }
 
 fn apply_theme_environment(theme: &config::ThemeConfig) {
@@ -421,70 +430,91 @@ fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)>
     variables
 }
 
-fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
-    let mut settings = cursor_gsettings(theme);
-    if let Some(value) = &theme.icon_theme {
-        settings.push(("icon-theme", value.clone()));
-    }
-    if let Some(value) = &theme.gtk_theme {
-        settings.push(("gtk-theme", value.clone()));
-    }
-    if let Some(value) = &theme.font {
-        settings.push(("font-name", value.clone()));
-    }
-    settings
+/// An `org.gnome.desktop.interface` key and where its value comes from.
+type ThemeKey = (&'static str, fn(&config::ThemeConfig) -> Option<String>);
+
+/// Cursor keys are their own list because a live change to one also has to
+/// reload the compositor's own cursor and re-export `XCURSOR_*` to the
+/// activation environment - see the reload timer in `main`.
+const CURSOR_KEYS: &[ThemeKey] = &[
+    ("cursor-theme", |theme| theme.cursor_theme.clone()),
+    ("cursor-size", |theme| {
+        theme.cursor_size.map(|size| size.to_string())
+    }),
+];
+
+const DESKTOP_KEYS: &[ThemeKey] = &[
+    ("icon-theme", |theme| theme.icon_theme.clone()),
+    ("gtk-theme", |theme| theme.gtk_theme.clone()),
+];
+
+/// Set once at startup and deliberately absent from the reload path: a font
+/// change is restart-only, which `config::theme_requires_restart` decides and
+/// the reload warning tells the user.
+const STARTUP_ONLY_KEYS: &[ThemeKey] = &[("font-name", |theme| theme.font.clone())];
+
+/// Every key in `keys` the theme has a value for.
+fn settings(keys: &[ThemeKey], theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
+    keys.iter()
+        .filter_map(|(key, read)| read(theme).map(|value| (*key, value)))
+        .collect()
 }
 
-fn cursor_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
-    let mut settings = Vec::new();
-    if let Some(value) = &theme.cursor_theme {
-        settings.push(("cursor-theme", value.clone()));
-    }
-    if let Some(value) = theme.cursor_size {
-        settings.push(("cursor-size", value.to_string()));
-    }
-    settings
+/// Every key in `keys` whose value differs, paired with the new one - `None`
+/// meaning the key should be reset rather than set.
+fn changed(
+    keys: &[ThemeKey],
+    current: &config::ThemeConfig,
+    updated: &config::ThemeConfig,
+) -> Vec<(&'static str, Option<String>)> {
+    keys.iter()
+        .filter_map(|(key, read)| {
+            let value = read(updated);
+            (read(current) != value).then_some((*key, value))
+        })
+        .collect()
+}
+
+fn theme_gsettings(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
+    [CURSOR_KEYS, DESKTOP_KEYS, STARTUP_ONLY_KEYS]
+        .into_iter()
+        .flat_map(|keys| settings(keys, theme))
+        .collect()
 }
 
 fn changed_cursor_gsettings(
     current: &config::ThemeConfig,
     updated: &config::ThemeConfig,
 ) -> Vec<(&'static str, Option<String>)> {
-    let mut settings = Vec::new();
-    if current.cursor_theme != updated.cursor_theme {
-        settings.push(("cursor-theme", updated.cursor_theme.clone()));
-    }
-    if current.cursor_size != updated.cursor_size {
-        settings.push((
-            "cursor-size",
-            updated.cursor_size.map(|size| size.to_string()),
-        ));
-    }
-    settings
+    changed(CURSOR_KEYS, current, updated)
 }
 
 fn changed_desktop_gsettings(
     current: &config::ThemeConfig,
     updated: &config::ThemeConfig,
 ) -> Vec<(&'static str, Option<String>)> {
-    let mut settings = Vec::new();
-    if current.icon_theme != updated.icon_theme {
-        settings.push(("icon-theme", updated.icon_theme.clone()));
-    }
-    if current.gtk_theme != updated.gtk_theme {
-        settings.push(("gtk-theme", updated.gtk_theme.clone()));
-    }
-    settings
+    changed(DESKTOP_KEYS, current, updated)
 }
 
 /// Live children, so logging out does not leave them behind holding the login
 /// session open.
-// ponytail: a plain pid list; the reaper clears each entry the moment the child
-// is waited for, so the only window for pid reuse is shutdown itself.
-static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+///
+/// The `Child` handles are owned, not just their pids: an unwaited handle
+/// keeps the pid reserved, so there is no window in which a dead child's pid
+/// could be reused by something else and signalled at shutdown.
+static CHILDREN: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
 
-fn children() -> MutexGuard<'static, Vec<u32>> {
+fn children() -> MutexGuard<'static, Vec<std::process::Child>> {
     CHILDREN.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Drop the children that have already exited.
+///
+/// Called from the config-reload timer, which is running twice a second
+/// anyway. That is what replaced a thread per child whose only job was to sit
+/// in `wait`.
+fn reap_children() {
+    children().retain_mut(|child| matches!(child.try_wait(), Ok(None)));
 }
 
 pub(crate) fn spawn<T: AsRef<OsStr>>(
@@ -497,25 +527,22 @@ pub(crate) fn spawn<T: AsRef<OsStr>>(
             "command cannot be empty",
         ));
     };
-    let mut child = std::process::Command::new(program)
+    let child = std::process::Command::new(program)
         .args(args)
         .envs(cursor_settings.environment_values())
         .spawn()?;
-    let pid = child.id();
-    children().push(pid);
-    // ponytail: one waiter per child; replace with session process supervision if launch volume grows.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-        children().retain(|tracked| *tracked != pid);
-    });
+    children().push(child);
     Ok(())
 }
 
 /// Wayland clients exit on their own once the socket closes; anything else we
 /// launched would outlive the session and keep logind from ending it.
 fn terminate_children() {
-    for pid in children().drain(..) {
-        if let Some(pid) = Pid::from_raw(pid as i32) {
+    // Signalled, not waited for: a child that ignores `TERM` must not hold the
+    // session open past logout. The process is on its way out, so the zombies
+    // this leaves are reparented and reaped by init.
+    for child in children().drain(..) {
+        if let Some(pid) = Pid::from_raw(child.id() as i32) {
             let _ = kill_process(pid, Signal::TERM);
         }
     }
@@ -605,9 +632,23 @@ mod tests {
     use super::*;
 
     #[test]
+    // One test, not two: `CHILDREN` is a global and `terminate_children` drains
+    // it, so a sibling test running in parallel would be reaping this one's.
     fn shutdown_terminates_tracked_children() {
-        spawn(&["sleep", "10"], &cursor::CursorSettings::environment()).unwrap();
-        assert!(!children().is_empty());
+        let settings = cursor::CursorSettings::environment();
+        spawn(&["sleep", "10"], &settings).unwrap();
+        spawn(&["true"], &settings).unwrap();
+        assert_eq!(children().len(), 2);
+
+        // `true` exits immediately, but not synchronously with `spawn`; the
+        // sleeper has to survive every reap.
+        let reaped = (0..200).any(|_| {
+            reap_children();
+            std::thread::sleep(Duration::from_millis(10));
+            children().len() == 1
+        });
+        assert!(reaped, "an exited child was never reaped");
+
         terminate_children();
         assert!(children().is_empty());
     }
