@@ -605,10 +605,6 @@ pub struct ConfigWatcher {
     /// Each layer's text in merge order. Compared verbatim so that saving a
     /// file without changing it does not churn the compositor.
     sources: Vec<String>,
-    /// Layer count and newest mtime. The cheap gate the twice-a-second poll
-    /// stops at when nothing changed; the count is what catches a drop-in being
-    /// added or deleted without any surviving file being touched.
-    stamp: Option<(usize, std::time::SystemTime)>,
     /// The merged document behind the live `Config`. Kept so the IPC layer can
     /// hand a shell the effective config without a second copy of the defaults.
     document: toml::Value,
@@ -642,31 +638,32 @@ impl ConfigWatcher {
         layers
     }
 
-    /// `None` when any layer's metadata is unreadable, which falls through to
-    /// the full read rather than guessing - the behaviour this had before.
-    fn stamp(layers: &[PathBuf]) -> Option<(usize, std::time::SystemTime)> {
-        let mut newest = std::time::SystemTime::UNIX_EPOCH;
-        for layer in layers {
-            let modified = fs::metadata(layer).and_then(|data| data.modified()).ok()?;
-            newest = newest.max(modified);
-        }
-        Some((layers.len(), newest))
+    /// Every layer's text, in merge order.
+    ///
+    /// Split from [`Self::merge_sources`] so [`Self::reload`] can cache what it
+    /// read *before* anything parses it: a config that does not parse must be
+    /// reported once, not on every poll for as long as it stays broken.
+    fn read_sources(layers: &[PathBuf]) -> io::Result<Vec<String>> {
+        layers
+            .iter()
+            .map(|layer| {
+                fs::read_to_string(layer)
+                    .map_err(|error| invalid_data(layer, format!("could not read config: {error}")))
+            })
+            .collect()
     }
 
-    /// Read every layer and merge it over the compiled fallback.
+    /// Merge every layer over the compiled fallback.
     ///
     /// Starting from `FALLBACK_CONFIG` rather than an empty document is what
     /// keeps the fallback bindings alive under a config that never mentions
     /// them, and it means the merged document is the effective config - which
     /// is what the shell is handed over IPC.
-    fn read(layers: &[PathBuf]) -> io::Result<(toml::Value, Vec<String>)> {
+    fn merge_sources(layers: &[PathBuf], sources: &[String]) -> io::Result<toml::Value> {
         let mut document =
             toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML");
-        let mut sources = Vec::with_capacity(layers.len());
-        for (index, layer) in layers.iter().enumerate() {
-            let source = fs::read_to_string(layer)
-                .map_err(|error| invalid_data(layer, format!("could not read config: {error}")))?;
-            let overlay = toml::from_str(&source)
+        for (index, (layer, source)) in layers.iter().zip(sources).enumerate() {
+            let overlay = toml::from_str(source)
                 .map_err(|error: toml::de::Error| invalid_data(layer, error.to_string()))?;
             // `config.toml` is the base layer and merges key by key, so a partial
             // hand-written section still inherits the compiled defaults around it.
@@ -677,9 +674,13 @@ impl ConfigWatcher {
             } else {
                 replace_sections(&mut document, overlay);
             }
-            sources.push(source);
         }
-        Ok((document, sources))
+        Ok(document)
+    }
+
+    fn read(layers: &[PathBuf]) -> io::Result<(toml::Value, Vec<String>)> {
+        let sources = Self::read_sources(layers)?;
+        Ok((Self::merge_sources(layers, &sources)?, sources))
     }
 
     /// The merged config as it was last parsed successfully.
@@ -689,17 +690,19 @@ impl ConfigWatcher {
 
     pub fn reload(&mut self) -> io::Result<Option<Config>> {
         let layers = self.layers();
-        let stamp = Self::stamp(&layers);
-        if stamp.is_some() && stamp == self.stamp {
-            return Ok(None);
-        }
-        self.stamp = stamp;
-
-        let (document, sources) = Self::read(&layers)?;
+        // Compared by content, not by mtime. A layer can be rewritten with an
+        // older or preserved timestamp - `cp -p`, `rsync --times`, a `git
+        // checkout` - and a gate keyed on the newest mtime would call that no
+        // change and never reload. Reading three small page-cached files twice
+        // a second is not worth a class of missed edits.
+        let sources = Self::read_sources(&layers)?;
         if sources == self.sources {
             return Ok(None);
         }
+        // Cached before the parse, so text that does not parse is reported once
+        // rather than on every poll until the user fixes it.
         self.sources = sources;
+        let document = Self::merge_sources(&layers, &self.sources)?;
         let config = parse_value(document.clone()).map_err(|error| blame(&layers, error))?;
         // Only now: `document()` is what Paw2 is running, and a rejected save
         // must leave the last config that parsed on show, not its own values
@@ -715,8 +718,8 @@ impl ConfigWatcher {
     /// so the shell that would show the error is the one thing that cannot
     /// start. Keeping the hand-written layer breaks that circle.
     ///
-    /// `stamp` and `sources` stay as the failed [`Self::reload`] left them, so
-    /// the next edit to the drop-in retries the full merge.
+    /// `sources` holds the text the failed [`Self::reload`] rejected, so the
+    /// next edit to the drop-in - and only an edit - retries the full merge.
     fn base_only(&mut self) -> io::Result<Config> {
         let layers = [self.path.clone()];
         let (document, _) = Self::read(&layers)?;
@@ -1158,11 +1161,10 @@ pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
     let mut watcher = ConfigWatcher {
         path,
         sources: Vec::new(),
-        stamp: None,
         document: toml::Value::Table(toml::Table::new()),
     };
-    // A fresh watcher has no stamp and no cached sources, so neither change
-    // gate can short-circuit here; this reads, and seeds both for the poll.
+    // A fresh watcher has no cached sources, so the change gate cannot
+    // short-circuit here; this reads, and seeds them for the poll.
     let error = match watcher.reload() {
         Ok(config) => {
             return Ok((
@@ -2547,11 +2549,23 @@ swap_right = ["Super+Shift+l"]
         root
     }
 
+    /// Write `source` and stamp it with a fixed past mtime, so two successive
+    /// edits are indistinguishable by timestamp.
+    fn write_backdated(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        let when = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
     fn watcher_at(root: &Path) -> ConfigWatcher {
         ConfigWatcher {
             path: root.join("config.toml"),
             sources: Vec::new(),
-            stamp: None,
             document: toml::Value::Table(toml::Table::new()),
         }
     }
@@ -2787,16 +2801,18 @@ swap_right = ["Super+Shift+l"]
         let mut watcher = ConfigWatcher {
             path: path.clone(),
             sources: vec![with_monitors.clone()],
-            stamp: None,
             document: toml::Value::Table(toml::Table::new()),
         };
         assert!(watcher.reload().unwrap().is_none());
 
-        // Prove the mtime gate short-circuits rather than re-reading: the cached
-        // source is now a lie, and an untouched file must still report no change.
-        watcher.sources = vec!["stale".into()];
-        assert!(watcher.reload().unwrap().is_none());
-        watcher.sources = vec![with_monitors.clone()];
+        // An edit that does not move the file's mtime forward must still be
+        // seen: the gate is the file's content, not its timestamp. Both writes
+        // below land on the same backdated mtime with the layer count
+        // unchanged, which is precisely what a timestamp gate calls "no change".
+        write_backdated(&path, &with_monitors.replace("gaps = 15", "gaps = 16"));
+        assert!(watcher.reload().unwrap().is_some());
+        write_backdated(&path, &with_monitors);
+        assert!(watcher.reload().unwrap().is_some());
 
         let changed = with_monitors
             .replace("column_width = 0.6", "column_width = 0.7")
