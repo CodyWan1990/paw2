@@ -812,7 +812,7 @@ impl DirectBackend {
         }
 
         let geometries = state.output_rects().collect::<Vec<_>>();
-        let pointer = state.seat.get_pointer().unwrap();
+        let pointer = state.pointer();
         pointer.set_location(crate::input::constrain_pointer(
             pointer.current_location(),
             &geometries,
@@ -1308,7 +1308,7 @@ impl DirectBackend {
         let Some(geometry) = state.output_geometry(output) else {
             return;
         };
-        let location = state.seat.get_pointer().unwrap().current_location();
+        let location = state.pointer().current_location();
         if !geometry.to_f64().contains(location) || state.cursor_status == CursorImageStatus::Hidden
         {
             return;

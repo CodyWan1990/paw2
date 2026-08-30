@@ -812,8 +812,12 @@ impl WaylandDndGrabHandler for Paw2 {
     ) {
         match grab_type {
             GrabType::Pointer => {
-                let pointer = seat.get_pointer().unwrap();
-                let start_data = pointer.grab_start_data().unwrap();
+                // Smithay only reports a pointer grab after `has_grab(serial)`
+                // held, so the start data is there; the seat is this one.
+                let pointer = self.pointer();
+                let Some(start_data) = pointer.grab_start_data() else {
+                    return;
+                };
                 let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
                 pointer.set_grab(self, grab, serial, Focus::Keep);
             }

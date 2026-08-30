@@ -298,6 +298,96 @@ impl Paw2 {
             .is_some_and(|inhibitor| inhibitor.is_active())
     }
 
+    /// Send one motion event and close the frame.
+    fn send_motion(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        location: Point<f64, Logical>,
+        under: Option<(WlSurface, Point<f64, Logical>)>,
+        time: u32,
+    ) {
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// A motion plus everything that follows an unconstrained one: hover focus
+    /// if the config asks for it, and activating whatever pointer constraint
+    /// the surface now under the pointer declares. Neither applies during a
+    /// grab - the grabbing client owns the pointer until it lets go.
+    fn deliver_motion(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        location: Point<f64, Logical>,
+        under: Option<(WlSurface, Point<f64, Logical>)>,
+        time: u32,
+    ) {
+        self.send_motion(pointer, location, under.clone(), time);
+        if pointer.is_grabbed() {
+            return;
+        }
+        if self.config.input.focus_follows_mouse
+            && let Some(window) = self.window_under(location)
+        {
+            self.focus_window_on_hover(&window);
+        }
+        activate_pointer_constraint(pointer, location, under);
+    }
+
+    /// Pass a button press or release on to the client and close the frame.
+    fn forward_button<I: InputBackend>(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        event: &I::PointerButtonEvent,
+        serial: smithay::utils::Serial,
+    ) {
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button: event.button_code(),
+                state: event.state(),
+                serial,
+                time: event.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Take the pointer for a compositor-side drag - a move, a resize, a tab
+    /// regroup. `focus` is the surface the grab started over, which the grab
+    /// hands back to the client when it lets go.
+    fn start_mouse_grab(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        operation: MouseOperation,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        button: u32,
+        location: Point<f64, Logical>,
+        serial: smithay::utils::Serial,
+    ) {
+        pointer.set_grab(
+            self,
+            MouseGrab {
+                start_data: GrabStartData {
+                    focus,
+                    button,
+                    location,
+                },
+                operation,
+                location,
+            },
+            serial,
+            Focus::Clear,
+        );
+    }
+
     pub fn process_input<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -305,7 +395,7 @@ impl Paw2 {
                 let time = Event::time_msec(&event);
                 let key_state = event.state();
                 let inhibited = self.keyboard_inhibited();
-                let action = self.seat.get_keyboard().unwrap().input::<Option<_>, _>(
+                let action = self.keyboard().input::<Option<_>, _>(
                     self,
                     event.key_code(),
                     key_state,
@@ -391,8 +481,8 @@ impl Paw2 {
                 if geometries.is_empty() {
                     return;
                 }
-                let current = self.seat.get_pointer().unwrap().current_location();
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.pointer();
+                let current = pointer.current_location();
                 if self.overview_active() || self.scratchpad_overview_active() {
                     let location = constrain_pointer(current + event.delta(), &geometries);
                     pointer.relative_motion(
@@ -404,16 +494,7 @@ impl Paw2 {
                             utime: event.time(),
                         },
                     );
-                    pointer.motion(
-                        self,
-                        None,
-                        &MotionEvent {
-                            location,
-                            serial: SERIAL_COUNTER.next_serial(),
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
+                    self.send_motion(&pointer, location, None, event.time_msec());
                     return;
                 }
                 let under = self.surface_under(current);
@@ -474,70 +555,25 @@ impl Paw2 {
                     return;
                 }
                 self.focus_output_at(location);
-                pointer.motion(
-                    self,
-                    new_under.clone(),
-                    &MotionEvent {
-                        location,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
-                if self.config.input.focus_follows_mouse
-                    && !pointer.is_grabbed()
-                    && let Some(window) = self.window_under(location)
-                {
-                    self.focus_window_on_hover(&window);
-                }
-                if !pointer.is_grabbed() {
-                    activate_pointer_constraint(&pointer, location, new_under);
-                }
+                self.deliver_motion(&pointer, location, new_under, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(geometry) = self.focused_output_geometry() else {
                     return;
                 };
                 let location = event.position_transformed(geometry.size) + geometry.loc.to_f64();
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.pointer();
                 if self.overview_active() || self.scratchpad_overview_active() {
-                    pointer.motion(
-                        self,
-                        None,
-                        &MotionEvent {
-                            location,
-                            serial: SERIAL_COUNTER.next_serial(),
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
+                    self.send_motion(&pointer, location, None, event.time_msec());
                     return;
                 }
                 self.focus_output_at(location);
                 let under = self.surface_under(location);
 
-                pointer.motion(
-                    self,
-                    under.clone(),
-                    &MotionEvent {
-                        location,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
-                if self.config.input.focus_follows_mouse
-                    && !pointer.is_grabbed()
-                    && let Some(window) = self.window_under(location)
-                {
-                    self.focus_window_on_hover(&window);
-                }
-                if !pointer.is_grabbed() {
-                    activate_pointer_constraint(&pointer, location, under);
-                }
+                self.deliver_motion(&pointer, location, under, event.time_msec());
             }
             InputEvent::PointerButton { event, .. } => {
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.pointer();
                 let serial = SERIAL_COUNTER.next_serial();
                 let location = pointer.current_location();
 
@@ -566,7 +602,7 @@ impl Paw2 {
                     return;
                 }
 
-                let modifiers = self.seat.get_keyboard().unwrap().modifier_state();
+                let modifiers = self.keyboard().modifier_state();
                 let tab = self.tab_at(location);
                 if event.state() == ButtonState::Pressed
                     && !pointer.is_grabbed()
@@ -576,30 +612,15 @@ impl Paw2 {
                     self.focus_output_at(location);
                     self.focus_window(&window);
                     if let Some(operation) = self.begin_tab_group_drag(window, location) {
-                        pointer.set_grab(
-                            self,
-                            MouseGrab {
-                                start_data: GrabStartData {
-                                    focus: None,
-                                    button: event.button_code(),
-                                    location,
-                                },
-                                operation,
-                                location,
-                            },
+                        self.start_mouse_grab(
+                            &pointer,
+                            operation,
+                            None,
+                            event.button_code(),
+                            location,
                             serial,
-                            Focus::Clear,
                         );
-                        pointer.button(
-                            self,
-                            &ButtonEvent {
-                                button: event.button_code(),
-                                state: event.state(),
-                                serial,
-                                time: event.time_msec(),
-                            },
-                        );
-                        pointer.frame(self);
+                        self.forward_button::<I>(&pointer, &event, serial);
                         return;
                     }
                 }
@@ -623,30 +644,10 @@ impl Paw2 {
                     self.focus_window(&window);
                     if let Some(operation) = self.begin_mouse_operation(window, location) {
                         let focus = self.surface_under(location);
-                        pointer.set_grab(
-                            self,
-                            MouseGrab {
-                                start_data: GrabStartData {
-                                    focus,
-                                    button: BTN_LEFT,
-                                    location,
-                                },
-                                operation,
-                                location,
-                            },
-                            serial,
-                            Focus::Clear,
+                        self.start_mouse_grab(
+                            &pointer, operation, focus, BTN_LEFT, location, serial,
                         );
-                        pointer.button(
-                            self,
-                            &ButtonEvent {
-                                button: event.button_code(),
-                                state: event.state(),
-                                serial,
-                                time: event.time_msec(),
-                            },
-                        );
-                        pointer.frame(self);
+                        self.forward_button::<I>(&pointer, &event, serial);
                         return;
                     }
                 }
@@ -657,7 +658,7 @@ impl Paw2 {
                     if let Some(window) = window {
                         self.focus_window(&window);
                     } else if let Some(surface) = self.keyboard_layer_under(location) {
-                        self.seat.get_keyboard().unwrap().set_focus(
+                        self.keyboard().set_focus(
                             self,
                             Some(KeyboardFocus::Surface(surface)),
                             serial,
@@ -665,16 +666,7 @@ impl Paw2 {
                     }
                 }
 
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                self.forward_button::<I>(&pointer, &event, serial);
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
@@ -685,7 +677,7 @@ impl Paw2 {
                         if self.scratchpad_overview_active() {
                             self.move_scratchpad_overview(delta);
                         } else {
-                            let location = self.seat.get_pointer().unwrap().current_location();
+                            let location = self.pointer().current_location();
                             self.scroll_overview_at(location, delta);
                         }
                     }
@@ -700,7 +692,7 @@ impl Paw2 {
                     } else {
                         ScrollDirection::Down
                     };
-                    let modifiers = self.seat.get_keyboard().unwrap().modifier_state();
+                    let modifiers = self.keyboard().modifier_state();
                     if let Some(action) = self.config.wheel_action(&modifiers, direction) {
                         if self.pending_wheel_action != Some(action) {
                             self.wheel_v120_remainder = 0.0;
@@ -731,7 +723,7 @@ impl Paw2 {
                     }
                 }
 
-                let pointer = self.seat.get_pointer().unwrap();
+                let pointer = self.pointer();
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }

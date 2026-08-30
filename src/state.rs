@@ -11,7 +11,11 @@ use std::{
 
 use smithay::{
     desktop::PopupManager,
-    input::{Seat, SeatState, keyboard::XkbConfig},
+    input::{
+        Seat, SeatState,
+        keyboard::{KeyboardHandle, XkbConfig},
+        pointer::PointerHandle,
+    },
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
@@ -256,6 +260,24 @@ impl Paw2 {
 
     /// Every exit path goes through here so shutdown behaves the same whether it
     /// was a keybinding, a lost device, or a closed nested window.
+    /// The seat's pointer.
+    ///
+    /// Both capabilities are added in [`Self::new`] and never removed, so this
+    /// cannot fail. Stated once here rather than as an `unwrap` at each of the
+    /// dozen-odd call sites.
+    pub fn pointer(&self) -> PointerHandle<Self> {
+        self.seat
+            .get_pointer()
+            .expect("the seat has had a pointer since startup")
+    }
+
+    /// The seat's keyboard. See [`Self::pointer`].
+    pub fn keyboard(&self) -> KeyboardHandle<Self> {
+        self.seat
+            .get_keyboard()
+            .expect("the seat has had a keyboard since startup")
+    }
+
     pub fn begin_shutdown(&mut self) {
         start_shutdown();
         self.loop_signal.stop();

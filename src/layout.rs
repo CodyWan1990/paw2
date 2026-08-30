@@ -3327,7 +3327,7 @@ impl Paw2 {
             self.ipc.touch();
             return;
         }
-        let pointer = self.seat.get_pointer().unwrap().current_location();
+        let pointer = self.pointer().current_location();
         self.focus_output_at(pointer);
         if let Some(output) = self.scroller.focused_output.clone()
             && let Some(monitor) = self.scroller.monitor_mut(&output)
@@ -3736,7 +3736,7 @@ impl Paw2 {
         if self.scroller.focused_scratchpad.is_some() {
             return false;
         }
-        let pointer_x = self.seat.get_pointer().unwrap().current_location().x;
+        let pointer_x = self.pointer().current_location().x;
         let Some(output) = self.scroller.focused_output.clone() else {
             return false;
         };
@@ -4594,7 +4594,7 @@ impl Paw2 {
 
         if let Some((_, geometry)) = geometries.iter().find(|(name, _)| name == &target) {
             let location = geometry.loc.to_f64() + geometry.size.to_f64() / 2.0;
-            let pointer = self.seat.get_pointer().unwrap();
+            let pointer = self.pointer();
             pointer.motion(
                 self,
                 self.surface_under(location),
@@ -5896,7 +5896,7 @@ impl Paw2 {
                 }
             }
         }
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let keyboard = self.keyboard();
         // Reading the outgoing focus clones it, and `sync_focus` runs on layer
         // surface commits, so only pay for it when there is an inhibitor to
         // retarget. Smithay exposes no way to enumerate inhibitors, which is why
