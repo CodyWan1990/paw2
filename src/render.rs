@@ -611,7 +611,7 @@ impl Effects {
         // Gated on visibility, not on input ownership: the closing animation
         // still has to be drawn after the overview has given focus back.
         if state.overview_visible() {
-            return self.overview_elements(renderer, state, output);
+            return Ok(self.overview_elements(renderer, state, output));
         }
         let scale = Scale::from(output.current_scale().fractional_scale());
         if state.renders_fullscreen(output)
@@ -746,7 +746,7 @@ impl Effects {
         if !state.scratchpad_overview_visible_on(output) {
             return Ok(desktop);
         }
-        let mut overview = self.scratchpad_overview_elements(renderer, state, output)?;
+        let mut overview = self.scratchpad_overview_elements(renderer, state, output);
         overview.append(&mut desktop);
         Ok(overview)
     }
@@ -821,10 +821,10 @@ impl Effects {
         renderer: &mut GlesRenderer,
         state: &Paw2,
         output: &Output,
-    ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
+    ) -> Vec<PawRenderElements> {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let Some(strip) = state.scratchpad_strip(output) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let mut elements = Vec::new();
         for preview in strip.previews {
@@ -861,7 +861,7 @@ impl Effects {
             OVERVIEW_CARD,
             Kind::Unspecified,
         )));
-        Ok(elements)
+        elements
     }
 
     /// The overview: every visible workspace drawn as a shrunken copy of the
@@ -873,10 +873,10 @@ impl Effects {
         renderer: &mut GlesRenderer,
         state: &Paw2,
         output: &Output,
-    ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
+    ) -> Vec<PawRenderElements> {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let Some(output_size) = state.output_geometry(output).map(|geometry| geometry.size) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         // Top and overlay stay at full size above the overview; background and
@@ -994,7 +994,7 @@ impl Effects {
             }
         }
         elements.append(&mut shadows);
-        Ok(elements)
+        elements
     }
 
     /// The ring around the selected preview. Unlike the desktop's focus ring
