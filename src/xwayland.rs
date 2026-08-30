@@ -1,8 +1,9 @@
 use std::{io, os::fd::OwnedFd, process::Stdio};
 
 use smithay::{
+    input::Seat,
     reexports::{calloop::LoopHandle, wayland_server::protocol::wl_surface::WlSurface},
-    utils::{Logical, Rectangle},
+    utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
         selection::{
             SelectionTarget,
@@ -15,6 +16,7 @@ use smithay::{
                 request_primary_client_selection, set_primary_selection,
             },
         },
+        xwayland_keyboard_grab::{XWaylandKeyboardGrab, XWaylandKeyboardGrabHandler},
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
     xwayland::{
@@ -23,7 +25,7 @@ use smithay::{
     },
 };
 
-use crate::state::Paw2;
+use crate::{handlers::KeyboardFocus, state::Paw2};
 
 pub fn start(handle: LoopHandle<'static, Paw2>, state: &mut Paw2) -> io::Result<u32> {
     let (xwayland, client) = XWayland::spawn(
@@ -71,6 +73,22 @@ impl XWaylandShellHandler for Paw2 {
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, _surface: X11Surface) {
         self.sync_focus();
         crate::drm::redraw(self);
+    }
+}
+
+impl XWaylandKeyboardGrabHandler for Paw2 {
+    fn keyboard_focus_for_xsurface(&self, surface: &WlSurface) -> Option<KeyboardFocus> {
+        KeyboardFocus::x11(self.window_for_surface(surface)?.x11_surface()?)
+    }
+
+    /// Remember the grab object as well as installing it: it is the only thing
+    /// that reports when the client lets the keyboard go, and `process_input`
+    /// has to stop running compositor bindings for as long as it lives.
+    fn grab(&mut self, _surface: WlSurface, seat: Seat<Self>, grab: XWaylandKeyboardGrab<Self>) {
+        self.xwayland_keyboard_grab = Some(grab.grab().clone());
+        if let Some(keyboard) = seat.get_keyboard() {
+            keyboard.set_grab(self, grab, SERIAL_COUNTER.next_serial());
+        }
     }
 }
 
@@ -216,11 +234,12 @@ impl XwmHandler for Paw2 {
         if selection == SelectionTarget::Primary && !self.config.input.middle_click_paste {
             return false;
         }
-        self.seat
-            .get_keyboard()
-            .and_then(|keyboard| keyboard.current_focus())
-            .and_then(|surface| self.window_for_surface(&surface))
-            .is_some_and(|window| window.x11_surface().is_some())
+        matches!(
+            self.seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus()),
+            Some(KeyboardFocus::X11 { .. })
+        )
     }
 
     fn send_selection(

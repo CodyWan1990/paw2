@@ -31,7 +31,10 @@ use smithay::{
             },
             gles::{GlesRenderer, GlesTarget, GlesTexture},
         },
-        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        session::{
+            Event as SessionEvent, Session,
+            libseat::{LibSeatSession, LibSeatSessionNotifier},
+        },
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     desktop::{layer_map_for_output, space::SurfaceTree, utils::OutputPresentationFeedback},
@@ -194,16 +197,21 @@ pub fn init(
     state: &mut Paw2,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let clock = Instant::now();
-    let (mut session, session_notifier) = LibSeatSession::new()?;
-    let path = select_device(&session, state.config.backend.drm_device.clone())?;
+    let mut attempt = 1;
+    let (session, session_notifier, path, fd) = loop {
+        match take_seat(state.config.backend.drm_device.clone()) {
+            Ok(taken) => break taken,
+            Err(error) if attempt < SEAT_ATTEMPTS => {
+                warn!(?error, attempt, "could not take the seat yet; retrying");
+                std::thread::sleep(SEAT_RETRY);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let node = DrmNode::from_path(&path)?;
     info!(device = %path.display(), "using DRM device");
 
-    let fd = session.open(
-        &path,
-        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-    )?;
-    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let (device, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
     if supports_syncobj_eventfd(&fd) {
         state.drm_syncobj_state = Some(DrmSyncobjState::new::<Paw2>(
@@ -414,6 +422,36 @@ pub fn init(
 
     crate::phase(&clock, "input devices opened");
     Ok(())
+}
+
+/// How long to keep trying to take the seat before giving up.
+///
+/// SDDM hands the seat over asynchronously while its Wayland greeter is torn
+/// down, and the first login after boot loses that race: the session exits
+/// before it draws anything and the greeter comes straight back. Waiting it out
+/// costs a second in the worst case and saves logging in twice.
+// ponytail: a fixed budget; make it adaptive only if a slower machine needs more.
+const SEAT_ATTEMPTS: u32 = 10;
+const SEAT_RETRY: Duration = Duration::from_millis(100);
+
+/// Take the seat and open the GPU, as one unit.
+///
+/// Session and notifier are returned together on purpose: the notifier holds
+/// the only strong reference to the seat, so a caller that retries has to drop
+/// both to release it before trying again.
+fn take_seat(
+    configured: Option<PathBuf>,
+) -> Result<
+    (LibSeatSession, LibSeatSessionNotifier, PathBuf, DrmDeviceFd),
+    Box<dyn std::error::Error>,
+> {
+    let (mut session, notifier) = LibSeatSession::new()?;
+    let path = select_device(&session, configured)?;
+    let fd = session.open(
+        &path,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+    )?;
+    Ok((session, notifier, path, DrmDeviceFd::new(DeviceFd::from(fd))))
 }
 
 fn select_device(session: &LibSeatSession, configured: Option<PathBuf>) -> io::Result<PathBuf> {

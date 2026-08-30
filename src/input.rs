@@ -12,13 +12,18 @@ use smithay::{
             MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
         },
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
-    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    wayland::{
+        keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+        seat::WaylandFocus,
+    },
 };
 
 use crate::{
     config::{Action, ScrollDirection},
+    handlers::KeyboardFocus,
     layout::MouseOperation,
     state::Paw2,
 };
@@ -257,13 +262,49 @@ fn activate_pointer_constraint(
     });
 }
 
+/// A client holding the keyboard exclusively gets every key except the escape
+/// hatch. Without `Quit` staying live a fullscreen game could leave the user
+/// with no way out of the session.
+fn binding_allowed(inhibited: bool, action: Action) -> bool {
+    !inhibited || action == Action::Quit
+}
+
 impl Paw2 {
+    /// Whether the focused client asked for the keyboard to itself, either
+    /// through `zwp_keyboard_shortcuts_inhibit_v1` or an XWayland grab.
+    ///
+    /// The inhibitor is looked up on the *currently focused* surface only, so a
+    /// background window can never suppress a binding. Deliberately not keyed on
+    /// `KeyboardHandle::is_grabbed`, which is also true for ordinary popup menu
+    /// grabs - those must keep bindings working.
+    fn keyboard_inhibited(&self) -> bool {
+        if self
+            .xwayland_keyboard_grab
+            .as_ref()
+            .is_some_and(Resource::is_alive)
+        {
+            return true;
+        }
+        // Cheap seat-wide check first: reading the focus clones it, and almost
+        // no session ever has an inhibitor at all.
+        if !self.seat.keyboard_shortcuts_inhibited() {
+            return false;
+        }
+        self.seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|focus| focus.wl_surface().map(|surface| surface.into_owned()))
+            .and_then(|surface| self.seat.keyboard_shortcuts_inhibitor_for_surface(&surface))
+            .is_some_and(|inhibitor| inhibitor.is_active())
+    }
+
     pub fn process_input<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
                 let key_state = event.state();
+                let inhibited = self.keyboard_inhibited();
                 let action = self.seat.get_keyboard().unwrap().input::<Option<_>, _>(
                     self,
                     event.key_code(),
@@ -292,6 +333,7 @@ impl Paw2 {
                                 state
                                     .config
                                     .action(modifiers, keysym)
+                                    .filter(|action| binding_allowed(inhibited, *action))
                                     .map(KeyAction::Compositor)
                             });
                             if overview || scratchpad_overview || action.is_some() {
@@ -615,10 +657,11 @@ impl Paw2 {
                     if let Some(window) = window {
                         self.focus_window(&window);
                     } else if let Some(surface) = self.keyboard_layer_under(location) {
-                        self.seat
-                            .get_keyboard()
-                            .unwrap()
-                            .set_focus(self, Some(surface), serial);
+                        self.seat.get_keyboard().unwrap().set_focus(
+                            self,
+                            Some(KeyboardFocus::Surface(surface)),
+                            serial,
+                        );
                     }
                 }
 
@@ -739,6 +782,14 @@ pub(crate) fn constrain_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inhibited_keyboard_keeps_only_the_escape_hatch() {
+        assert!(binding_allowed(false, Action::ToggleOverview));
+        assert!(binding_allowed(false, Action::Quit));
+        assert!(!binding_allowed(true, Action::ToggleOverview));
+        assert!(binding_allowed(true, Action::Quit));
+    }
 
     #[test]
     fn pointer_stays_inside_output() {

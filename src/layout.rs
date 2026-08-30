@@ -22,6 +22,8 @@ use smithay::{
         compositor::{CompositorHandler, SurfaceData, with_states},
         fifo::FifoBarrierCachedState,
         fractional_scale::with_fractional_scale,
+        keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
+        seat::WaylandFocus,
         shell::wlr_layer::{KeyboardInteractivity, Layer},
         shell::xdg::{
             SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData, dialog::ToplevelDialogHint,
@@ -35,6 +37,7 @@ use crate::{
         Action, Config, LayoutMode, NUMBERED_SCRATCHPAD_COUNT, NUMBERED_SCRATCHPAD_PREFIX,
         ScratchpadConfig, ScratchpadEdge, ScratchpadOverviewPosition,
     },
+    handlers::KeyboardFocus,
     state::Paw2,
 };
 
@@ -5165,7 +5168,11 @@ impl Paw2 {
     // ponytail: linear scan per element, so O(n^2) per frame in window count.
     // Never runs on the fullscreen path and n is small; index by surface id if a
     // workspace ever holds enough windows for it to show up in a profile.
-    pub fn window_render_state(&self, output: &Output, element: &Id) -> Option<WindowRenderState> {
+    pub(crate) fn window_render_state(
+        &self,
+        output: &Output,
+        element: &Id,
+    ) -> Option<WindowRenderState> {
         let monitor = self.scroller.monitor_for(output)?;
         let window = self
             .scroller
@@ -5927,12 +5934,12 @@ impl Paw2 {
             self.scroller.scratchpad_overview = None;
         }
         let overview = self.overview_active() || self.scroller.scratchpad_overview.is_some();
-        let focused_surface = exclusive.or_else(|| {
+        let focused_surface = exclusive.map(KeyboardFocus::Surface).or_else(|| {
             if overview {
                 return None;
             }
             if let Some(name) = &self.scroller.focused_scratchpad
-                && let Some(surface) = self
+                && let Some(focus) = self
                     .scroller
                     .scratchpads
                     .get(name)
@@ -5940,9 +5947,9 @@ impl Paw2 {
                         runtime.visible && runtime.output.as_deref() == active_output.as_deref()
                     })
                     .and_then(|runtime| runtime.window.as_ref())
-                    .and_then(window_surface)
+                    .and_then(window_keyboard_focus)
             {
-                return Some(surface);
+                return Some(focus);
             }
             self.scroller
                 .monitors
@@ -5953,12 +5960,12 @@ impl Paw2 {
                     workspace
                         .fullscreen
                         .as_ref()
-                        .and_then(window_surface)
+                        .and_then(window_keyboard_focus)
                         .or_else(|| {
                             workspace
                                 .focused
                                 .and_then(|index| workspace.windows.get(index))
-                                .and_then(window_surface)
+                                .and_then(window_keyboard_focus)
                         })
                 })
         });
@@ -6000,11 +6007,42 @@ impl Paw2 {
                 }
             }
         }
-        self.seat.get_keyboard().unwrap().set_focus(
-            self,
-            focused_surface,
-            SERIAL_COUNTER.next_serial(),
-        );
+        let keyboard = self.seat.get_keyboard().unwrap();
+        // Reading the outgoing focus clones it, and `sync_focus` runs on layer
+        // surface commits, so only pay for it when there is an inhibitor to
+        // retarget. Smithay exposes no way to enumerate inhibitors, which is why
+        // the previous focus has to be captured before it is replaced.
+        let inhibiting = self.seat.keyboard_shortcuts_inhibited();
+        let previous = inhibiting.then(|| keyboard.current_focus()).flatten();
+        let current = inhibiting.then(|| focused_surface.clone()).flatten();
+        keyboard.set_focus(self, focused_surface, SERIAL_COUNTER.next_serial());
+        if inhibiting {
+            self.retarget_shortcuts_inhibitors(previous.as_ref(), current.as_ref());
+        }
+    }
+
+    /// A shortcuts inhibitor only holds while its surface has keyboard focus, so
+    /// a background window cannot swallow every binding and trap the user.
+    fn retarget_shortcuts_inhibitors(
+        &self,
+        previous: Option<&KeyboardFocus>,
+        current: Option<&KeyboardFocus>,
+    ) {
+        if previous == current {
+            return;
+        }
+        if let Some(inhibitor) = previous
+            .and_then(|focus| focus.wl_surface())
+            .and_then(|surface| self.seat.keyboard_shortcuts_inhibitor_for_surface(&surface))
+        {
+            inhibitor.inactivate();
+        }
+        if let Some(inhibitor) = current
+            .and_then(|focus| focus.wl_surface())
+            .and_then(|surface| self.seat.keyboard_shortcuts_inhibitor_for_surface(&surface))
+        {
+            inhibitor.activate();
+        }
     }
 
     pub(crate) fn has_exclusive_keyboard_layer(&self) -> bool {
@@ -6043,6 +6081,18 @@ pub(crate) fn is_exclusive_keyboard_layer(
 ) -> bool {
     matches!(layer, Layer::Top | Layer::Overlay)
         && interactivity == KeyboardInteractivity::Exclusive
+}
+
+/// The keyboard focus target for a window. Prefers the `X11Surface`, because
+/// that is the arm that moves the X server's input focus; see
+/// [`crate::handlers::KeyboardFocus`].
+fn window_keyboard_focus(window: &Window) -> Option<KeyboardFocus> {
+    if let Some(surface) = window.x11_surface() {
+        return KeyboardFocus::x11(surface);
+    }
+    window
+        .toplevel()
+        .map(|surface| KeyboardFocus::Surface(surface.wl_surface().clone()))
 }
 
 fn window_surface(window: &Window) -> Option<WlSurface> {

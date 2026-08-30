@@ -1,6 +1,9 @@
+use std::borrow::Cow;
+
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
+        input::KeyState,
         renderer::{ImportDma, element::Id, utils::on_commit_buffer_handler},
     },
     desktop::{
@@ -11,6 +14,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         dnd::{DnDGrab, DndGrabHandler, GrabType, Source},
+        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
         pointer::{Focus, PointerHandle},
         tablet::TabletSeatHandler,
     },
@@ -22,7 +26,7 @@ use smithay::{
             protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, Rectangle, Serial},
+    utils::{IsAlive, Logical, Point, Rectangle, Serial},
     wayland::{
         background_effect::ExtBackgroundEffectHandler,
         buffer::BufferHandler,
@@ -35,10 +39,15 @@ use smithay::{
         drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         idle_inhibit::IdleInhibitHandler,
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor,
+        },
         output::OutputHandler,
         pointer_constraints::{
             PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
         },
+        seat::WaylandFocus,
         selection::{
             SelectionHandler,
             data_device::{
@@ -59,7 +68,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
     },
-    xwayland::XWaylandClientData,
+    xwayland::{X11Surface, XWaylandClientData},
 };
 
 use crate::state::{ClientState, Paw2};
@@ -417,6 +426,10 @@ impl XdgShellHandler for Paw2 {
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
+        // Always the `Surface` arm: xdg popups are Wayland-only, so their root is
+        // never an X11 window. `popup_destroyed` re-runs `sync_focus`, which puts
+        // the proper focus target back once the grab ends.
+        let root = KeyboardFocus::Surface(root);
         let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
             return;
         };
@@ -459,8 +472,144 @@ impl XdgDialogHandler for Paw2 {
     }
 }
 
+/// What the seat's keyboard focus points at.
+///
+/// X11 clients have to be held as the real [`X11Surface`], not as their
+/// `wl_surface`: smithay's `KeyboardTarget` impl for `X11Surface` is the only
+/// place that calls `SetInputFocus` and sends `WM_TAKE_FOCUS`. Focusing the bare
+/// `wl_surface` leaves the X server's input focus untouched, so an XWayland
+/// client never receives a `FocusIn` - and SDL/Proton games, which gate their
+/// keyboard handling on having input focus, drop every key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyboardFocus {
+    Surface(WlSurface),
+    /// The `wl_surface` is carried alongside the `X11Surface` rather than
+    /// fetched on demand, because `PopupGrab` needs a *total* conversion into
+    /// `SeatHandler::PointerFocus`, which is a plain `WlSurface`. An unassociated
+    /// `X11Surface` has no `wl_surface` and cannot hold focus anyway, so
+    /// [`KeyboardFocus::x11`] is the only constructor and it refuses that case.
+    X11 {
+        /// Boxed only for size: `X11Surface` is ~500 bytes by value, and this
+        /// enum is cloned out of the seat on every focus read.
+        surface: Box<X11Surface>,
+        wl_surface: WlSurface,
+    },
+}
+
+impl KeyboardFocus {
+    pub fn x11(surface: &X11Surface) -> Option<Self> {
+        Some(Self::X11 {
+            surface: Box::new(surface.clone()),
+            wl_surface: surface.wl_surface()?,
+        })
+    }
+}
+
+impl From<WlSurface> for KeyboardFocus {
+    fn from(surface: WlSurface) -> Self {
+        Self::Surface(surface)
+    }
+}
+
+impl From<PopupKind> for KeyboardFocus {
+    fn from(popup: PopupKind) -> Self {
+        Self::Surface(popup.wl_surface().clone())
+    }
+}
+
+impl From<KeyboardFocus> for WlSurface {
+    fn from(focus: KeyboardFocus) -> Self {
+        match focus {
+            KeyboardFocus::Surface(surface) => surface,
+            KeyboardFocus::X11 { wl_surface, .. } => wl_surface,
+        }
+    }
+}
+
+impl IsAlive for KeyboardFocus {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Surface(surface) => surface.alive(),
+            Self::X11 { surface, .. } => surface.alive(),
+        }
+    }
+}
+
+impl WaylandFocus for KeyboardFocus {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        match self {
+            Self::Surface(surface) => Some(Cow::Borrowed(surface)),
+            Self::X11 { wl_surface, .. } => Some(Cow::Borrowed(wl_surface)),
+        }
+    }
+}
+
+/// Every method just picks the arm; the real work lives in smithay's
+/// `KeyboardTarget` impls, and the `X11Surface` one forwards to its own
+/// `wl_surface` after touching the X server, so `wl_keyboard` clients see
+/// exactly what they saw before.
+impl KeyboardTarget<Paw2> for KeyboardFocus {
+    fn enter(
+        &self,
+        seat: &Seat<Paw2>,
+        data: &mut Paw2,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Surface(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            Self::X11 { surface, .. } => {
+                KeyboardTarget::enter(&**surface, seat, data, keys, serial)
+            }
+        }
+    }
+
+    fn leave(&self, seat: &Seat<Paw2>, data: &mut Paw2, serial: Serial) {
+        match self {
+            Self::Surface(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            Self::X11 { surface, .. } => KeyboardTarget::leave(&**surface, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<Paw2>,
+        data: &mut Paw2,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Surface(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+            Self::X11 { surface, .. } => {
+                KeyboardTarget::key(&**surface, seat, data, key, state, serial, time)
+            }
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<Paw2>,
+        data: &mut Paw2,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Surface(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial)
+            }
+            Self::X11 { surface, .. } => {
+                KeyboardTarget::modifiers(&**surface, seat, data, modifiers, serial)
+            }
+        }
+    }
+}
+
 impl SeatHandler for Paw2 {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocus;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -479,8 +628,10 @@ impl SeatHandler for Paw2 {
         self.cursor_status = image;
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocus>) {
+        let client = focused
+            .and_then(|focus| focus.wl_surface())
+            .and_then(|surface| self.display_handle.get_client(surface.id()).ok());
         set_data_device_focus(&self.display_handle, seat, client.clone());
         set_primary_focus(&self.display_handle, seat, client);
     }
@@ -527,6 +678,26 @@ impl PointerConstraintsHandler for Paw2 {
             constraint.is_some_and(|constraint| constraint.is_active())
         }) {
             self.cursor_position_hint = Some((surface.clone(), location));
+        }
+    }
+}
+
+impl KeyboardShortcutsInhibitHandler for Paw2 {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+
+    /// Granted, but only in force while the surface holds keyboard focus -
+    /// `Paw2::retarget_shortcuts_inhibitors` follows focus, and `process_input`
+    /// keeps the `quit` binding live regardless.
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|focus| focus.wl_surface().map(|surface| surface.into_owned()));
+        if focused.as_ref() == Some(inhibitor.wl_surface()) {
+            inhibitor.activate();
         }
     }
 }

@@ -16,6 +16,7 @@ use smithay::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
         },
+        wayland_protocols::xwayland::keyboard_grab::zv1::server::zwp_xwayland_keyboard_grab_v1::ZwpXwaylandKeyboardGrabV1,
         wayland_server::{
             Client, Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -35,6 +36,7 @@ use smithay::{
         fifo::FifoManagerState,
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
+        keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
@@ -51,6 +53,7 @@ use smithay::{
         single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
+        xwayland_keyboard_grab::XWaylandKeyboardGrabState,
         xwayland_shell::XWaylandShellState,
     },
     xwayland::X11Wm,
@@ -82,6 +85,12 @@ pub struct Paw2 {
     pub shm_state: ShmState,
     pub _output_manager_state: OutputManagerState,
     pub _idle_inhibit_state: IdleInhibitManagerState,
+    pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
+    pub _xwayland_keyboard_grab_state: XWaylandKeyboardGrabState,
+    /// The live `zwp_xwayland_keyboard_grab_v1`, if an XWayland client took the
+    /// keyboard. Smithay drops the grab when the client destroys the object and
+    /// offers no ungrab callback, so the resource's own liveness is the signal.
+    pub xwayland_keyboard_grab: Option<ZwpXwaylandKeyboardGrabV1>,
     pub _presentation_state: PresentationState,
     pub _fifo_manager_state: FifoManagerState,
     pub _fractional_scale_manager_state: FractionalScaleManagerState,
@@ -153,6 +162,9 @@ impl Paw2 {
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&display_handle);
+        let keyboard_shortcuts_inhibit_state =
+            KeyboardShortcutsInhibitState::new::<Self>(&display_handle);
+        let xwayland_keyboard_grab_state = XWaylandKeyboardGrabState::new::<Self>(&display_handle);
         let presentation_state =
             PresentationState::new::<Self>(&display_handle, Monotonic::ID as u32);
         let fifo_manager_state = FifoManagerState::new::<Self>(&display_handle);
@@ -215,6 +227,9 @@ impl Paw2 {
             shm_state,
             _output_manager_state: output_manager_state,
             _idle_inhibit_state: idle_inhibit_state,
+            keyboard_shortcuts_inhibit_state,
+            _xwayland_keyboard_grab_state: xwayland_keyboard_grab_state,
+            xwayland_keyboard_grab: None,
             _presentation_state: presentation_state,
             _fifo_manager_state: fifo_manager_state,
             _fractional_scale_manager_state: fractional_scale_manager_state,
