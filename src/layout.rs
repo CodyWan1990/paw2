@@ -268,6 +268,10 @@ impl<T> Column<T> {
     }
 }
 
+/// Where a tiled window sits: an index into `Workspace.columns`, then into that
+/// column's windows.
+type Slot = (usize, usize);
+
 struct Workspace {
     windows: Vec<Window>,
     /// Index into `windows`. Kept in step by `focus_after_removal` and by every
@@ -716,7 +720,7 @@ impl Workspace {
         true
     }
 
-    fn tiled_slots(&self) -> Vec<(usize, usize)> {
+    fn tiled_slots(&self) -> Vec<Slot> {
         self.columns
             .iter()
             .enumerate()
@@ -724,11 +728,22 @@ impl Workspace {
             .collect()
     }
 
+    /// The focused window, every tiled slot in order, and which slot the focus
+    /// occupies. `None` when nothing is focused, or the focus is floating.
+    fn focused_tiled_slot(&self) -> Option<(Window, Vec<Slot>, usize)> {
+        let focused = self
+            .focused
+            .and_then(|index| self.windows.get(index))?
+            .clone();
+        let slots = self.tiled_slots();
+        let current = slots
+            .iter()
+            .position(|&(column, row)| self.columns[column].windows[row] == focused)?;
+        Some((focused, slots, current))
+    }
+
     fn focused_tiled_index(&self) -> Option<usize> {
-        let focused = self.focused.and_then(|index| self.windows.get(index))?;
-        self.tiled_slots()
-            .into_iter()
-            .position(|(column, row)| &self.columns[column].windows[row] == focused)
+        self.focused_tiled_slot().map(|(_, _, index)| index)
     }
 
     fn sync_layout_sizes(&mut self, tiled: usize) {
@@ -760,14 +775,7 @@ impl Workspace {
     }
 
     fn focus_tiled(&mut self, delta: i32) -> bool {
-        let Some(focused) = self.focused.and_then(|index| self.windows.get(index)) else {
-            return false;
-        };
-        let slots = self.tiled_slots();
-        let Some(current) = slots
-            .iter()
-            .position(|&(column, row)| &self.columns[column].windows[row] == focused)
-        else {
+        let Some((_, slots, current)) = self.focused_tiled_slot() else {
             return false;
         };
         let Some(next) = neighbor(current, slots.len(), delta) else {
@@ -786,18 +794,7 @@ impl Workspace {
     }
 
     fn swap_tiled(&mut self, delta: i32) -> bool {
-        let Some(focused) = self
-            .focused
-            .and_then(|index| self.windows.get(index))
-            .cloned()
-        else {
-            return false;
-        };
-        let slots = self.tiled_slots();
-        let Some(current) = slots
-            .iter()
-            .position(|&(column, row)| self.columns[column].windows[row] == focused)
-        else {
+        let Some((_, slots, current)) = self.focused_tiled_slot() else {
             return false;
         };
         let Some(next) = neighbor(current, slots.len(), delta) else {
@@ -807,18 +804,7 @@ impl Workspace {
     }
 
     fn swap_tiled_at(&mut self, target: usize) -> bool {
-        let Some(focused) = self
-            .focused
-            .and_then(|index| self.windows.get(index))
-            .cloned()
-        else {
-            return false;
-        };
-        let slots = self.tiled_slots();
-        let Some(current) = slots
-            .iter()
-            .position(|&(column, row)| self.columns[column].windows[row] == focused)
-        else {
+        let Some((focused, slots, current)) = self.focused_tiled_slot() else {
             return false;
         };
         let Some(&(to_column, to_row)) = slots.get(target) else {
@@ -880,10 +866,7 @@ impl Workspace {
     }
 
     fn swap_vertical(&mut self, delta: i32) -> bool {
-        let Some(column) = self
-            .focused_column()
-            .and_then(|index| self.columns.get_mut(index))
-        else {
+        let Some(column) = self.focused_column_mut() else {
             return false;
         };
         swap_column_window(column, delta)
@@ -963,14 +946,31 @@ impl Workspace {
         if self.layout != LayoutMode::Scrolling {
             return false;
         }
-        let Some(column) = self
-            .focused_column()
-            .and_then(|index| self.columns.get_mut(index))
-        else {
+        let Some(column) = self.focused_column_mut() else {
             return false;
         };
         cycle_column_width(column, default, presets);
         true
+    }
+
+    fn focused_column_mut(&mut self) -> Option<&mut Column> {
+        let index = self.focused_column()?;
+        self.columns.get_mut(index)
+    }
+
+    /// The dwindle split that owns the focused window on one axis, nudged by
+    /// `delta`. Identical for width and height but for which axis the split is
+    /// looked up on, which is what `vertical` picks.
+    fn adjust_dwindle_split(&mut self, tiled: usize, vertical: bool, delta: f64) -> bool {
+        let Some(focused) = self.focused_tiled_index() else {
+            return false;
+        };
+        let Some(split) = dwindle_split(focused, tiled, vertical) else {
+            return false;
+        };
+        self.sync_layout_sizes(tiled);
+        let delta = if focused == split { delta } else { -delta };
+        adjust_split_ratio(&mut self.dwindle_ratios[split], delta)
     }
 
     fn adjust_column_width(&mut self, default: f64, delta: f64) -> bool {
@@ -994,25 +994,12 @@ impl Workspace {
                 self.master_ratio = Some(adjusted);
                 return true;
             }
-            LayoutMode::Dwindle => {
-                let Some(focused) = focused else {
-                    return false;
-                };
-                let Some(split) = dwindle_split(focused, tiled, true) else {
-                    return false;
-                };
-                self.sync_layout_sizes(tiled);
-                let delta = if focused == split { delta } else { -delta };
-                return adjust_split_ratio(&mut self.dwindle_ratios[split], delta);
-            }
+            LayoutMode::Dwindle => return self.adjust_dwindle_split(tiled, true, delta),
             LayoutMode::Monocle => return false,
             LayoutMode::Scrolling => {}
             LayoutMode::MasterStack => return false,
         }
-        let Some(column) = self
-            .focused_column()
-            .and_then(|index| self.columns.get_mut(index))
-        else {
+        let Some(column) = self.focused_column_mut() else {
             return false;
         };
         let current = column.width.unwrap_or(default);
@@ -1045,24 +1032,11 @@ impl Workspace {
                     delta,
                 );
             }
-            LayoutMode::Dwindle => {
-                let Some(focused) = focused else {
-                    return false;
-                };
-                let Some(split) = dwindle_split(focused, tiled, false) else {
-                    return false;
-                };
-                self.sync_layout_sizes(tiled);
-                let delta = if focused == split { delta } else { -delta };
-                return adjust_split_ratio(&mut self.dwindle_ratios[split], delta);
-            }
+            LayoutMode::Dwindle => return self.adjust_dwindle_split(tiled, false, delta),
             LayoutMode::Monocle => return false,
             LayoutMode::Scrolling => {}
         }
-        let Some(column) = self
-            .focused_column()
-            .and_then(|index| self.columns.get_mut(index))
-        else {
+        let Some(column) = self.focused_column_mut() else {
             return false;
         };
         adjust_row_weights(column, delta)
@@ -3372,32 +3346,26 @@ impl Paw2 {
         self.sync_focus();
     }
 
-    pub fn refresh_wayland_floating(&mut self, surface: &ToplevelSurface) {
-        let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() else {
-            return;
-        };
-        let floating = self
-            .scroller
-            .should_float(&window, wayland_should_float(surface));
-        let changed = self.scroller.set_floating(&window, floating);
-
-        if changed {
+    /// Re-decide whether `window` floats, now that a hint behind that decision
+    /// changed. `automatic` is what the surface's own hints ask for; a manual
+    /// override still wins inside `should_float`.
+    fn refresh_floating(&mut self, window: &Window, automatic: bool) {
+        let floating = self.scroller.should_float(window, automatic);
+        if self.scroller.set_floating(window, floating) {
             self.relayout(true);
             self.sync_focus();
         }
     }
 
+    pub fn refresh_wayland_floating(&mut self, surface: &ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() {
+            self.refresh_floating(&window, wayland_should_float(surface));
+        }
+    }
+
     pub fn refresh_x11_floating(&mut self, surface: &smithay::xwayland::X11Surface) {
-        let Some(window) = self.window_for_x11_surface(surface).cloned() else {
-            return;
-        };
-        let floating = self
-            .scroller
-            .should_float(&window, x11_should_float(surface));
-        let changed = self.scroller.set_floating(&window, floating);
-        if changed {
-            self.relayout(true);
-            self.sync_focus();
+        if let Some(window) = self.window_for_x11_surface(surface).cloned() {
+            self.refresh_floating(&window, x11_should_float(surface));
         }
     }
 
@@ -7177,6 +7145,41 @@ fn split_rectangle(
     }
 }
 
+/// Split `available` pixels across `weights`, giving every row at least
+/// `minimum` and handing the rounding remainder to the last one.
+///
+/// Shared by the two row layouts, which differ only in how many gaps they take
+/// out first and what they wrap the heights in. Weights that do not add up to
+/// anything positive - all zero, or a caller that never set them - fall back to
+/// an even split rather than dividing by zero.
+fn distribute(available: i32, weights: &[f64], minimum: i32) -> Vec<i32> {
+    let count = weights.len() as i32;
+    if count == 0 {
+        return Vec::new();
+    }
+    let distributable = available - minimum * count;
+    let total = weights.iter().map(|weight| weight.max(0.0)).sum::<f64>();
+    let equal = total <= 0.0;
+    let total = if equal { f64::from(count) } else { total };
+    let mut cumulative = 0.0;
+    let mut distributed = 0;
+    weights
+        .iter()
+        .enumerate()
+        .map(|(row, weight)| {
+            cumulative += if equal { 1.0 } else { weight.max(0.0) };
+            let target = if row + 1 == weights.len() {
+                distributable
+            } else {
+                (f64::from(distributable) * cumulative / total).round() as i32
+            };
+            let height = minimum + target - distributed;
+            distributed = target;
+            height
+        })
+        .collect()
+}
+
 fn weighted_rows(
     rectangle: Rectangle<i32, Logical>,
     count: usize,
@@ -7186,34 +7189,22 @@ fn weighted_rows(
     if count == 0 {
         return Vec::new();
     }
-    let count = count as i32;
-    let gap = if count == 1 {
+    let rows = count as i32;
+    // Gaps sit between the rows only; the caller owns the outer margin.
+    let gap = if rows == 1 {
         0
     } else {
-        requested_gap.min(((rectangle.size.h - count) / (count - 1)).max(0))
+        requested_gap.min(((rectangle.size.h - rows) / (rows - 1)).max(0))
     };
-    let available = (rectangle.size.h - gap * (count - 1)).max(count);
-    let minimum = MIN_ROW_HEIGHT.min(available / count).max(1);
-    let distributable = available - minimum * count;
-    let weights = (0..count as usize)
-        .map(|index| weights.get(index).copied().unwrap_or(1.0).max(0.0))
+    let available = (rectangle.size.h - gap * (rows - 1)).max(rows);
+    let minimum = MIN_ROW_HEIGHT.min(available / rows).max(1);
+    let weights = (0..count)
+        .map(|index| weights.get(index).copied().unwrap_or(1.0))
         .collect::<Vec<_>>();
-    let total = weights.iter().sum::<f64>();
-    let equal = total <= 0.0;
-    let total = if equal { f64::from(count) } else { total };
     let mut y = rectangle.loc.y;
-    let mut cumulative = 0.0;
-    let mut distributed = 0;
-    (0..count)
-        .map(|row| {
-            cumulative += if equal { 1.0 } else { weights[row as usize] };
-            let target = if row + 1 == count {
-                distributable
-            } else {
-                (f64::from(distributable) * cumulative / total).round() as i32
-            };
-            let height = minimum + target - distributed;
-            distributed = target;
+    distribute(available, &weights, minimum)
+        .into_iter()
+        .map(|height| {
             let result = Rectangle::new(
                 (rectangle.loc.x, y).into(),
                 (rectangle.size.w, height).into(),
@@ -7242,6 +7233,9 @@ fn column_width(output_width: i32, fraction: f64, gap: i32) -> i32 {
     (((output_width - gap) as f64 * fraction).round() as i32).clamp(gap + 1, output_width - gap)
 }
 
+/// Rows stacked down an output, with a gap above the first and below the last
+/// as well as between them. Only y and height are filled in; the caller places
+/// x and width.
 fn stacked_rows(
     output_y: i32,
     output_height: i32,
@@ -7256,25 +7250,10 @@ fn stacked_rows(
     let gap = requested_gap.min(((output_height - count) / (count + 1)).max(0));
     let available = (output_height - gap * (count + 1)).max(count);
     let minimum = requested_minimum.min(available / count).max(1);
-    let distributable = available - minimum * count;
-    let total = weights.iter().map(|weight| weight.max(0.0)).sum::<f64>();
-    let equal = total <= 0.0;
-    let total = if equal { count.into() } else { total };
-    let mut cumulative = 0.0;
-    let mut distributed = 0;
     let mut y = output_y + gap;
-    weights
-        .iter()
-        .enumerate()
-        .map(|(row, weight)| {
-            cumulative += if equal { 1.0 } else { weight.max(0.0) };
-            let target = if row + 1 == weights.len() {
-                distributable
-            } else {
-                (f64::from(distributable) * cumulative / total).round() as i32
-            };
-            let row_height = minimum + target - distributed;
-            distributed = target;
+    distribute(available, weights, minimum)
+        .into_iter()
+        .map(|row_height| {
             let rectangle = Rectangle::new((0, y).into(), (0, row_height).into());
             y += row_height + gap;
             rectangle
