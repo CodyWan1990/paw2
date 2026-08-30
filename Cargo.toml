@@ -6,6 +6,11 @@ edition = "2024"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Nothing here catches a panic, and a panic in a compositor ends the session
+# either way - aborting hands the DRM state back to the kernel rather than
+# unwinding through it. Together with stripping this is ~4.5 MB off the binary.
+panic = "abort"
+strip = true
 
 [dependencies]
 # Only for installing the SIGTERM/SIGINT handlers; rustix has no stable sigaction.
