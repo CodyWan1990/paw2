@@ -582,11 +582,17 @@ pub fn apply_monitor_changes(state: &mut Paw2, monitors: &[MonitorConfig]) -> Ve
 }
 
 /// One refresh interval; `refresh` is in mHz.
+///
+/// `Mode::refresh` is a plain integer computation over the DRM mode with no
+/// lower bound, and `Duration::from_secs_f64` panics on a non-finite value -
+/// so a mode reporting zero must fall through to the default, not divide.
 fn frame_duration(output: &Output) -> Duration {
     output
         .current_mode()
-        .map(|mode| Duration::from_secs_f64(1_000.0 / mode.refresh as f64))
-        .unwrap_or(Duration::from_millis(16))
+        .filter(|mode| mode.refresh > 0)
+        .map_or(Duration::from_millis(16), |mode| {
+            Duration::from_secs_f64(1_000.0 / f64::from(mode.refresh))
+        })
 }
 
 fn present_feedback(

@@ -659,7 +659,7 @@ impl Effects {
         let output_bounds = Rectangle::from_size(
             output
                 .current_transform()
-                .transform_size(output.current_mode().unwrap().size),
+                .transform_size(output.current_mode().ok_or(OutputNoMode)?.size),
         );
         let mut elements = Vec::with_capacity(space_elements.len() + 4);
         let mut focus_ring = self.focus_ring(state, output);
