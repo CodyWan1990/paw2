@@ -78,25 +78,15 @@ pub struct Paw2 {
     pub seat: Seat<Self>,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
-    pub _xdg_dialog_state: XdgDialogState,
     pub xwayland_shell_state: XWaylandShellState,
     pub xwm: Option<X11Wm>,
     pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
-    pub _output_manager_state: OutputManagerState,
-    pub _idle_inhibit_state: IdleInhibitManagerState,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
-    pub _xwayland_keyboard_grab_state: XWaylandKeyboardGrabState,
     /// The live `zwp_xwayland_keyboard_grab_v1`, if an XWayland client took the
     /// keyboard. Smithay drops the grab when the client destroys the object and
     /// offers no ungrab callback, so the resource's own liveness is the signal.
     pub xwayland_keyboard_grab: Option<ZwpXwaylandKeyboardGrabV1>,
-    pub _presentation_state: PresentationState,
-    pub _fifo_manager_state: FifoManagerState,
-    pub _fractional_scale_manager_state: FractionalScaleManagerState,
-    pub _commit_timing_manager_state: CommitTimingManagerState,
-    pub _content_type_state: ContentTypeState,
-    pub _cursor_shape_manager_state: CursorShapeManagerState,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
@@ -106,11 +96,8 @@ pub struct Paw2 {
     /// [`Paw2::set_middle_click_paste`] for what a live change does not reach.
     primary_selection_enabled: Arc<AtomicBool>,
     pub data_control_state: DataControlState,
-    pub _viewporter_state: ViewporterState,
-    pub _single_pixel_buffer_state: SinglePixelBufferState,
     pub dmabuf_state: DmabufState,
-    pub _alpha_modifier_state: AlphaModifierState,
-    pub _background_effect_state: Option<BackgroundEffectState>,
+    pub background_effect_state: Option<BackgroundEffectState>,
     pub blur_surfaces: Vec<WlSurface>,
     pub cursor_status: smithay::input::pointer::CursorImageStatus,
     pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
@@ -154,25 +141,29 @@ impl Paw2 {
     ) -> Self {
         let display_handle = display.handle();
         let clock = Clock::<Monotonic>::new();
+        // Only the protocol states Paw2 actually reads are bound to a name and
+        // kept on `Self`. The rest are created and dropped: at the pinned
+        // smithay revision each is a bare `GlobalId`, `GlobalId` has no `Drop`,
+        // and a global is removed by `DisplayHandle::remove_global` and nothing
+        // else - so holding one changes nothing but the size of this struct.
+        // Re-check that if smithay is bumped.
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
-        let xdg_dialog_state = XdgDialogState::new::<Self>(&display_handle);
+        XdgDialogState::new::<Self>(&display_handle);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
-        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
-        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&display_handle);
+        OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        IdleInhibitManagerState::new::<Self>(&display_handle);
         let keyboard_shortcuts_inhibit_state =
             KeyboardShortcutsInhibitState::new::<Self>(&display_handle);
-        let xwayland_keyboard_grab_state = XWaylandKeyboardGrabState::new::<Self>(&display_handle);
-        let presentation_state =
-            PresentationState::new::<Self>(&display_handle, Monotonic::ID as u32);
-        let fifo_manager_state = FifoManagerState::new::<Self>(&display_handle);
-        let fractional_scale_manager_state =
-            FractionalScaleManagerState::new::<Self>(&display_handle);
-        let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&display_handle);
-        let content_type_state = ContentTypeState::new::<Self>(&display_handle);
-        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&display_handle);
+        XWaylandKeyboardGrabState::new::<Self>(&display_handle);
+        PresentationState::new::<Self>(&display_handle, Monotonic::ID as u32);
+        FifoManagerState::new::<Self>(&display_handle);
+        FractionalScaleManagerState::new::<Self>(&display_handle);
+        CommitTimingManagerState::new::<Self>(&display_handle);
+        ContentTypeState::new::<Self>(&display_handle);
+        CursorShapeManagerState::new::<Self>(&display_handle);
         RelativePointerManagerState::new::<Self>(&display_handle);
         PointerConstraintsState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -196,9 +187,9 @@ impl Paw2 {
         );
         // Both are handled entirely inside smithay's surface renderer, which
         // Paw2 already goes through; neither needs anything of its own here.
-        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
-        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
-        let alpha_modifier_state = AlphaModifierState::new::<Self>(&display_handle);
+        ViewporterState::new::<Self>(&display_handle);
+        SinglePixelBufferState::new::<Self>(&display_handle);
+        AlphaModifierState::new::<Self>(&display_handle);
         let workspace_state = WorkspaceState::new(&display_handle);
         let screencopy_state = ScreencopyState::new(&display_handle);
 
@@ -233,33 +224,20 @@ impl Paw2 {
             seat,
             compositor_state,
             xdg_shell_state,
-            _xdg_dialog_state: xdg_dialog_state,
             xwayland_shell_state,
             xwm: None,
             layer_shell_state,
             shm_state,
-            _output_manager_state: output_manager_state,
-            _idle_inhibit_state: idle_inhibit_state,
             keyboard_shortcuts_inhibit_state,
-            _xwayland_keyboard_grab_state: xwayland_keyboard_grab_state,
             xwayland_keyboard_grab: None,
-            _presentation_state: presentation_state,
-            _fifo_manager_state: fifo_manager_state,
-            _fractional_scale_manager_state: fractional_scale_manager_state,
-            _commit_timing_manager_state: commit_timing_manager_state,
-            _content_type_state: content_type_state,
-            _cursor_shape_manager_state: cursor_shape_manager_state,
             drm_syncobj_state: None,
             seat_state,
             data_device_state,
             primary_selection_state,
             primary_selection_enabled,
             data_control_state,
-            _viewporter_state: viewporter_state,
-            _single_pixel_buffer_state: single_pixel_buffer_state,
             dmabuf_state: DmabufState::new(),
-            _alpha_modifier_state: alpha_modifier_state,
-            _background_effect_state: None,
+            background_effect_state: None,
             blur_surfaces: Vec::new(),
             cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
             cursor_position_hint: None,
@@ -298,8 +276,8 @@ impl Paw2 {
     }
 
     pub fn enable_background_effects(&mut self) {
-        if self._background_effect_state.is_none() && self.config.appearance.blur_enabled() {
-            self._background_effect_state =
+        if self.background_effect_state.is_none() && self.config.appearance.blur_enabled() {
+            self.background_effect_state =
                 Some(BackgroundEffectState::new::<Self>(&self.display_handle));
         }
     }
