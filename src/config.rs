@@ -1738,6 +1738,30 @@ mod tests {
     use super::*;
 
     /// Drops one TOML section, header and all, up to the next section header.
+    /// What `config` does when the chord `keys` is pressed - spelled exactly as
+    /// a user would spell it in TOML.
+    ///
+    /// `Binding::parse` is the same parser the config itself uses, so this
+    /// cannot drift from what a real binding means, and it turns ten lines of
+    /// `ModifiersState { .. }` plus `keysym_from_name` into one string.
+    fn pressed(config: &Config, keys: &str) -> Option<Action> {
+        let binding = Binding::parse(keys).unwrap_or_else(|error| panic!("{keys}: {error}"));
+        let modifiers = ModifiersState {
+            ctrl: binding.ctrl,
+            alt: binding.alt,
+            shift: binding.shift,
+            logo: binding.logo,
+            ..Default::default()
+        };
+        match binding.trigger {
+            BindingTrigger::Key(keysym) => config.action(&modifiers, keysym),
+            BindingTrigger::Wheel(direction) => config.wheel_action(&modifiers, direction),
+            BindingTrigger::Button(button) => config
+                .tab_group_drag(&modifiers, button)
+                .then_some(Action::TabGroupDrag),
+        }
+    }
+
     fn without_section(source: &str, header: &str) -> String {
         let start = source.find(header).expect("section not found");
         let body = start + header.len();
@@ -1747,64 +1771,31 @@ mod tests {
         format!("{}{}", &source[..start], &source[end..])
     }
 
+    /// `EXAMPLE.toml` is the reference every option is documented in, so what it
+    /// parses to is the contract. Note that the *defaults* are the off state in
+    /// `Default` and `FALLBACK_CONFIG`, not these values.
     #[test]
-    fn defaults_and_validation() {
+    fn the_reference_config_parses_to_its_documented_values() {
         let config = parse(EXAMPLE_CONFIG).unwrap();
         assert_eq!(config.bindings.len(), 87);
-        let one = xkb::keysym_from_name("1", xkb::KEYSYM_CASE_INSENSITIVE);
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    alt: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                one,
-            ),
+            pressed(&config, "Super+Alt+1"),
             Some(Action::ToggleNumberedScratchpad(0))
         );
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    alt: true,
-                    shift: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                one,
-            ),
+            pressed(&config, "Super+Alt+Shift+1"),
             Some(Action::AssignNumberedScratchpad(0))
         );
-        let group_modifiers = ModifiersState {
-            shift: true,
-            logo: true,
-            ..Default::default()
-        };
-        let bracket_left = xkb::keysym_from_name("bracketleft", xkb::KEYSYM_CASE_INSENSITIVE);
         assert!(!config.layout.tab_grouping);
-        assert_eq!(config.action(&group_modifiers, bracket_left), None);
-        assert!(!config.tab_group_drag(
-            &ModifiersState {
-                ctrl: true,
-                logo: true,
-                ..Default::default()
-            },
-            BTN_LEFT,
-        ));
+        assert_eq!(pressed(&config, "Super+Shift+bracketleft"), None);
+        assert!(!(pressed(&config, "Super+Ctrl+MouseLeft") == Some(Action::TabGroupDrag)));
         let enabled =
             parse(&EXAMPLE_CONFIG.replace("tab_grouping = false", "tab_grouping = true")).unwrap();
         assert_eq!(
-            enabled.action(&group_modifiers, bracket_left),
+            pressed(&enabled, "Super+Shift+bracketleft"),
             Some(Action::TabGroupLeft)
         );
-        assert!(enabled.tab_group_drag(
-            &ModifiersState {
-                ctrl: true,
-                logo: true,
-                ..Default::default()
-            },
-            BTN_LEFT,
-        ));
+        assert!((pressed(&enabled, "Super+Ctrl+MouseLeft") == Some(Action::TabGroupDrag)));
         assert!(
             parse(&EXAMPLE_CONFIG.replace(
                 "tab_group_drag = [\"Super+Ctrl+MouseLeft\"]",
@@ -1822,62 +1813,22 @@ mod tests {
             .contains("non-drag action")
         );
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    shift: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
+            pressed(&config, "Super+Shift+space"),
             Some(Action::ToggleFloating)
         );
-        assert_eq!(
-            config.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("o", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
-            Some(Action::ToggleOverview)
-        );
+        assert_eq!(pressed(&config, "Super+o"), Some(Action::ToggleOverview));
         let disabled = parse(&EXAMPLE_CONFIG.replace(
             "toggle_floating = [\"Super+Shift+space\"]",
             "toggle_floating = []",
         ))
         .unwrap();
+        assert_eq!(pressed(&disabled, "Super+Shift+space"), None);
         assert_eq!(
-            disabled.action(
-                &ModifiersState {
-                    shift: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("space", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
-            None
-        );
-        assert_eq!(
-            config.action(
-                &ModifiersState {
-                    ctrl: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("k", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
+            pressed(&config, "Super+Ctrl+k"),
             Some(Action::DecreaseRowHeight)
         );
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    ctrl: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("Down", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
+            pressed(&config, "Super+Ctrl+Down"),
             Some(Action::IncreaseRowHeight)
         );
         assert!(!config.input.focus_follows_mouse);
@@ -1886,16 +1837,7 @@ mod tests {
         assert_eq!(config.layout.column_width, 0.6);
         assert_eq!(config.layout.enabled_layouts, default_enabled_layouts());
         assert_eq!(config.layout.preset_column_widths, [0.33333, 0.5, 0.66667]);
-        assert_eq!(
-            config.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("Tab", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
-            Some(Action::CycleLayout)
-        );
+        assert_eq!(pressed(&config, "Super+Tab"), Some(Action::CycleLayout));
         assert_eq!(config.appearance.gaps, 15);
         assert_eq!(config.appearance.focus_ring_width, 1);
         assert_eq!(
@@ -1990,38 +1932,18 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(default_scale.monitors[0].scale, 1.0);
+        assert_eq!(pressed(&config, "Super+Shift+k"), Some(Action::SwapUp));
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    shift: true,
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("k", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
-            Some(Action::SwapUp)
-        );
-        assert_eq!(
-            config.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("comma", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
+            pressed(&config, "Super+comma"),
             Some(Action::FocusMonitorLeft)
         );
-        assert_eq!(
-            config.wheel_action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                ScrollDirection::Up,
-            ),
-            None
-        );
+        assert_eq!(pressed(&config, "Super+WheelScrollUp"), None);
+    }
 
+    /// A bad value must cost the user that value's error message, never the
+    /// session - and must say which key it was.
+    #[test]
+    fn out_of_range_values_are_rejected_and_name_their_key() {
         let invalid_width = EXAMPLE_CONFIG.replace("column_width = 0.6", "column_width = 2.0");
         assert!(
             parse(&invalid_width)
@@ -2148,7 +2070,11 @@ mod tests {
                 .unwrap_err()
                 .contains("cannot be empty")
         );
+    }
 
+    /// Ambiguous chords, unknown actions, unknown keys and wheel bindings.
+    #[test]
+    fn bindings_reject_what_they_cannot_mean() {
         let ambiguous = EXAMPLE_CONFIG.replace(
             "focus_right = [\"Super+l\", \"Super+Right\"]",
             "focus_right = [\"Super+h\"]",
@@ -2188,24 +2114,11 @@ mod tests {
             );
         let config = parse(&wheel_bindings).unwrap();
         assert_eq!(
-            config.wheel_action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                ScrollDirection::Up,
-            ),
+            pressed(&config, "Super+WheelScrollUp"),
             Some(Action::FocusLeft)
         );
         assert_eq!(
-            config.wheel_action(
-                &ModifiersState {
-                    ctrl: true,
-                    alt: true,
-                    ..Default::default()
-                },
-                ScrollDirection::Down,
-            ),
+            pressed(&config, "Ctrl+Alt+WheelScrollDown"),
             Some(Action::DecreaseColumnWidth)
         );
         let duplicate_wheel = wheel_bindings.replace(
@@ -2271,7 +2184,13 @@ mod tests {
                 .unwrap_err()
                 .contains("only one monitor")
         );
+    }
 
+    /// An option a user's config has never heard of falls back to the compiled
+    /// default - which is the *off* state, not `EXAMPLE.toml`'s value.
+    #[test]
+    fn a_config_predating_a_section_gets_the_compiled_defaults() {
+        let config = parse(EXAMPLE_CONFIG).unwrap();
         // A config predating every optional section falls back to the compiled
         // defaults, which are the off state - not to the reference's values.
         let legacy = without_section(EXAMPLE_CONFIG, "[appearance]");
@@ -2502,16 +2421,7 @@ swap_right = ["Super+Shift+l"]
                 vec!["fuzzel".to_string(), "--show-actions".to_string()]
             ]
         );
-        assert_eq!(
-            config.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("d", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
-            Some(Action::LaunchCommand(1))
-        );
+        assert_eq!(pressed(&config, "Super+d"), Some(Action::LaunchCommand(1)));
 
         let empty = EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = []");
         assert!(parse(&empty).unwrap_err().contains("contain an executable"));
@@ -2945,13 +2855,7 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(config.scratchpads[0].size, [70.0, 55.0]);
         assert_eq!(config.scratchpads[0].position, Some([15.0, 20.0]));
         assert_eq!(
-            config.action(
-                &ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-                xkb::keysym_from_name("grave", xkb::KEYSYM_CASE_INSENSITIVE),
-            ),
+            pressed(&config, "Super+grave"),
             Some(Action::ToggleScratchpad(0))
         );
 
