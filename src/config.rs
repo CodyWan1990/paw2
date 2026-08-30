@@ -375,16 +375,32 @@ impl Default for BackendConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     pub connector: String,
+    #[serde(default)]
     pub focus_at_startup: bool,
+    #[serde(default)]
     pub resolution: Option<[u16; 2]>,
+    #[serde(default)]
     pub refresh: Option<f64>,
+    #[serde(default)]
     pub position: Option<[i32; 2]>,
+    #[serde(default = "default_monitor_scale")]
     pub scale: f64,
+    /// Parsed by serde rather than after the fact, which is what lets this be
+    /// the deserialised type and not a second `Raw` one. The wording of an
+    /// unknown transform is unchanged; toml adds the key path under it.
+    #[serde(default, deserialize_with = "transform")]
     pub transform: Transform,
+    #[serde(default)]
     pub vrr: VrrPolicy,
+}
+
+fn transform<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Transform, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    parse_transform(&value).map_err(serde::de::Error::custom)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -853,7 +869,7 @@ struct RawConfig {
     #[serde(default)]
     security: SecurityConfig,
     #[serde(default)]
-    monitors: Vec<RawMonitor>,
+    monitors: Vec<MonitorConfig>,
     #[serde(default)]
     autostart: RawAutostart,
     #[serde(default)]
@@ -1088,23 +1104,6 @@ impl Default for RawNumberedScratchpadBindings {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawMonitor {
-    connector: String,
-    #[serde(default)]
-    focus_at_startup: bool,
-    resolution: Option<[u16; 2]>,
-    refresh: Option<f64>,
-    position: Option<[i32; 2]>,
-    #[serde(default = "default_monitor_scale")]
-    scale: f64,
-    #[serde(default = "default_transform")]
-    transform: String,
-    #[serde(default)]
-    vrr: VrrPolicy,
-}
-
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAutostart {
@@ -1123,10 +1122,6 @@ fn default_enabled_layouts() -> Vec<LayoutMode> {
         LayoutMode::MasterStack,
         LayoutMode::Monocle,
     ]
-}
-
-fn default_transform() -> String {
-    "normal".into()
 }
 
 fn default_monitor_scale() -> f64 {
@@ -1240,6 +1235,41 @@ fn parse(source: &str) -> Result<Config, String> {
     parse_value(toml::from_str(source).map_err(|error: toml::de::Error| error.to_string())?)
 }
 
+/// A finite number inside `range`.
+///
+/// The bounds are `{:?}`-formatted so a whole number still reads as `1.0`
+/// rather than `1`, which is how every one of these messages is worded.
+fn finite_in(field: &str, value: f64, range: std::ops::RangeInclusive<f64>) -> Result<(), String> {
+    if !value.is_finite() || !range.contains(&value) {
+        return Err(format!(
+            "{field} must be between {:?} and {:?}",
+            range.start(),
+            range.end()
+        ));
+    }
+    Ok(())
+}
+
+/// An upper bound on a size or a duration.
+fn at_most<T: PartialOrd + std::fmt::Display>(
+    field: &str,
+    value: T,
+    maximum: T,
+) -> Result<(), String> {
+    if value > maximum {
+        return Err(format!("{field} must be at most {maximum}"));
+    }
+    Ok(())
+}
+
+/// A command must name something to run.
+fn executable(field: &str, command: &[String]) -> Result<(), String> {
+    if command.is_empty() || command[0].trim().is_empty() {
+        return Err(format!("{field} must contain an executable"));
+    }
+    Ok(())
+}
+
 fn parse_value(document: toml::Value) -> Result<Config, String> {
     let raw: RawConfig = document
         .try_into()
@@ -1256,9 +1286,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     {
         return Err("layout.enabled_layouts must not contain duplicates".into());
     }
-    if !raw.layout.column_width.is_finite() || !(0.1..=1.0).contains(&raw.layout.column_width) {
-        return Err("layout.column_width must be between 0.1 and 1.0".into());
-    }
+    finite_in("layout.column_width", raw.layout.column_width, 0.1..=1.0)?;
     if raw.layout.preset_column_widths.is_empty()
         || raw
             .layout
@@ -1268,29 +1296,21 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     {
         return Err("layout.preset_column_widths must contain values between 0.1 and 1.0".into());
     }
-    if raw.appearance.gaps > 256 {
-        return Err("appearance.gaps must be at most 256".into());
-    }
+    at_most("appearance.gaps", raw.appearance.gaps, 256)?;
     if raw.appearance.focus_ring_width > raw.appearance.gaps {
         return Err(
             "appearance.focus_ring_width cannot exceed appearance.gaps, which defaults to 0 - set gaps as well"
                 .into(),
         );
     }
-    if raw.appearance.blur_radius > 64 {
-        return Err("appearance.blur_radius must be at most 64".into());
-    }
-    if raw.appearance.corner_radius > 64 {
-        return Err("appearance.corner_radius must be at most 64".into());
-    }
-    if raw.appearance.shadow_radius > 64 {
-        return Err("appearance.shadow_radius must be at most 64".into());
-    }
-    if !raw.appearance.shadow_opacity.is_finite()
-        || !(0.0..=1.0).contains(&raw.appearance.shadow_opacity)
-    {
-        return Err("appearance.shadow_opacity must be between 0.0 and 1.0".into());
-    }
+    at_most("appearance.blur_radius", raw.appearance.blur_radius, 64)?;
+    at_most("appearance.corner_radius", raw.appearance.corner_radius, 64)?;
+    at_most("appearance.shadow_radius", raw.appearance.shadow_radius, 64)?;
+    finite_in(
+        "appearance.shadow_opacity",
+        raw.appearance.shadow_opacity,
+        0.0..=1.0,
+    )?;
     for (name, offset) in [
         ("shadow_offset_x", raw.appearance.shadow_offset_x),
         ("shadow_offset_y", raw.appearance.shadow_offset_y),
@@ -1299,15 +1319,9 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
             return Err(format!("appearance.{name} must be between -64 and 64"));
         }
     }
-    if !raw.appearance.opacity.is_finite() || !(0.1..=1.0).contains(&raw.appearance.opacity) {
-        return Err("appearance.opacity must be between 0.1 and 1.0".into());
-    }
-    if raw.animations.duration_ms > 5000 {
-        return Err("animations.duration_ms must be at most 5000".into());
-    }
-    if !raw.animations.slowdown.is_finite() || !(0.1..=100.0).contains(&raw.animations.slowdown) {
-        return Err("animations.slowdown must be between 0.1 and 100.0".into());
-    }
+    finite_in("appearance.opacity", raw.appearance.opacity, 0.1..=1.0)?;
+    at_most("animations.duration_ms", raw.animations.duration_ms, 5000)?;
+    finite_in("animations.slowdown", raw.animations.slowdown, 0.1..=100.0)?;
     for (name, value) in [
         ("cursor_theme", &raw.theme.cursor_theme),
         ("icon_theme", &raw.theme.icon_theme),
@@ -1334,10 +1348,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         parse_color(&raw.appearance.shadow_color, "appearance.shadow_color")?,
         raw.appearance.shadow_opacity as f32,
     );
-    if !(OVERVIEW_ZOOM_RANGE).contains(&raw.overview.zoom) {
-        let (low, high) = (OVERVIEW_ZOOM_RANGE.start(), OVERVIEW_ZOOM_RANGE.end());
-        return Err(format!("overview.zoom must be between {low} and {high}"));
-    }
+    finite_in("overview.zoom", raw.overview.zoom, OVERVIEW_ZOOM_RANGE)?;
     let backdrop_color = parse_color(&raw.overview.backdrop_color, "overview.backdrop_color")?;
     if let Some(path) = &raw.backend.drm_device
         && !path.is_absolute()
@@ -1361,11 +1372,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         return Err("security.privileged_clients entries cannot be empty".into());
     }
     for (index, command) in raw.autostart.commands.iter().enumerate() {
-        if command.is_empty() || command[0].trim().is_empty() {
-            return Err(format!(
-                "autostart.commands[{index}] must contain an executable"
-            ));
-        }
+        executable(&format!("autostart.commands[{index}]"), command)?;
     }
     if raw.backend.connector.is_some() && !raw.monitors.is_empty() {
         return Err("backend.connector cannot be used with [[monitors]]".into());
@@ -1416,16 +1423,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
                 monitor.connector
             ));
         }
-        monitors.push(MonitorConfig {
-            connector: monitor.connector,
-            focus_at_startup: monitor.focus_at_startup,
-            resolution: monitor.resolution,
-            refresh: monitor.refresh,
-            position: monitor.position,
-            scale: monitor.scale,
-            transform: parse_transform(&monitor.transform)?,
-            vrr: monitor.vrr,
-        });
+        monitors.push(monitor);
     }
 
     let mut scratchpads = Vec::new();
@@ -1436,11 +1434,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         if name.starts_with(NUMBERED_SCRATCHPAD_PREFIX) {
             return Err(format!("scratchpad name `{name}` is reserved"));
         }
-        if scratchpad.command.is_empty() || scratchpad.command[0].trim().is_empty() {
-            return Err(format!(
-                "scratchpads.{name}.command must contain an executable"
-            ));
-        }
+        executable(&format!("scratchpads.{name}.command"), &scratchpad.command)?;
         if scratchpad.app_id.trim().is_empty() {
             return Err(format!("scratchpads.{name}.app_id cannot be empty"));
         }
@@ -1473,9 +1467,11 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
                 "scratchpads.{name}.position and size must fit within 100 percent"
             ));
         }
-        if scratchpad.margin > 256 {
-            return Err(format!("scratchpads.{name}.margin must be at most 256"));
-        }
+        at_most(
+            &format!("scratchpads.{name}.margin"),
+            scratchpad.margin,
+            256,
+        )?;
         scratchpads.push(ScratchpadConfig {
             name,
             command: scratchpad.command,
@@ -1565,11 +1561,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     }
     let mut binding_commands = Vec::new();
     for (value, command) in command_bindings {
-        if command.is_empty() || command[0].trim().is_empty() {
-            return Err(format!(
-                "bindings.commands.{value} must contain an executable"
-            ));
-        }
+        executable(&format!("bindings.commands.{value}"), &command)?;
         let action = Action::LaunchCommand(binding_commands.len());
         add_binding(&mut bindings, &value, action)?;
         binding_commands.push(command);
