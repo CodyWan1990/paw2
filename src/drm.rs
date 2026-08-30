@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     time::{Duration, Instant},
@@ -38,7 +39,7 @@ use smithay::{
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     desktop::{layer_map_for_output, space::SurfaceTree, utils::OutputPresentationFeedback},
-    input::pointer::{CursorImageStatus, CursorImageSurfaceData},
+    input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     output::{Mode, Output, PhysicalProperties, Scale as OutputScale},
     reexports::{
         calloop::{
@@ -68,6 +69,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{MonitorConfig, ThemeConfig, VrrPolicy},
+    cursor::CursorSettings,
     render::{Effects, PawRenderElements, clear_color},
     screencopy::CaptureTarget,
     state::Paw2,
@@ -187,6 +189,12 @@ pub struct DirectBackend {
     scanner: DrmScanner,
     outputs: Vec<ActiveOutput>,
     cursor: Option<crate::cursor::Cursor>,
+    /// Every shape loaded for `cursor_settings`. Smithay asks for a cursor on
+    /// every focus change and `wp_cursor_shape` lets a client ask as often as
+    /// it likes, and each miss is an `XCURSOR_PATH` scan plus a file read.
+    cursor_cache: HashMap<CursorIcon, crate::cursor::Cursor>,
+    /// What `cursor_cache` was filled for; a theme change empties it.
+    cursor_settings: CursorSettings,
     cursor_fallback: SolidColorBuffer,
     effects: Effects,
     pub renderer: GlesRenderer,
@@ -261,12 +269,9 @@ pub fn init(
         state.config.theme.cursor_theme.as_deref(),
         state.config.theme.cursor_size,
     );
-    let cursor = crate::cursor::Cursor::load(
-        &cursor_settings,
-        smithay::input::pointer::CursorIcon::Default,
-    )
-    .map_err(|error| warn!(?error, "could not load cursor theme; using fallback cursor"))
-    .ok();
+    let cursor = crate::cursor::Cursor::load(&cursor_settings, CursorIcon::Default)
+        .map_err(|error| warn!(?error, "could not load cursor theme; using fallback cursor"))
+        .ok();
     let mut backend = DirectBackend {
         handle: event_loop.handle(),
         _session: session.clone(),
@@ -274,7 +279,12 @@ pub fn init(
         manager,
         scanner: DrmScanner::new(),
         outputs: Vec::new(),
+        cursor_cache: cursor
+            .clone()
+            .map(|cursor| HashMap::from([(CursorIcon::Default, cursor)]))
+            .unwrap_or_default(),
         cursor,
+        cursor_settings,
         cursor_fallback: SolidColorBuffer::new((12, 12), [1.0, 1.0, 1.0, 1.0]),
         effects,
         renderer,
@@ -510,35 +520,57 @@ pub fn redraw(state: &mut Paw2) {
     with_backend(state, |backend, state| backend.render(state));
 }
 
-pub fn reload_cursor(state: &mut Paw2, theme: &ThemeConfig) -> Result<(), String> {
+/// Make `icon` the drawn cursor, loading it only on a cache miss.
+///
+/// A theme change empties the cache; within one theme every shape is read from
+/// disk at most once. See [`DirectBackend::cursor_cache`] for why that matters.
+fn set_cursor(
+    state: &mut Paw2,
+    settings: &CursorSettings,
+    icon: CursorIcon,
+) -> Result<(), String> {
     let mut result = Ok(());
-    with_backend(state, |backend, state| {
-        let settings = state
-            .cursor_defaults
-            .configured(theme.cursor_theme.as_deref(), theme.cursor_size);
-        let icon = match state.cursor_status {
-            CursorImageStatus::Named(icon) => icon,
-            _ => smithay::input::pointer::CursorIcon::Default,
-        };
-        match crate::cursor::Cursor::load(&settings, icon) {
-            Ok(cursor) => backend.cursor = Some(cursor),
+    with_backend(state, |backend, _| {
+        if backend.cursor_settings != *settings {
+            backend.cursor_cache.clear();
+            backend.cursor_settings = settings.clone();
+        }
+        if let Some(cursor) = backend.cursor_cache.get(&icon) {
+            backend.cursor = Some(cursor.clone());
+            return;
+        }
+        match crate::cursor::Cursor::load(settings, icon) {
+            Ok(cursor) => {
+                backend.cursor_cache.insert(icon, cursor.clone());
+                backend.cursor = Some(cursor);
+            }
             Err(error) => result = Err(format!("could not load cursor theme: {error}")),
         }
     });
     result
 }
 
-pub fn select_cursor_icon(state: &mut Paw2, icon: smithay::input::pointer::CursorIcon) {
-    with_backend(state, |backend, state| {
-        let settings = state.cursor_defaults.configured(
-            state.config.theme.cursor_theme.as_deref(),
-            state.config.theme.cursor_size,
-        );
-        match crate::cursor::Cursor::load(&settings, icon) {
-            Ok(cursor) => backend.cursor = Some(cursor),
-            Err(error) => warn!(?error, %icon, "could not load requested cursor shape"),
-        }
-    });
+/// The configured theme changed; reload whatever shape is currently showing.
+pub fn reload_cursor(state: &mut Paw2, theme: &ThemeConfig) -> Result<(), String> {
+    let settings = state
+        .cursor_defaults
+        .configured(theme.cursor_theme.as_deref(), theme.cursor_size);
+    let icon = match state.cursor_status {
+        CursorImageStatus::Named(icon) => icon,
+        _ => CursorIcon::Default,
+    };
+    set_cursor(state, &settings, icon)
+}
+
+/// A client asked for a named shape.
+pub fn select_cursor_icon(state: &mut Paw2, icon: CursorIcon) {
+    let settings = state.cursor_defaults.configured(
+        state.config.theme.cursor_theme.as_deref(),
+        state.config.theme.cursor_size,
+    );
+    if let Err(error) = set_cursor(state, &settings, icon) {
+        warn!(%error, %icon, "could not load requested cursor shape");
+    }
 }
 
 pub fn apply_monitor_changes(state: &mut Paw2, monitors: &[MonitorConfig]) -> Vec<String> {

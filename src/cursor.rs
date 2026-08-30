@@ -39,6 +39,7 @@ impl CursorSettings {
     }
 }
 
+#[derive(Clone)]
 pub struct Cursor {
     pub buffer: MemoryRenderBuffer,
     pub hotspot: Point<i32, Logical>,

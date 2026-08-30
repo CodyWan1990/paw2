@@ -622,6 +622,13 @@ impl SeatHandler for Paw2 {
         _seat: &Seat<Self>,
         image: smithay::input::pointer::CursorImageStatus,
     ) {
+        // Smithay calls this from inside every pointer focus change, and
+        // `wp_cursor_shape` lets a client call it as often as it likes. Loading
+        // a shape scans `XCURSOR_PATH` and reads a file, so an unchanged
+        // request must not reach the loader at all.
+        if self.cursor_status == image {
+            return;
+        }
         if let smithay::input::pointer::CursorImageStatus::Named(icon) = image {
             crate::drm::select_cursor_icon(self, icon);
         }
