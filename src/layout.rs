@@ -154,6 +154,17 @@ pub(crate) struct WindowRenderState {
     pub scratchpad: bool,
 }
 
+/// One column of the scrolling layout, and the row it remembers.
+///
+/// `focused` is **not** a duplicate of [`Workspace::focused`]. It is this
+/// column's own memory of where the user last was in it, which is what lets
+/// focus move out of a column and back into the same row - see
+/// [`column_neighbor`], which reads it on a column that does *not* have focus.
+/// Do not try to derive it from the workspace's focus; that loses the memory.
+///
+/// It is kept in range by [`Workspace::focus_window`] and
+/// [`Workspace::remove_tile_from_column`], the only two places that can put it
+/// out of date. Read it through [`Self::focused_window`] rather than indexing.
 struct Column<T = Window> {
     windows: Vec<T>,
     row_weights: Vec<f64>,
@@ -269,6 +280,15 @@ impl<T> Column<T> {
             focused: 0,
             width: None,
         }
+    }
+
+    /// The window in this column's remembered row.
+    ///
+    /// `None` only if `focused` has gone stale, which the two resync sites are
+    /// there to prevent - but this is what every reader uses, so a bug there
+    /// costs a missed focus rather than a panicking index.
+    fn focused_window(&self) -> Option<&T> {
+        self.windows.get(self.focused)
     }
 }
 
@@ -665,7 +685,7 @@ impl Workspace {
         self.focused = self
             .columns
             .get(column_index.min(self.columns.len().saturating_sub(1)))
-            .and_then(|column| column.windows.get(column.focused))
+            .and_then(Column::focused_window)
             .and_then(|window| self.window_index(window))
             .or_else(|| (!self.windows.is_empty()).then_some(0));
         debug_assert!(column.windows.contains(&focused_window));
@@ -684,7 +704,9 @@ impl Workspace {
     fn drain_groups(&mut self) -> Vec<WindowGroup> {
         let mut groups = Vec::new();
         while let Some(column) = self.columns.first() {
-            let window = column.windows[column.focused].clone();
+            let Some(window) = column.focused_window().cloned() else {
+                break;
+            };
             self.focused = self.window_index(&window);
             groups.push(self.take_focused_group().unwrap());
         }
@@ -703,7 +725,7 @@ impl Workspace {
             return false;
         };
         let column = &self.columns[next];
-        let Some(window) = column.windows.get(column.focused).cloned() else {
+        let Some(window) = column.focused_window().cloned() else {
             return false;
         };
         self.focused = self.window_index(&window);
@@ -4878,7 +4900,7 @@ fn column_neighbor<T: Clone + PartialEq>(
     let target = neighbor(current, columns.len() + floating.len(), delta)?;
     columns
         .get(target)
-        .and_then(|column| column.windows.get(column.focused))
+        .and_then(Column::focused_window)
         // `checked_sub`, not `saturating_sub`: a column whose `focused` index has
         // gone stale would otherwise fall through to the first floating window
         // instead of reporting that it has nothing to offer.
@@ -4921,7 +4943,9 @@ fn consume_or_expel_columns<T>(columns: &mut Vec<Column<T>>, current: usize, del
         columns[target].focused = columns[target].windows.len() - 1;
     } else {
         let column = &mut columns[current];
-        let row = column.focused;
+        // Clamped: `remove` would panic on a stale index, and this is the last
+        // place that indexes `windows` by `focused` directly.
+        let row = column.focused.min(column.windows.len() - 1);
         let window = column.windows.remove(row);
         column.row_weights.remove(row);
         column.focused = row.min(column.windows.len() - 1);
