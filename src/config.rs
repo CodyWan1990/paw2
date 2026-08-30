@@ -1738,6 +1738,28 @@ mod tests {
     use super::*;
 
     /// Drops one TOML section, header and all, up to the next section header.
+    /// `str::replace`, but it refuses to do nothing.
+    ///
+    /// The fixtures below are built by rewriting literal lines of
+    /// `EXAMPLE.toml`. `str::replace` returns its input unchanged when the
+    /// needle is absent, so rewording one of those lines would quietly turn the
+    /// assertion that follows into one that tests nothing - the hazard
+    /// REFERENCE.md warns about. This fails loudly instead.
+    trait Edited {
+        fn edited(&self, from: &str, to: &str) -> String;
+    }
+
+    impl Edited for str {
+        #[track_caller]
+        fn edited(&self, from: &str, to: &str) -> String {
+            assert!(
+                self.contains(from),
+                "the fixture no longer contains `{from}`"
+            );
+            self.replace(from, to)
+        }
+    }
+
     /// What `config` does when the chord `keys` is pressed - spelled exactly as
     /// a user would spell it in TOML.
     ///
@@ -1790,14 +1812,14 @@ mod tests {
         assert_eq!(pressed(&config, "Super+Shift+bracketleft"), None);
         assert!(!(pressed(&config, "Super+Ctrl+MouseLeft") == Some(Action::TabGroupDrag)));
         let enabled =
-            parse(&EXAMPLE_CONFIG.replace("tab_grouping = false", "tab_grouping = true")).unwrap();
+            parse(&EXAMPLE_CONFIG.edited("tab_grouping = false", "tab_grouping = true")).unwrap();
         assert_eq!(
             pressed(&enabled, "Super+Shift+bracketleft"),
             Some(Action::TabGroupLeft)
         );
         assert!((pressed(&enabled, "Super+Ctrl+MouseLeft") == Some(Action::TabGroupDrag)));
         assert!(
-            parse(&EXAMPLE_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.edited(
                 "tab_group_drag = [\"Super+Ctrl+MouseLeft\"]",
                 "tab_group_drag = [\"Super+Ctrl+x\"]",
             ))
@@ -1805,7 +1827,7 @@ mod tests {
             .contains("must use a mouse button")
         );
         assert!(
-            parse(&EXAMPLE_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.edited(
                 "focus_left = [\"Super+h\", \"Super+Left\"]",
                 "focus_left = [\"Super+MouseRight\"]",
             ))
@@ -1817,7 +1839,7 @@ mod tests {
             Some(Action::ToggleFloating)
         );
         assert_eq!(pressed(&config, "Super+o"), Some(Action::ToggleOverview));
-        let disabled = parse(&EXAMPLE_CONFIG.replace(
+        let disabled = parse(&EXAMPLE_CONFIG.edited(
             "toggle_floating = [\"Super+Shift+space\"]",
             "toggle_floating = []",
         ))
@@ -1860,12 +1882,12 @@ mod tests {
             [28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0, 1.0]
         );
         assert!(
-            parse(&EXAMPLE_CONFIG.replace("zoom = 0.5", "zoom = 0.9"))
+            parse(&EXAMPLE_CONFIG.edited("zoom = 0.5", "zoom = 0.9"))
                 .unwrap_err()
                 .contains("overview.zoom must be between")
         );
         assert!(
-            parse(&EXAMPLE_CONFIG.replace(
+            parse(&EXAMPLE_CONFIG.edited(
                 r##"backdrop_color = "#1c1c1c""##,
                 r#"backdrop_color = "grey""#
             ))
@@ -1876,7 +1898,7 @@ mod tests {
             config.overview.scratchpad_position,
             ScratchpadOverviewPosition::Centered
         );
-        let left = parse(&EXAMPLE_CONFIG.replace(
+        let left = parse(&EXAMPLE_CONFIG.edited(
             "scratchpad_position = \"centered\"",
             "scratchpad_position = \"left\"",
         ))
@@ -1889,8 +1911,8 @@ mod tests {
         // A config written before the overview existed still gets its defaults.
         let legacy_overview = parse(
             &EXAMPLE_CONFIG
-                .replace("zoom = 0.5\n", "")
-                .replace(r##"backdrop_color = "#1c1c1c""##, ""),
+                .edited("zoom = 0.5\n", "")
+                .edited(r##"backdrop_color = "#1c1c1c""##, ""),
         )
         .unwrap();
         assert_eq!(legacy_overview.overview, config.overview);
@@ -1907,7 +1929,7 @@ mod tests {
             ]
         );
         assert!(
-            parse(&EXAMPLE_CONFIG.replace(PRIVILEGED, r#"privileged_clients = ["  "]"#))
+            parse(&EXAMPLE_CONFIG.edited(PRIVILEGED, r#"privileged_clients = ["  "]"#))
                 .unwrap_err()
                 .contains("cannot be empty")
         );
@@ -1928,7 +1950,7 @@ mod tests {
         assert_eq!(monitored.monitors[1].transform, Transform::Normal);
         let default_scale = parse(&format!(
             "{EXAMPLE_CONFIG}{}",
-            MONITORS.replace("scale = 1.0\n", "")
+            MONITORS.edited("scale = 1.0\n", "")
         ))
         .unwrap();
         assert_eq!(default_scale.monitors[0].scale, 1.0);
@@ -1944,14 +1966,14 @@ mod tests {
     /// session - and must say which key it was.
     #[test]
     fn out_of_range_values_are_rejected_and_name_their_key() {
-        let invalid_width = EXAMPLE_CONFIG.replace("column_width = 0.6", "column_width = 2.0");
+        let invalid_width = EXAMPLE_CONFIG.edited("column_width = 0.6", "column_width = 2.0");
         assert!(
             parse(&invalid_width)
                 .unwrap_err()
                 .contains("between 0.1 and 1.0")
         );
 
-        let no_layouts = EXAMPLE_CONFIG.replace(
+        let no_layouts = EXAMPLE_CONFIG.edited(
             "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
             "enabled_layouts = []",
         );
@@ -1960,19 +1982,19 @@ mod tests {
                 .unwrap_err()
                 .contains("must not be empty")
         );
-        let duplicate_layout = EXAMPLE_CONFIG.replace(
+        let duplicate_layout = EXAMPLE_CONFIG.edited(
             "enabled_layouts = [\"scrolling\", \"dwindle\", \"master_stack\", \"monocle\"]",
             "enabled_layouts = [\"scrolling\", \"scrolling\"]",
         );
         assert!(parse(&duplicate_layout).unwrap_err().contains("duplicates"));
-        let unknown_layout = EXAMPLE_CONFIG.replace("\"dwindle\"", "\"grid\"");
+        let unknown_layout = EXAMPLE_CONFIG.edited("\"dwindle\"", "\"grid\"");
         assert!(
             parse(&unknown_layout)
                 .unwrap_err()
                 .contains("unknown variant")
         );
 
-        let invalid_presets = EXAMPLE_CONFIG.replace(
+        let invalid_presets = EXAMPLE_CONFIG.edited(
             "preset_column_widths = [0.33333, 0.5, 0.66667]",
             "preset_column_widths = []",
         );
@@ -1982,27 +2004,27 @@ mod tests {
                 .contains("preset_column_widths")
         );
 
-        let invalid_color = EXAMPLE_CONFIG.replace("#0b3d91", "blue");
+        let invalid_color = EXAMPLE_CONFIG.edited("#0b3d91", "blue");
         assert!(parse(&invalid_color).unwrap_err().contains("#RRGGBB"));
 
-        let invalid_ring = EXAMPLE_CONFIG.replace("focus_ring_width = 1", "focus_ring_width = 16");
+        let invalid_ring = EXAMPLE_CONFIG.edited("focus_ring_width = 1", "focus_ring_width = 16");
         assert!(parse(&invalid_ring).unwrap_err().contains("cannot exceed"));
 
-        let invalid_corner = EXAMPLE_CONFIG.replace("corner_radius = 8", "corner_radius = 65");
+        let invalid_corner = EXAMPLE_CONFIG.edited("corner_radius = 8", "corner_radius = 65");
         assert!(
             parse(&invalid_corner)
                 .unwrap_err()
                 .contains("corner_radius")
         );
 
-        let invalid_shadow = EXAMPLE_CONFIG.replace("shadow_radius = 12", "shadow_radius = 65");
+        let invalid_shadow = EXAMPLE_CONFIG.edited("shadow_radius = 12", "shadow_radius = 65");
         assert!(
             parse(&invalid_shadow)
                 .unwrap_err()
                 .contains("shadow_radius")
         );
 
-        let invalid_offset = EXAMPLE_CONFIG.replace("shadow_offset_y = 4", "shadow_offset_y = -65");
+        let invalid_offset = EXAMPLE_CONFIG.edited("shadow_offset_y = 4", "shadow_offset_y = -65");
         assert!(
             parse(&invalid_offset)
                 .unwrap_err()
@@ -2012,46 +2034,46 @@ mod tests {
         // The colour error has to name the key that is wrong, not the first key
         // that happens to be a colour.
         let invalid_shadow_color =
-            EXAMPLE_CONFIG.replace(r##"shadow_color = "#000000""##, r#"shadow_color = "black""#);
+            EXAMPLE_CONFIG.edited(r##"shadow_color = "#000000""##, r#"shadow_color = "black""#);
         assert!(
             parse(&invalid_shadow_color)
                 .unwrap_err()
                 .contains("shadow_color")
         );
 
-        let invalid_opacity = EXAMPLE_CONFIG.replace("opacity = 0.95", "opacity = 1.5");
+        let invalid_opacity = EXAMPLE_CONFIG.edited("opacity = 0.95", "opacity = 1.5");
         assert!(parse(&invalid_opacity).unwrap_err().contains("opacity"));
 
-        let invalid_duration = EXAMPLE_CONFIG.replace("duration_ms = 150", "duration_ms = 5001");
+        let invalid_duration = EXAMPLE_CONFIG.edited("duration_ms = 150", "duration_ms = 5001");
         assert!(
             parse(&invalid_duration)
                 .unwrap_err()
                 .contains("duration_ms")
         );
 
-        let invalid_slowdown = EXAMPLE_CONFIG.replace("slowdown = 1.0", "slowdown = 0.0");
+        let invalid_slowdown = EXAMPLE_CONFIG.edited("slowdown = 1.0", "slowdown = 0.0");
         assert!(parse(&invalid_slowdown).unwrap_err().contains("slowdown"));
 
         // slowdown scales duration; the renderer only ever sees the product.
-        let slowed = EXAMPLE_CONFIG.replace("slowdown = 1.0", "slowdown = 3.0");
+        let slowed = EXAMPLE_CONFIG.edited("slowdown = 1.0", "slowdown = 3.0");
         assert_eq!(
             parse(&slowed).unwrap().animations.duration,
             Duration::from_millis(450)
         );
 
         // Both switches independently disable their effect.
-        let no_blur = EXAMPLE_CONFIG.replace("blur = true", "blur = false");
+        let no_blur = EXAMPLE_CONFIG.edited("blur = true", "blur = false");
         assert!(!parse(&no_blur).unwrap().appearance.blur_enabled());
-        let opaque = EXAMPLE_CONFIG.replace("transparency = true", "transparency = false");
+        let opaque = EXAMPLE_CONFIG.edited("transparency = true", "transparency = false");
         assert_eq!(parse(&opaque).unwrap().appearance.window_opacity(), 1.0);
         let no_scanout =
-            parse(&EXAMPLE_CONFIG.replace("direct_scanout = true", "direct_scanout = false"))
+            parse(&EXAMPLE_CONFIG.edited("direct_scanout = true", "direct_scanout = false"))
                 .unwrap();
         assert!(!no_scanout.backend.direct_scanout);
         let mut active = parse(EXAMPLE_CONFIG).unwrap();
         assert!(active.apply_runtime(no_scanout));
         assert!(active.backend.direct_scanout);
-        let no_animation = EXAMPLE_CONFIG.replace("enabled = true", "enabled = false");
+        let no_animation = EXAMPLE_CONFIG.edited("enabled = true", "enabled = false");
         assert!(!parse(&no_animation).unwrap().animations.active());
 
         let themed = parse(&format!(
@@ -2075,7 +2097,7 @@ mod tests {
     /// Ambiguous chords, unknown actions, unknown keys and wheel bindings.
     #[test]
     fn bindings_reject_what_they_cannot_mean() {
-        let ambiguous = EXAMPLE_CONFIG.replace(
+        let ambiguous = EXAMPLE_CONFIG.edited(
             "focus_right = [\"Super+l\", \"Super+Right\"]",
             "focus_right = [\"Super+h\"]",
         );
@@ -2085,14 +2107,14 @@ mod tests {
                 .contains("more than one action")
         );
 
-        let unknown_action = EXAMPLE_CONFIG.replace("focus_left = ", "focus_lft = ");
+        let unknown_action = EXAMPLE_CONFIG.edited("focus_left = ", "focus_lft = ");
         assert!(
             parse(&unknown_action)
                 .unwrap_err()
                 .contains("unknown binding action")
         );
 
-        let invalid_binding = EXAMPLE_CONFIG.replace("Super+h", "Hyper+h");
+        let invalid_binding = EXAMPLE_CONFIG.edited("Super+h", "Hyper+h");
         assert!(
             parse(&invalid_binding)
                 .unwrap_err()
@@ -2100,15 +2122,15 @@ mod tests {
         );
 
         let wheel_bindings = EXAMPLE_CONFIG
-            .replace(
+            .edited(
                 "focus_left = [\"Super+h\", \"Super+Left\"]",
                 "focus_left = [\"Super+h\", \"Super+Left\", \"Super+WheelScrollUp\"]",
             )
-            .replace(
+            .edited(
                 "decrease_column_width = [\"Super+Ctrl+h\", \"Super+Ctrl+Left\"]",
                 "decrease_column_width = [\"Ctrl+Alt+WheelScrollDown\"]",
             )
-            .replace(
+            .edited(
                 "increase_column_width = [\"Super+Ctrl+l\", \"Super+Ctrl+Right\"]",
                 "increase_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
             );
@@ -2121,7 +2143,7 @@ mod tests {
             pressed(&config, "Ctrl+Alt+WheelScrollDown"),
             Some(Action::DecreaseColumnWidth)
         );
-        let duplicate_wheel = wheel_bindings.replace(
+        let duplicate_wheel = wheel_bindings.edited(
             "increase_column_width = [\"Ctrl+Alt+WheelScrollUp\"]",
             "increase_column_width = [\"Ctrl+Alt+WheelScrollDown\"]",
         );
@@ -2131,7 +2153,7 @@ mod tests {
                 .contains("more than one action")
         );
         assert!(
-            parse(&wheel_bindings.replace("WheelScrollUp", "WheelScrollSideways"))
+            parse(&wheel_bindings.edited("WheelScrollUp", "WheelScrollSideways"))
                 .unwrap_err()
                 .contains("unknown key")
         );
@@ -2159,7 +2181,7 @@ mod tests {
 
         let duplicate = format!(
             "{EXAMPLE_CONFIG}{}",
-            MONITORS.replace("connector = \"DP-1\"", "connector = \"DP-2\"")
+            MONITORS.edited("connector = \"DP-1\"", "connector = \"DP-2\"")
         );
         assert!(
             parse(&duplicate)
@@ -2169,13 +2191,13 @@ mod tests {
 
         let startup_monitor = format!(
             "{EXAMPLE_CONFIG}{}",
-            MONITORS.replace("# focus_at_startup = true", "focus_at_startup = true")
+            MONITORS.edited("# focus_at_startup = true", "focus_at_startup = true")
         );
         assert_eq!(
             parse(&startup_monitor).unwrap().startup_monitor(),
             Some("DP-2")
         );
-        let duplicate_startup = startup_monitor.replace(
+        let duplicate_startup = startup_monitor.edited(
             "connector = \"DP-1\"\nresolution",
             "connector = \"DP-1\"\nfocus_at_startup = true\nresolution",
         );
@@ -2198,10 +2220,10 @@ mod tests {
         let legacy = without_section(&legacy, "[input]");
         let legacy = without_section(&legacy, "[security]");
         let legacy = without_section(&legacy, "[backend]")
-            .replace("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
-            .replace("toggle_fullscreen = [\"Super+Shift+f\"]\n", "")
-            .replace("focus_monitor_left = [\"Super+comma\"]\n", "")
-            .replace("quit = [\"Super+Shift+Escape\"]\n", "");
+            .edited("close_window = [\"Super+q\", \"Super+BackSpace\"]\n", "")
+            .edited("toggle_fullscreen = [\"Super+Shift+f\"]\n", "")
+            .edited("focus_monitor_left = [\"Super+comma\"]\n", "")
+            .edited("quit = [\"Super+Shift+Escape\"]\n", "");
         let legacy = parse(&legacy).unwrap();
         // `close_window` and `quit` are in the fallback set, so dropping them
         // hands them back. `toggle_fullscreen` and `focus_monitor_left` are
@@ -2254,25 +2276,25 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(config.bindings.len(), 4 + 11 + 18 + 1);
 
         let old_monitor_bindings = EXAMPLE_CONFIG
-            .replace(
+            .edited(
                 "decrease_row_height = [\"Super+Ctrl+k\", \"Super+Ctrl+Up\"]\n",
                 "",
             )
-            .replace(
+            .edited(
                 "increase_row_height = [\"Super+Ctrl+j\", \"Super+Ctrl+Down\"]\n",
                 "",
             )
-            .replace(
+            .edited(
                 "focus_monitor_up = []",
                 "focus_monitor_up = [\"Super+Ctrl+Up\"]",
             )
-            .replace(
+            .edited(
                 "focus_monitor_down = []",
                 "focus_monitor_down = [\"Super+Ctrl+Down\"]",
             );
         assert!(parse(&old_monitor_bindings).is_ok());
 
-        let invalid_workspaces = EXAMPLE_CONFIG.replace(
+        let invalid_workspaces = EXAMPLE_CONFIG.edited(
             "  [\"Super+7\"], [\"Super+8\"], [\"Super+9\"],\n]",
             "  [\"Super+7\"], [\"Super+8\"],\n]",
         );
@@ -2281,7 +2303,7 @@ swap_right = ["Super+Shift+l"]
                 .unwrap_err()
                 .contains("exactly 9")
         );
-        let invalid_scratchpads = EXAMPLE_CONFIG.replace(
+        let invalid_scratchpads = EXAMPLE_CONFIG.edited(
             "  [\"Super+Alt+7\"], [\"Super+Alt+8\"], [\"Super+Alt+9\"],\n]",
             "  [\"Super+Alt+7\"], [\"Super+Alt+8\"],\n]",
         );
@@ -2368,10 +2390,10 @@ swap_right = ["Super+Shift+l"]
 
         let with_monitors = format!("{EXAMPLE_CONFIG}{MONITORS}");
         let config =
-            parse(&with_monitors.replace("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
+            parse(&with_monitors.edited("vrr = \"automatic\"", "vrr = \"never\"")).unwrap();
         assert_eq!(config.monitors[0].vrr, VrrPolicy::Never);
 
-        let config = parse(&with_monitors.replace("vrr = \"automatic\"\n", "")).unwrap();
+        let config = parse(&with_monitors.edited("vrr = \"automatic\"\n", "")).unwrap();
         assert!(
             config
                 .monitors
@@ -2382,7 +2404,7 @@ swap_right = ["Super+Shift+l"]
 
     #[test]
     fn parses_and_validates_autostart() {
-        let configured = EXAMPLE_CONFIG.replace(
+        let configured = EXAMPLE_CONFIG.edited(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[\"swaybg\", \"-m\", \"fill\"], [\"waybar\"]]",
         );
@@ -2394,13 +2416,13 @@ swap_right = ["Super+Shift+l"]
             ]
         );
 
-        let empty = EXAMPLE_CONFIG.replace(
+        let empty = EXAMPLE_CONFIG.edited(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[]]",
         );
         assert!(parse(&empty).unwrap_err().contains("contain an executable"));
 
-        let blank = EXAMPLE_CONFIG.replace(
+        let blank = EXAMPLE_CONFIG.edited(
             "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
             "commands = [[\"  \"]]",
         );
@@ -2409,7 +2431,7 @@ swap_right = ["Super+Shift+l"]
 
     #[test]
     fn parses_and_validates_command_bindings() {
-        let configured = EXAMPLE_CONFIG.replace(
+        let configured = EXAMPLE_CONFIG.edited(
             "# \"Super+d\" = [\"fuzzel\"]",
             "\"Super+d\" = [\"fuzzel\", \"--show-actions\"]",
         );
@@ -2423,15 +2445,14 @@ swap_right = ["Super+Shift+l"]
         );
         assert_eq!(pressed(&config, "Super+d"), Some(Action::LaunchCommand(1)));
 
-        let empty = EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = []");
+        let empty = EXAMPLE_CONFIG.edited("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = []");
         assert!(parse(&empty).unwrap_err().contains("contain an executable"));
 
-        let blank =
-            EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = [\"  \"]");
+        let blank = EXAMPLE_CONFIG.edited("# \"Super+d\" = [\"fuzzel\"]", "\"Super+d\" = [\"  \"]");
         assert!(parse(&blank).unwrap_err().contains("contain an executable"));
 
         let duplicate =
-            EXAMPLE_CONFIG.replace("# \"Super+d\" = [\"fuzzel\"]", "\"Super+h\" = [\"fuzzel\"]");
+            EXAMPLE_CONFIG.edited("# \"Super+d\" = [\"fuzzel\"]", "\"Super+h\" = [\"fuzzel\"]");
         assert!(
             parse(&duplicate)
                 .unwrap_err()
@@ -2440,12 +2461,44 @@ swap_right = ["Super+Shift+l"]
     }
 
     /// A scratch config tree with `config.toml` and a `config.d/` beside it.
-    fn config_tree(label: &str) -> PathBuf {
+    /// A temporary directory that removes itself.
+    ///
+    /// Through `Drop`, so it goes even when the test panics. The seven
+    /// `remove_dir_all` calls this replaces were all the last statement of a
+    /// test, which is exactly where a failure never reaches them - so every
+    /// failing run used to leave a `/tmp/paw2-*` behind.
+    struct Tree(PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Tree {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Tree {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn temp_dir(label: &str) -> Tree {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = env::temp_dir().join(format!("paw2-{label}-{}-{nonce}", std::process::id()));
+        Tree(env::temp_dir().join(format!("paw2-{label}-{}-{nonce}", std::process::id())))
+    }
+
+    /// [`temp_dir`], already holding a `config.toml` and an empty `config.d/`.
+    fn config_tree(label: &str) -> Tree {
+        let root = temp_dir(label);
         fs::create_dir_all(root.join(OVERLAY_DIR)).unwrap();
         fs::write(root.join("config.toml"), EXAMPLE_CONFIG).unwrap();
         root
@@ -2540,8 +2593,6 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(config.appearance.corner_radius, 0);
         // A section nobody claimed is still config.toml's.
         assert_eq!(config.layout.column_width, 0.6);
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2551,9 +2602,9 @@ swap_right = ["Super+Shift+l"]
         fs::write(
             root.join("config.toml"),
             EXAMPLE_CONFIG
-                .replace("gaps = 15", "gaps = 40")
-                .replace("focus_follows_mouse = false", "focus_follows_mouse = true")
-                .replace(
+                .edited("gaps = 15", "gaps = 40")
+                .edited("focus_follows_mouse = false", "focus_follows_mouse = true")
+                .edited(
                     "center_focused_column = false",
                     "center_focused_column = true",
                 ),
@@ -2577,8 +2628,6 @@ swap_right = ["Super+Shift+l"]
         // Sections the drop-in did not claim are untouched.
         assert_eq!(config.appearance.gaps, 40);
         assert!(config.input.focus_follows_mouse);
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2609,8 +2658,6 @@ swap_right = ["Super+Shift+l"]
         // Removed - back to what config.toml says.
         fs::remove_file(&drop_in).unwrap();
         assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 15);
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2628,8 +2675,6 @@ swap_right = ["Super+Shift+l"]
         // without needing config.toml to be touched.
         fs::write(&drop_in, "[appearance]\ngaps = 40\n").unwrap();
         assert_eq!(watcher.reload().unwrap().unwrap().appearance.gaps, 40);
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2665,17 +2710,11 @@ swap_right = ["Super+Shift+l"]
         let config = watcher.reload().unwrap().unwrap();
         assert_eq!(config.appearance.focus_ring_width, 3);
         assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn creates_default_without_overwriting() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("paw2-config-test-{}-{nonce}", std::process::id()));
+        let root = temp_dir("config-test");
         let path = root.join("paw2/config.toml");
 
         create_default(&path).unwrap();
@@ -2684,17 +2723,11 @@ swap_right = ["Super+Shift+l"]
         fs::write(&path, "custom = true").unwrap();
         create_default(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "custom = true");
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn reloads_only_changed_valid_config() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("paw2-reload-test-{}-{nonce}", std::process::id()));
+        let root = temp_dir("reload-test");
         let path = root.join("config.toml");
         fs::create_dir_all(&root).unwrap();
         let with_monitors = format!("{EXAMPLE_CONFIG}{MONITORS}");
@@ -2711,19 +2744,19 @@ swap_right = ["Super+Shift+l"]
         // seen: the gate is the file's content, not its timestamp. Both writes
         // below land on the same backdated mtime with the layer count
         // unchanged, which is precisely what a timestamp gate calls "no change".
-        write_backdated(&path, &with_monitors.replace("gaps = 15", "gaps = 16"));
+        write_backdated(&path, &with_monitors.edited("gaps = 15", "gaps = 16"));
         assert!(watcher.reload().unwrap().is_some());
         write_backdated(&path, &with_monitors);
         assert!(watcher.reload().unwrap().is_some());
 
         let changed = with_monitors
-            .replace("column_width = 0.6", "column_width = 0.7")
-            .replace("resolution = [2560, 1440]", "resolution = [1920, 1080]")
-            .replace(
+            .edited("column_width = 0.6", "column_width = 0.7")
+            .edited("resolution = [2560, 1440]", "resolution = [1920, 1080]")
+            .edited(
                 "# \"Super+d\" = [\"fuzzel\"]",
                 "\"Super+d\" = [\"fuzzel\"]",
             )
-            .replace(
+            .edited(
                 "commands = [\n  # [\"swaybg\", \"-i\", \"/absolute/path/to/wallpaper.png\", \"-m\", \"fill\"],\n  # [\"waybar\"],\n]",
                 "commands = [[\"waybar\"]]",
             );
@@ -2742,17 +2775,15 @@ swap_right = ["Super+Shift+l"]
         );
 
         let updated =
-            parse(&with_monitors.replace(PRIVILEGED, r#"privileged_clients = ["waybar"]"#))
-                .unwrap();
+            parse(&with_monitors.edited(PRIVILEGED, r#"privileged_clients = ["waybar"]"#)).unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.security, SecurityConfig::default());
 
         // Turning primary selection off reaches the running config without a
         // restart; `Paw2::set_middle_click_paste` carries it to the global.
-        let updated = parse(
-            &with_monitors.replace("middle_click_paste = true", "middle_click_paste = false"),
-        )
-        .unwrap();
+        let updated =
+            parse(&with_monitors.edited("middle_click_paste = true", "middle_click_paste = false"))
+                .unwrap();
         assert!(!active.apply_runtime(updated));
         assert!(!active.input.middle_click_paste);
         let updated = parse(&with_monitors).unwrap();
@@ -2760,7 +2791,7 @@ swap_right = ["Super+Shift+l"]
         assert!(active.input.middle_click_paste);
 
         let updated = parse(
-            &with_monitors.replace("focus_follows_mouse = false", "focus_follows_mouse = true"),
+            &with_monitors.edited("focus_follows_mouse = false", "focus_follows_mouse = true"),
         )
         .unwrap();
         assert!(!active.apply_runtime(updated));
@@ -2798,7 +2829,6 @@ swap_right = ["Super+Shift+l"]
 
         fs::write(&path, &with_monitors).unwrap();
         assert!(watcher.reload().unwrap().is_some());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2844,7 +2874,7 @@ swap_right = ["Super+Shift+l"]
     fn parses_and_validates_scratchpads() {
         let source = format!(
             "{}\n[scratchpads.term]\ncommand = [\"kitty\", \"--class\", \"paw-term\"]\napp_id = \"paw-term\"\nedge = \"bottom\"\nsize = [70, 55]\nposition = [15, 20]\nmargin = 12\n",
-            EXAMPLE_CONFIG.replace(
+            EXAMPLE_CONFIG.edited(
                 "# \"Super+grave\" = \"terminal\"",
                 "\"Super+grave\" = \"term\""
             )
@@ -2859,7 +2889,7 @@ swap_right = ["Super+Shift+l"]
             Some(Action::ToggleScratchpad(0))
         );
 
-        let invalid = source.replace("size = [70, 55]", "size = [101, 55]");
+        let invalid = source.edited("size = [70, 55]", "size = [101, 55]");
         assert!(parse(&invalid).unwrap_err().contains("between 1 and 100"));
     }
 }
