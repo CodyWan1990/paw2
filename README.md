@@ -624,15 +624,23 @@ It sends two messages on connect, and again whenever something changes
   modes; windows with title, app ID, output and workspace.
 - `config` — the merged configuration and any error from the last load.
 
-It accepts five commands:
+It accepts these commands:
 
 ```json
 {"cmd": "focus-workspace", "output": "DP-1", "index": 2}
 {"cmd": "focus-window", "id": 7}
-{"cmd": "set-layout", "layout": "dwindle"}
+{"cmd": "set-layout", "layout": "dwindle", "output": "DP-1"}
+{"cmd": "toggle-scratchpad", "name": "terminal"}
+{"cmd": "show-scratchpad", "name": "terminal"}
+{"cmd": "hide-scratchpad", "name": "terminal"}
 {"cmd": "reset-scratchpad", "name": "terminal"}
+{"cmd": "toggle-scratchpad-overview"}
 {"cmd": "quit"}
 ```
+
+`output` is optional on `focus-workspace` and `set-layout`; both act on the
+focused monitor, so passing it follows a click onto the bar's own monitor
+first. `set-layout` without a `layout` cycles to the next enabled one.
 
 There is deliberately no "set config" command. Settings go through `config.d/`,
 so there is one path into the configuration and one thing deciding what is
