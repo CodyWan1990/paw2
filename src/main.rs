@@ -580,7 +580,11 @@ fn print_usage() {
 /// Startup phase timing, so a slow login is legible in the session log instead
 /// of reconstructed from the timestamps of unrelated lines.
 pub(crate) fn phase(clock: &Instant, name: &str) {
-    tracing::info!(name, elapsed_ms = clock.elapsed().as_millis(), "startup phase");
+    tracing::info!(
+        name,
+        elapsed_ms = clock.elapsed().as_millis(),
+        "startup phase"
+    );
 }
 
 fn init_logging() {

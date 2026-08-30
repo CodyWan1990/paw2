@@ -461,7 +461,12 @@ fn take_seat(
         &path,
         OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
     )?;
-    Ok((session, notifier, path, DrmDeviceFd::new(DeviceFd::from(fd))))
+    Ok((
+        session,
+        notifier,
+        path,
+        DrmDeviceFd::new(DeviceFd::from(fd)),
+    ))
 }
 
 fn select_device(session: &LibSeatSession, configured: Option<PathBuf>) -> io::Result<PathBuf> {
@@ -532,11 +537,7 @@ pub fn redraw(state: &mut Paw2) {
 ///
 /// A theme change empties the cache; within one theme every shape is read from
 /// disk at most once. See [`DirectBackend::cursor_cache`] for why that matters.
-fn set_cursor(
-    state: &mut Paw2,
-    settings: &CursorSettings,
-    icon: CursorIcon,
-) -> Result<(), String> {
+fn set_cursor(state: &mut Paw2, settings: &CursorSettings, icon: CursorIcon) -> Result<(), String> {
     let mut result = Ok(());
     with_backend(state, |backend, _| {
         if backend.cursor_settings != *settings {

@@ -490,8 +490,7 @@ impl Workspace {
             return false;
         };
         let len = self.tab_groups[group_index].windows.len();
-        let current = self.tab_groups[group_index].active as i32;
-        let next = (current + delta).rem_euclid(len as i32) as usize;
+        let next = wrapping_index(self.tab_groups[group_index].active, len, delta);
         let window = self.tab_groups[group_index].windows[next].clone();
         self.focus_window(&window);
         true
@@ -1261,6 +1260,15 @@ impl Scroller {
         Some(group)
     }
 
+    /// Where windows may go: this monitor's geometry minus whatever the layer
+    /// surfaces on it reserved. `None` while the output has no geometry yet.
+    fn work_area(&self) -> Option<Rectangle<i32, Logical>> {
+        Some(work_area(
+            self.space.output_geometry(&self.output)?,
+            layer_map_for_output(&self.output).non_exclusive_zone(),
+        ))
+    }
+
     fn active(&self) -> &Workspace {
         &self.workspaces[self.active_workspace]
     }
@@ -1637,6 +1645,21 @@ impl Scrollers {
             .find(|monitor| monitor.output == *output)
     }
 
+    /// The index of the monitor called `output`, for the callers that need to
+    /// let the borrow go and come back to it.
+    fn monitor_index(&self, output: &str) -> Option<usize> {
+        self.monitors
+            .iter()
+            .position(|monitor| monitor.name == output)
+    }
+
+    /// The index of the monitor whose active workspace holds `window`.
+    fn monitor_index_holding(&self, window: &Window) -> Option<usize> {
+        self.monitors
+            .iter()
+            .position(|monitor| monitor.active().windows.contains(window))
+    }
+
     fn monitor(&self, output: &str) -> Option<&Scroller> {
         self.monitors.iter().find(|monitor| monitor.name == output)
     }
@@ -1809,11 +1832,7 @@ impl Paw2 {
             return None;
         }
         let monitor = self.scroller.monitor(output)?;
-        let output_geometry = monitor.space.output_geometry(&monitor.output)?;
-        let area = work_area(
-            output_geometry,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
+        let area = monitor.work_area()?;
         let saved = self
             .scroller
             .scratchpad_geometry
@@ -1866,13 +1885,9 @@ impl Paw2 {
         let Some(monitor) = self.scroller.monitor(output) else {
             return;
         };
-        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output_geometry,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let Some(geometry) = monitor.space.element_geometry(window) else {
             return;
         };
@@ -1999,21 +2014,13 @@ impl Paw2 {
         location: Point<f64, Logical>,
         tab_group: bool,
     ) -> Option<MouseOperation> {
-        let monitor_index = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.active().windows.contains(&window))?;
+        let monitor_index = self.scroller.monitor_index_holding(&window)?;
         let monitor = &self.scroller.monitors[monitor_index];
         let origin_workspace = monitor.active_workspace;
         let origin_geometry = monitor.space.element_geometry(&window)?;
         let preview_size = drag_preview_size(origin_geometry.size);
         let grab_offset = drag_grab_offset(location, origin_geometry);
-        let output = monitor.space.output_geometry(&monitor.output)?;
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
+        let area = monitor.work_area()?;
         let preview_location =
             constrain_window(area, preview_size, (location - grab_offset).to_i32_round());
         configure_window(
@@ -2058,11 +2065,7 @@ impl Paw2 {
         window: Window,
         location: Point<f64, Logical>,
     ) -> Option<MouseOperation> {
-        let output = monitor.space.output_geometry(&monitor.output)?;
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
+        let area = monitor.work_area()?;
         let tiled = workspace
             .columns
             .iter()
@@ -2214,13 +2217,9 @@ impl Paw2 {
         let Some(monitor) = self.scroller.monitor_mut(&output) else {
             return;
         };
-        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output_geometry,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let rectangle = match (initial_geometry, edges) {
             (Some(initial), Some((x, y))) => {
                 resized_floating_rectangle(initial, x, y, delta, area, MIN_ROW_HEIGHT)
@@ -2284,12 +2283,7 @@ impl Paw2 {
         delta: Point<f64, Logical>,
         pointer: Point<f64, Logical>,
     ) {
-        let Some(source) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.active().windows.contains(window))
-        else {
+        let Some(source) = self.scroller.monitor_index_holding(window) else {
             return;
         };
         let size = self
@@ -2322,13 +2316,9 @@ impl Paw2 {
             self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
         }
         let monitor = &mut self.scroller.monitors[target];
-        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let location = constrain_window(area, size, desired.to_i32_round());
         monitor.space.map_element(window.clone(), location, true);
         self.scroller.animations.remove(&window.id());
@@ -2354,13 +2344,9 @@ impl Paw2 {
         else {
             return;
         };
-        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let rectangle = resized_floating_rectangle(initial, x, y, delta, area, MIN_ROW_HEIGHT);
         configure_window(window, rectangle, false);
         monitor
@@ -2406,13 +2392,9 @@ impl Paw2 {
             }
         }
         let monitor = &mut self.scroller.monitors[target];
-        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let location = constrain_window(area, size, (pointer - grab_offset).to_i32_round());
         monitor.space.map_element(window.clone(), location, true);
         monitor.space.raise_element(window, false);
@@ -2442,12 +2424,7 @@ impl Paw2 {
         else {
             return;
         };
-        let Some(source) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == *origin_output)
-        else {
+        let Some(source) = self.scroller.monitor_index(origin_output) else {
             self.scroller.drag_preview = None;
             return;
         };
@@ -2631,13 +2608,9 @@ impl Paw2 {
         else {
             return;
         };
-        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return;
         };
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let requested_width = monitor
             .active()
             .columns
@@ -2814,12 +2787,7 @@ impl Paw2 {
             .filter(|(_, runtime)| runtime.visible && runtime.output.as_deref() == Some(name))
             .map(|(scratchpad, _)| scratchpad.clone())
             .collect::<Vec<_>>();
-        let Some(index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == name)
-        else {
+        let Some(index) = self.scroller.monitor_index(name) else {
             return;
         };
         let removed_was_focused = self.scroller.focused_output.as_deref() == Some(name);
@@ -3244,34 +3212,21 @@ impl Paw2 {
                 monitor.space.unmap_elem(&window);
             }
         }
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == output)
-        else {
+        let Some(monitor_index) = self.scroller.monitor_index(&output) else {
             return;
         };
         let current = {
             let monitor = &self.scroller.monitors[monitor_index];
-            let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+            let Some(area) = monitor.work_area() else {
                 return;
             };
-            let area = work_area(
-                output_geometry,
-                layer_map_for_output(&monitor.output).non_exclusive_zone(),
-            );
             monitor
                 .space
                 .element_location(&window)
                 .unwrap_or_else(|| hidden_scratchpad_location(edge, area, rectangle))
         };
         configure_window(&window, rectangle, false);
-        let duration = self
-            .config
-            .animations
-            .active()
-            .then_some(self.config.animations.duration);
+        let duration = self.animation_duration();
         let position = start_motion(
             &mut self.scroller.animations,
             window.id(),
@@ -3311,24 +3266,16 @@ impl Paw2 {
         let Some(edge) = self.scratchpad_edge(name) else {
             return;
         };
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == output)
-        else {
+        let Some(monitor_index) = self.scroller.monitor_index(&output) else {
             return;
         };
         let (area, current) = {
             let monitor = &self.scroller.monitors[monitor_index];
-            let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+            let Some(area) = monitor.work_area() else {
                 return;
             };
             (
-                work_area(
-                    output_geometry,
-                    layer_map_for_output(&monitor.output).non_exclusive_zone(),
-                ),
+                area,
                 monitor
                     .space
                     .element_location(&window)
@@ -3336,11 +3283,7 @@ impl Paw2 {
             )
         };
         let hidden = hidden_scratchpad_location(edge, area, rectangle);
-        let duration = self
-            .config
-            .animations
-            .active()
-            .then_some(self.config.animations.duration);
+        let duration = self.animation_duration();
         let position = start_motion(
             &mut self.scroller.animations,
             window.id(),
@@ -3593,13 +3536,9 @@ impl Paw2 {
             if !monitor.active().windows.contains(&window) {
                 continue;
             }
-            let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+            let Some(area) = monitor.work_area() else {
                 return;
             };
-            let area = work_area(
-                output,
-                layer_map_for_output(&monitor.output).non_exclusive_zone(),
-            );
             rectangle.loc = centered_rectangle(area, rectangle.size).loc;
             let result = if surface.sync_request_supported() {
                 surface.configure_with_sync(rectangle, None)
@@ -3646,12 +3585,7 @@ impl Paw2 {
             return;
         }
         self.scroller.focused_scratchpad = None;
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.active().windows.contains(window))
-        else {
+        let Some(monitor_index) = self.scroller.monitor_index_holding(window) else {
             return;
         };
         let monitor = &self.scroller.monitors[monitor_index];
@@ -3838,12 +3772,7 @@ impl Paw2 {
         let Some(output) = self.scroller.focused_output.clone() else {
             return false;
         };
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == output)
-        else {
+        let Some(monitor_index) = self.scroller.monitor_index(&output) else {
             return false;
         };
         let Some(window) = self.scroller.monitors[monitor_index]
@@ -3876,13 +3805,9 @@ impl Paw2 {
             .get(&window.id())
             .and_then(|override_| override_.width);
         let monitor = &mut self.scroller.monitors[monitor_index];
-        let Some(output) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return false;
         };
-        let area = work_area(
-            output,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         let (width, size, location) = if floating {
             let index = column_insertion_at(monitor.active(), &monitor.space, pointer_x);
             monitor
@@ -4138,12 +4063,7 @@ impl Paw2 {
         let Some(output) = self.scroller.focused_output.clone() else {
             return false;
         };
-        let Some(monitor_index) = self
-            .scroller
-            .monitors
-            .iter()
-            .position(|monitor| monitor.name == output)
-        else {
+        let Some(monitor_index) = self.scroller.monitor_index(&output) else {
             return false;
         };
         let layout = self.scroller.monitors[monitor_index].active().layout;
@@ -4323,8 +4243,7 @@ impl Paw2 {
         let Some(selection) = &mut self.scroller.scratchpad_overview else {
             return;
         };
-        selection.selected =
-            (selection.selected as i32 + delta).rem_euclid(selection.names.len() as i32) as usize;
+        selection.selected = wrapping_index(selection.selected, selection.names.len(), delta);
         crate::drm::redraw(self);
     }
 
@@ -4406,11 +4325,7 @@ impl Paw2 {
     /// hopping to another output has nothing to slide along.
     fn retarget_overview(&mut self, animate_scroll: bool) {
         let now = self.start_time.elapsed();
-        let duration = self
-            .config
-            .animations
-            .active()
-            .then_some(self.config.animations.duration);
+        let duration = self.animation_duration();
         let open = self.scroller.overview.is_some();
         let target = self
             .scroller
@@ -4459,13 +4374,9 @@ impl Paw2 {
         if workspace.layout != LayoutMode::Scrolling || workspace.fullscreen.is_some() {
             return 0;
         }
-        let Some(output_geometry) = monitor.space.output_geometry(&monitor.output) else {
+        let Some(area) = monitor.work_area() else {
             return selection.pan;
         };
-        let area = work_area(
-            output_geometry,
-            layer_map_for_output(&monitor.output).non_exclusive_zone(),
-        );
         overview_pan_target(
             &workspace.columns,
             area.size,
@@ -5643,13 +5554,14 @@ impl Paw2 {
                 Some((index, output, work_area(output, zone)))
             })
             .collect::<Vec<_>>();
+        // Resolved before the mutable borrows below, which run to the end of
+        // the loop.
+        let duration = animate.then(|| self.animation_duration()).flatten();
+        let now = self.start_time.elapsed();
         let manual_floating = &self.scroller.manual_floating;
         let animations = &mut self.scroller.animations;
         let focused_output = self.scroller.focused_output.clone();
         let monitors = &mut self.scroller.monitors;
-        let now = self.start_time.elapsed();
-        let duration =
-            (animate && self.config.animations.active()).then_some(self.config.animations.duration);
         for (index, output_geometry, geometry) in work_areas {
             let Some(monitor) = monitors.get_mut(index) else {
                 continue;
@@ -5844,6 +5756,15 @@ impl Paw2 {
     /// Progress comes from absolute time, so calling this repeatedly within one
     /// frame - once per output, and again per screencopy capture - is a no-op
     /// beyond the first.
+    /// How long a motion should take, or `None` when animation is off - which
+    /// `start_motion` reads as "go straight there".
+    fn animation_duration(&self) -> Option<Duration> {
+        self.config
+            .animations
+            .active()
+            .then_some(self.config.animations.duration)
+    }
+
     pub fn advance_animations(&mut self) {
         if self.scroller.animations.is_empty() {
             return;
@@ -6514,7 +6435,7 @@ fn wrapped_selection(workspaces: &[usize], current: usize, delta: i32) -> Option
     let current = workspaces
         .iter()
         .position(|workspace| *workspace == current)?;
-    let target = (current as i32 + delta).rem_euclid(workspaces.len() as i32) as usize;
+    let target = wrapping_index(current, workspaces.len(), delta);
     workspaces.get(target).copied()
 }
 
@@ -6859,8 +6780,19 @@ fn next_preset(current: f64, presets: &[f64]) -> f64 {
     presets[next]
 }
 
+/// `current` moved `delta` places through `len` items, wrapping at both ends.
+///
+/// Guards `len == 0` because `rem_euclid(0)` panics, and two of the callers
+/// count a list a client can empty.
+fn wrapping_index(current: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current as i32 + delta).rem_euclid(len as i32) as usize
+}
+
 fn workspace_neighbor(current: usize, delta: i32) -> usize {
-    (current as i32 + delta).rem_euclid(WORKSPACE_COUNT as i32) as usize
+    wrapping_index(current, WORKSPACE_COUNT, delta)
 }
 
 fn focus_after_removal(focused: Option<usize>, removed: usize, remaining: usize) -> Option<usize> {
