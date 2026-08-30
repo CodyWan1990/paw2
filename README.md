@@ -591,7 +591,14 @@ gaps = 12          # this section is now the drop-in's — corner_radius,
 ```
 
 Sections no drop-in names are untouched. Two drop-ins naming the same section
-resolve by filename; the later one wins.
+resolve by filename; the later one wins. Filenames sort bytewise, so
+`10-x.toml` comes *before* `9-x.toml` — zero-pad if the order matters.
+
+**A nested table counts as naming its parent section.** A drop-in containing
+only `[bindings.workspace]` takes over `[bindings]` entirely, so every flat
+binding in `config.toml` — `toggle_overview`, `close_window`, the rest — reverts
+to the built-in defaults, which for most actions is unbound. If a drop-in names
+`[bindings]` in any form, it has to carry all of them.
 
 Whole-section ownership is what lets a settings GUI keep coupled values
 consistent — `focus_ring_width` cannot exceed `gaps`, and that rule is

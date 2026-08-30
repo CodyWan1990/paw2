@@ -2569,6 +2569,33 @@ swap_right = ["Super+Shift+l"]
         assert_eq!(deep.get("list").unwrap().as_array().unwrap().len(), 1);
     }
 
+    /// A nested table names its *parent* section. Writing only
+    /// `[bindings.workspace]` therefore hands the drop-in all of `[bindings]`,
+    /// and the flat keys in `config.toml` are gone - which is surprising enough
+    /// that the README calls it out.
+    #[test]
+    fn a_nested_table_takes_over_its_whole_parent_section() {
+        let root = temp_dir("overlay-nested");
+        fs::create_dir_all(root.join(OVERLAY_DIR)).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "[bindings]\ntoggle_overview = [\"Super+o\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(OVERLAY_DIR).join("keys.toml"),
+            "[bindings.workspace]\nprevious = [\"Super+bracketleft\"]\n",
+        )
+        .unwrap();
+
+        let config = watcher_at(&root).reload().unwrap().unwrap();
+        assert_eq!(
+            pressed(&config, "Super+bracketleft"),
+            Some(Action::PreviousWorkspace)
+        );
+        assert_eq!(pressed(&config, "Super+o"), None);
+    }
+
     #[test]
     fn the_last_drop_in_to_name_a_section_owns_it_whole() {
         let root = config_tree("overlay-order");
