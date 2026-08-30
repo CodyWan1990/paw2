@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
 
 use crate::{
@@ -107,6 +107,7 @@ struct Client {
     pending: Vec<u8>,
 }
 
+#[derive(Default)]
 pub struct IpcState {
     path: Option<PathBuf>,
     clients: Vec<Client>,
@@ -123,21 +124,6 @@ pub struct IpcState {
     greeting: VecDeque<u64>,
     config: serde_json::Value,
     config_error: Option<String>,
-}
-
-impl Default for IpcState {
-    fn default() -> Self {
-        Self {
-            path: None,
-            clients: Vec::new(),
-            next_id: 0,
-            dirty: false,
-            config_dirty: false,
-            greeting: VecDeque::new(),
-            config: serde_json::Value::Null,
-            config_error: None,
-        }
-    }
 }
 
 impl IpcState {
@@ -296,78 +282,86 @@ fn disconnect(state: &mut Paw2, id: u64) -> PostAction {
     PostAction::Remove
 }
 
+/// What a shell may ask for.
+///
+/// Deserialised rather than picked apart by hand: serde gives the field types,
+/// the missing-field errors and the unknown-command error for free, and a
+/// command's shape is then stated once, here. Unknown *fields* are still
+/// ignored, as they always were, so a newer shell talking to an older Paw2
+/// keeps working.
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "kebab-case")]
+enum Command {
+    /// `output` is accepted because a bar is per-monitor, so a click can land
+    /// on a workspace belonging to a monitor that does not have focus, and
+    /// `SwitchWorkspace` only ever acts on the focused one. Same for
+    /// `set-layout` below.
+    FocusWorkspace {
+        index: usize,
+        output: Option<String>,
+    },
+    FocusWindow {
+        id: usize,
+    },
+    SetLayout {
+        layout: Option<LayoutMode>,
+        output: Option<String>,
+    },
+    ToggleScratchpad {
+        name: String,
+    },
+    ShowScratchpad {
+        name: String,
+    },
+    HideScratchpad {
+        name: String,
+    },
+    ResetScratchpad {
+        name: String,
+    },
+    ToggleScratchpadOverview,
+    Quit,
+    // No set-config: settings are changed by writing config.d/, which the
+    // config watcher picks up within half a second.
+}
+
 fn run(state: &mut Paw2, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return;
     }
-    let command = match serde_json::from_str::<serde_json::Value>(line) {
+    let command = match serde_json::from_str::<Command>(line) {
         Ok(command) => command,
         Err(error) => {
-            tracing::warn!(%error, "control command is not JSON");
+            tracing::warn!(%error, "unusable control command");
             return;
         }
     };
-    let name = command.get("cmd").and_then(|value| value.as_str());
-    match name {
-        Some("focus-workspace") => {
-            let Some(index) = command.get("index").and_then(|v| v.as_u64()) else {
-                return;
-            };
-            // A bar is per-monitor, so a click can land on a workspace of a
-            // monitor that does not have focus. Follow the click first;
-            // SwitchWorkspace only ever acts on the focused output.
-            if let Some(output) = command.get("output").and_then(|v| v.as_str()) {
-                state.focus_output_by_name(output);
-            }
-            state.run_action(Action::SwitchWorkspace(index as usize));
+    // Follow the click before acting: the actions below only ever reach the
+    // focused output.
+    if let Command::FocusWorkspace {
+        output: Some(output),
+        ..
+    }
+    | Command::SetLayout {
+        output: Some(output),
+        ..
+    } = &command
+    {
+        state.focus_output_by_name(output);
+    }
+    match command {
+        Command::FocusWorkspace { index, .. } => state.run_action(Action::SwitchWorkspace(index)),
+        Command::FocusWindow { id } => state.focus_window_by_id(id),
+        Command::SetLayout { layout, .. } => {
+            state.run_action(layout.map_or(Action::CycleLayout, Action::SwitchLayout))
         }
-        Some("focus-window") => {
-            if let Some(id) = command.get("id").and_then(|v| v.as_u64()) {
-                state.focus_window_by_id(id as usize);
-            }
-        }
-        Some("set-layout") => {
-            let layout = command
-                .get("layout")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<LayoutMode>(value).ok());
-            // Same reason as focus-workspace above: the layout widget is on a
-            // per-monitor bar, and SwitchLayout only ever acts on the focused
-            // output. Follow the click first.
-            if let Some(output) = command.get("output").and_then(|v| v.as_str()) {
-                state.focus_output_by_name(output);
-            }
-            match layout {
-                Some(layout) => state.run_action(Action::SwitchLayout(layout)),
-                None => state.run_action(Action::CycleLayout),
-            }
-        }
-        Some("toggle-scratchpad") => {
-            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
-                state.toggle_scratchpad_by_name(name);
-            }
-        }
-        Some("show-scratchpad") => {
-            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
-                state.show_scratchpad_by_name(name);
-            }
-        }
-        Some("hide-scratchpad") => {
-            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
-                state.hide_scratchpad(name);
-            }
-        }
-        Some("reset-scratchpad") => {
-            if let Some(name) = command.get("name").and_then(|value| value.as_str()) {
-                state.reset_scratchpad(name);
-            }
-        }
-        Some("toggle-scratchpad-overview") => state.toggle_scratchpad_overview(),
-        Some("quit") => state.run_action(Action::Quit),
-        // No set-config: settings are changed by writing config.d/, which the
-        // config watcher picks up within half a second.
-        other => tracing::warn!(?other, "unknown control command"),
+        Command::ToggleScratchpad { name } => state.toggle_scratchpad_by_name(&name),
+        Command::ShowScratchpad { name } => state.show_scratchpad_by_name(&name),
+        Command::HideScratchpad { name } => state.hide_scratchpad(&name),
+        Command::ResetScratchpad { name } => state.reset_scratchpad(&name),
+        Command::ToggleScratchpadOverview => state.toggle_scratchpad_overview(),
+        Command::Quit => state.run_action(Action::Quit),
     }
 }
 
