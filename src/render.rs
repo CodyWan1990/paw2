@@ -162,6 +162,29 @@ void main() {
 }
 "#;
 
+/// Signed distance from a point to a rounded rectangle centred on the origin.
+///
+/// The window, the focus ring and the shadow all have to trace the *same*
+/// curve or they will not line up, so it is written once and spliced into each
+/// source by [`with_rounded_box`] - the same shape as Smithay's own
+/// `//_DEFINES_` placeholder above.
+const ROUNDED_BOX: &str = "\
+float rounded_box(vec2 point, vec2 half_size, float radius) {
+    vec2 q = abs(point) - half_size + radius;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+";
+
+/// Splice [`ROUNDED_BOX`] into a shader that asked for it.
+fn with_rounded_box(source: &str) -> String {
+    let spliced = source.replace("//_ROUNDED_BOX_", ROUNDED_BOX);
+    debug_assert!(
+        spliced.contains("float rounded_box"),
+        "placeholder not found"
+    );
+    spliced
+}
+
 const WINDOW_SHADER: &str = r#"#version 100
 
 //_DEFINES_
@@ -192,11 +215,7 @@ varying vec2 v_coords;
 uniform float tint;
 #endif
 
-// Signed distance from a point to a rounded rectangle centred on the origin.
-float rounded_box(vec2 point, vec2 half_size, float radius) {
-    vec2 q = abs(point) - half_size + radius;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
-}
+//_ROUNDED_BOX_
 
 void main() {
     vec4 color = texture2D(tex, v_coords);
@@ -238,10 +257,7 @@ uniform float ring_width;
 uniform vec4 ring_color;
 varying vec2 v_coords;
 
-float rounded_box(vec2 point, vec2 half_size, float radius) {
-    vec2 q = abs(point) - half_size + radius;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
-}
+//_ROUNDED_BOX_
 
 void main() {
     vec2 half_size = size * 0.5;
@@ -276,10 +292,7 @@ uniform vec4 shadow_color;
 uniform vec2 window_offset;
 varying vec2 v_coords;
 
-float rounded_box(vec2 point, vec2 half_size, float radius) {
-    vec2 q = abs(point) - half_size + radius;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
-}
+//_ROUNDED_BOX_
 
 void main() {
     vec2 half_size = max(size * 0.5 - spread, vec2(0.0, 0.0));
@@ -320,6 +333,23 @@ type ConstrainedWindowElement = CropRenderElement<
 /// the output origin, moved onto the card, then clipped to `crop`. One uniform
 /// transform for wallpaper and windows alike, which is why the preview keeps the
 /// proportions of the real desktop.
+/// Every render element a surface tree contributes, at full opacity.
+///
+/// The turbofish this saves - naming both the renderer and the element type -
+/// was written out at five call sites, and is the same every time.
+fn surface_elements<T>(
+    source: &T,
+    renderer: &mut GlesRenderer,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>>
+where
+    T: AsRenderElements<GlesRenderer>,
+    WaylandSurfaceRenderElement<GlesRenderer>: From<T::RenderElement>,
+{
+    source.render_elements(renderer, location, scale, 1.0)
+}
+
 fn zoomed(
     elements: impl IntoIterator<Item = WaylandSurfaceRenderElement<GlesRenderer>>,
     zoom: f64,
@@ -606,9 +636,7 @@ impl Effects {
                         .map(|geometry| geometry.loc)
                         .unwrap_or_default()
                         .to_physical_precise_round(scale);
-                    AsRenderElements::<GlesRenderer>::render_elements::<
-                        WaylandSurfaceRenderElement<GlesRenderer>,
-                    >(layer, renderer, location, scale, 1.0)
+                    surface_elements(layer, renderer, location, scale)
                 })
                 .map(PawRenderElements::Cursor)
                 .collect::<Vec<_>>();
@@ -617,14 +645,11 @@ impl Effects {
                     .x11_override_windows(output)
                     .into_iter()
                     .flat_map(|(window, location)| {
-                        AsRenderElements::<GlesRenderer>::render_elements::<
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                        >(
+                        surface_elements(
                             &window,
                             renderer,
                             location.to_physical_precise_round(scale),
                             scale,
-                            1.0,
                         )
                     })
                     .map(PawRenderElements::Cursor),
@@ -870,14 +895,11 @@ impl Effects {
         let mut elements = above
             .iter()
             .flat_map(|(location, surface)| {
-                AsRenderElements::<GlesRenderer>::render_elements::<
-                    WaylandSurfaceRenderElement<GlesRenderer>,
-                >(
+                surface_elements(
                     surface,
                     renderer,
                     location.to_physical_precise_round(scale),
                     scale,
-                    1.0,
                 )
             })
             .map(PawRenderElements::Cursor)
@@ -914,14 +936,11 @@ impl Effects {
                 let origin = preview.geometry.loc - preview.window.geometry().loc;
                 elements.extend(
                     zoomed(
-                        AsRenderElements::<GlesRenderer>::render_elements::<
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                        >(
+                        surface_elements(
                             &preview.window,
                             renderer,
                             origin.to_physical_precise_round(scale),
                             scale,
-                            1.0,
                         ),
                         workspace.zoom,
                         card.loc,
@@ -935,14 +954,11 @@ impl Effects {
             for (location, surface) in &below {
                 elements.extend(
                     zoomed(
-                        AsRenderElements::<GlesRenderer>::render_elements::<
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                        >(
+                        surface_elements(
                             surface,
                             renderer,
                             location.to_physical_precise_round(scale),
                             scale,
-                            1.0,
                         ),
                         workspace.zoom,
                         card.loc,
@@ -1246,7 +1262,7 @@ fn compile_shadow(renderer: &mut GlesRenderer) -> Option<GlesPixelProgram> {
         UniformName::new("window_offset", UniformType::_2f),
     ];
     renderer
-        .compile_custom_pixel_shader(SHADOW_SHADER, &uniforms)
+        .compile_custom_pixel_shader(with_rounded_box(SHADOW_SHADER), &uniforms)
         .map_err(|error: GlesError| tracing::warn!(?error, "window shadow shader unavailable"))
         .ok()
 }
@@ -1286,7 +1302,7 @@ fn compile_window(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
         UniformName::new("opacity", UniformType::_1f),
     ];
     renderer
-        .compile_custom_texture_shader(WINDOW_SHADER, &uniforms)
+        .compile_custom_texture_shader(with_rounded_box(WINDOW_SHADER), &uniforms)
         .map_err(|error: GlesError| {
             tracing::warn!(?error, "rounded corners and window opacity unavailable")
         })
@@ -1577,7 +1593,7 @@ fn compile_ring(renderer: &mut GlesRenderer) -> Option<GlesPixelProgram> {
         UniformName::new("ring_color", UniformType::_4f),
     ];
     renderer
-        .compile_custom_pixel_shader(RING_SHADER, &uniforms)
+        .compile_custom_pixel_shader(with_rounded_box(RING_SHADER), &uniforms)
         .map_err(|error: GlesError| tracing::warn!(?error, "focus ring shader unavailable"))
         .ok()
 }
@@ -1799,6 +1815,20 @@ fn render_blur_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_rounded_shader_gets_the_same_curve() {
+        for source in [WINDOW_SHADER, RING_SHADER, SHADOW_SHADER] {
+            let spliced = with_rounded_box(source);
+            assert!(
+                !spliced.contains("//_ROUNDED_BOX_"),
+                "placeholder survived splicing"
+            );
+            assert_eq!(spliced.matches("float rounded_box").count(), 1);
+        }
+        // `#version` has to stay the very first line of the texture shader.
+        assert!(with_rounded_box(WINDOW_SHADER).starts_with("#version 100"));
+    }
 
     #[test]
     fn fullscreen_keeps_overlay_and_exclusive_launchers_visible() {
