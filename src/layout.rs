@@ -3237,61 +3237,80 @@ impl Paw2 {
     // ponytail: linear scan per element, so O(n^2) per frame in window count.
     // Never runs on the fullscreen path and n is small; index by surface id if a
     // workspace ever holds enough windows for it to show up in a profile.
-    pub(crate) fn window_render_state(
-        &self,
-        output: &Output,
-        element: &Id,
-    ) -> Option<WindowRenderState> {
-        let monitor = self.scroller.monitor_for(output)?;
-        let window = self
+    /// Output-relative geometry and effective opacity for every window that is
+    /// rendering on `output`, keyed by the render element id of its root
+    /// surface.
+    ///
+    /// Built once per frame rather than answered per element. It used to be the
+    /// latter, which meant walking every window on every workspace of every
+    /// monitor for each of the frame's elements - and doing the whole walk
+    /// twice over for the elements that are not windows at all, like layer
+    /// surfaces and the cursor.
+    ///
+    /// Only root surfaces appear, so subsurfaces are neither blurred nor
+    /// rounded.
+    // `Id` hashes by the render element's identity - a `wl_resource` id or an
+    // allocation - which never changes. The interior mutability clippy sees is
+    // in the object it points at, not in what the hash is taken from.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn window_render_states(&self, output: &Output) -> HashMap<Id, WindowRenderState> {
+        let Some(monitor) = self.scroller.monitor_for(output) else {
+            return HashMap::new();
+        };
+        let Some(output_location) = monitor.space.output_geometry(output).map(|value| value.loc)
+        else {
+            return HashMap::new();
+        };
+        let now = self.start_time.elapsed();
+        let opacity = self.config.appearance.window_opacity();
+        let workspace = monitor.active();
+
+        // Three kinds of window can be on screen here: the active workspace's
+        // own, a scratchpad shown on this output, and a window being dragged.
+        let scratchpads = self
             .scroller
             .scratchpads
             .values()
-            .filter_map(|runtime| runtime.window.as_ref())
-            .chain(
-                self.scroller
-                    .workspaces()
-                    .flat_map(|workspace| &workspace.windows),
-            )
-            .find(|window| {
-                window_surface(window)
-                    .is_some_and(|surface| Id::from_wayland_resource(&surface) == *element)
-            })?;
-        let scratchpad_visible = self
-            .scratchpad_name_for_window(window)
-            .and_then(|name| self.scroller.scratchpads.get(&name))
-            .is_some_and(|runtime| {
-                runtime.visible && runtime.output.as_deref() == Some(output.name().as_str())
-            });
-        if !scratchpad_visible
-            && self.scroller.drag_preview != Some(window.id())
-            && !monitor.active().windows.contains(window)
-        {
-            return None;
-        }
-        let mut client = monitor.space.element_geometry(window)?;
-        client.loc -= monitor.space.output_geometry(output)?.loc;
-        let frame = monitor
-            .active()
-            .tab_group_index(window)
-            .map_or(client, |_| tab_outer_rectangle(client));
-        let fade = self
+            .filter(|runtime| {
+                runtime.visible && runtime.output.as_deref() == Some(monitor.name.as_str())
+            })
+            .filter_map(|runtime| runtime.window.as_ref());
+        let dragged = self
             .scroller
-            .animations
-            .get(&window.id())
-            .map_or(1.0, |animation| {
-                animation.opacity(self.start_time.elapsed())
-            });
-        Some(WindowRenderState {
-            client,
-            frame,
-            opacity: self.config.appearance.window_opacity() * fade,
-            scratchpad: self.scratchpad_name_for_window(window).is_some(),
-        })
+            .drag_preview
+            .and_then(|id| self.find_window(|window| window.id() == id));
+
+        workspace
+            .windows
+            .iter()
+            .map(|window| (window, false))
+            .chain(scratchpads.map(|window| (window, true)))
+            .chain(dragged.map(|window| (window, false)))
+            .filter_map(|(window, scratchpad)| {
+                let element = Id::from_wayland_resource(&window_surface(window)?);
+                let mut client = monitor.space.element_geometry(window)?;
+                client.loc -= output_location;
+                let frame = workspace
+                    .tab_group_index(window)
+                    .map_or(client, |_| tab_outer_rectangle(client));
+                let fade = self
+                    .scroller
+                    .animations
+                    .get(&window.id())
+                    .map_or(1.0, |animation| animation.opacity(now));
+                Some((
+                    element,
+                    WindowRenderState {
+                        client,
+                        frame,
+                        opacity: opacity * fade,
+                        scratchpad: scratchpad || self.scratchpad_name_for_window(window).is_some(),
+                    },
+                ))
+            })
+            .collect()
     }
 
-    /// Runs `ready` over every surface on the output and clears the commit
-    /// blocker of each distinct client whose surface reported `true`.
     fn unblock_surfaces(
         &mut self,
         output: &Output,

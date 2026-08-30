@@ -691,14 +691,16 @@ impl Effects {
         let mut tab_elements = self.tab_elements(renderer, state, output, scale);
 
         let output_name = output.name();
+        // One pass over the windows on this output, not one per element - and
+        // all three consumers below want the same answer anyway.
+        // See `Paw2::window_render_states`: an `Id` hashes by identity.
+        #[allow(clippy::mutable_key_type)]
+        let window_states = state.window_render_states(output);
+        let scratchpad_overview = state.scratchpad_overview_visible_on(output);
         let mut shadowed = Vec::new();
         for element in space_elements {
-            // Resolved once per element: the lookup walks every window on every
-            // workspace, and all three consumers below want the same answer.
-            let window_state = state.window_render_state(output, element.id());
-            if state.scratchpad_overview_visible_on(output)
-                && window_state.is_some_and(|window| window.scratchpad)
-            {
+            let window_state = window_states.get(element.id()).copied();
+            if scratchpad_overview && window_state.is_some_and(|window| window.scratchpad) {
                 continue;
             }
             let blur = self.blur_elements(state, &element, scale, output_bounds, window_state);

@@ -132,20 +132,28 @@ impl CompositorHandler for Paw2 {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-            if let Some(window) = self.window_for_surface(&root).cloned() {
-                window.on_commit();
-                if let Some(toplevel) = window.toplevel() {
-                    self.refresh_wayland_floating(toplevel);
-                }
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        // One search, not two. `window_for_surface` only ever matches a
+        // window's *root* surface, so looking the committed surface up
+        // separately was the same walk over every window on every workspace -
+        // and this runs for every commit of every surface, subsurfaces and
+        // cursor surfaces included.
+        let window = self.window_for_surface(&root).cloned();
+
+        if !is_sync_subsurface(surface)
+            && let Some(window) = &window
+        {
+            window.on_commit();
+            if let Some(toplevel) = window.toplevel() {
+                self.refresh_wayland_floating(toplevel);
             }
         }
 
-        if let Some(window) = self.window_for_surface(surface)
+        if root == *surface
+            && let Some(window) = &window
             && let Some(toplevel) = window.toplevel()
             && !toplevel.is_initial_configure_sent()
         {
@@ -299,7 +307,8 @@ impl Paw2 {
                 continue;
             };
             let window_location = self
-                .window_render_state(&output, &root_id)
+                .window_render_states(&output)
+                .get(&root_id)
                 .map(|state| output_geometry.loc + state.client.loc);
             let layer_location = || {
                 let layers = layer_map_for_output(&output);
