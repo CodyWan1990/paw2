@@ -1818,6 +1818,25 @@ fn render_blur_pass(
 mod tests {
     use super::*;
 
+    /// Everything off, which is the state the config's own `Default` impls
+    /// describe. Each test below turns on only what it is about.
+    fn appearance() -> AppearanceConfig {
+        AppearanceConfig {
+            gaps: 15,
+            focus_ring_width: 1,
+            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
+            corner_radius: 0,
+            shadow_radius: 0,
+            shadow_color: [0.0, 0.0, 0.0, 0.0],
+            shadow_offset_x: 0,
+            shadow_offset_y: 0,
+            blur: false,
+            blur_radius: 0,
+            transparency: false,
+            opacity: 1.0,
+        }
+    }
+
     #[test]
     fn every_rounded_shader_gets_the_same_curve() {
         for source in [WINDOW_SHADER, RING_SHADER, SHADOW_SHADER] {
@@ -1944,18 +1963,8 @@ mod tests {
     #[test]
     fn window_effects_engage_only_when_configured() {
         let mut appearance = AppearanceConfig {
-            gaps: 15,
-            focus_ring_width: 1,
-            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0,
-            shadow_radius: 0,
-            shadow_color: [0.0, 0.0, 0.0, 0.0],
-            shadow_offset_x: 0,
-            shadow_offset_y: 0,
-            blur: false,
-            blur_radius: 0,
-            transparency: false,
             opacity: 0.5,
+            ..appearance()
         };
         // Transparency off pins opacity to 1.0, so nothing to do.
         assert!(!window_effects(&appearance));
@@ -1974,18 +1983,8 @@ mod tests {
     #[test]
     fn a_shadow_needs_both_reach_and_colour() {
         let mut appearance = AppearanceConfig {
-            gaps: 15,
-            focus_ring_width: 1,
-            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0,
-            shadow_radius: 0,
             shadow_color: [0.0, 0.0, 0.0, 0.5],
-            shadow_offset_x: 0,
-            shadow_offset_y: 0,
-            blur: false,
-            blur_radius: 0,
-            transparency: false,
-            opacity: 1.0,
+            ..appearance()
         };
         assert!(!appearance.shadow_enabled());
 
@@ -2001,18 +2000,10 @@ mod tests {
     fn the_shadow_area_centres_on_the_window_plus_the_offset() {
         let window = Rectangle::new((100, 100).into(), (200, 160).into());
         let mut appearance = AppearanceConfig {
-            gaps: 15,
-            focus_ring_width: 1,
-            focus_ring_color: [0.0, 0.0, 0.0, 1.0],
             corner_radius: 8,
             shadow_radius: 12,
             shadow_color: [0.0, 0.0, 0.0, 0.45],
-            shadow_offset_x: 0,
-            shadow_offset_y: 0,
-            blur: false,
-            blur_radius: 0,
-            transparency: false,
-            opacity: 1.0,
+            ..appearance()
         };
 
         // Without an offset the shadow is an even collar around the window,

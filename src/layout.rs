@@ -2815,7 +2815,7 @@ impl Paw2 {
             .map(|(name, _)| name.clone())
     }
 
-    pub fn output_geometries(&self) -> Vec<(String, Rectangle<i32, Logical>)> {
+    pub(super) fn output_geometries(&self) -> Vec<(String, Rectangle<i32, Logical>)> {
         self.scroller
             .monitors
             .iter()

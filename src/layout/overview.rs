@@ -134,7 +134,7 @@ impl Paw2 {
     }
 
     /// How far open the overview is drawn right now, 0.0 to 1.0.
-    pub(crate) fn overview_progress(&self) -> f64 {
+    pub(super) fn overview_progress(&self) -> f64 {
         self.scroller.overview_zoom.value(self.start_time.elapsed())
     }
 

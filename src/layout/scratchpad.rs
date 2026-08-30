@@ -262,7 +262,7 @@ impl Paw2 {
         self.relayout(true);
     }
 
-    pub fn toggle_scratchpad(&mut self, index: usize) {
+    pub(super) fn toggle_scratchpad(&mut self, index: usize) {
         let Some(config) = self.config.scratchpads.get(index).cloned() else {
             return;
         };
@@ -312,7 +312,7 @@ impl Paw2 {
         }
     }
 
-    pub fn toggle_numbered_scratchpad(&mut self, index: usize) {
+    pub(super) fn toggle_numbered_scratchpad(&mut self, index: usize) {
         if index >= NUMBERED_SCRATCHPAD_COUNT {
             return;
         }
@@ -327,7 +327,7 @@ impl Paw2 {
         }
     }
 
-    pub fn assign_numbered_scratchpad(&mut self, index: usize) {
+    pub(super) fn assign_numbered_scratchpad(&mut self, index: usize) {
         if index >= NUMBERED_SCRATCHPAD_COUNT {
             return;
         }

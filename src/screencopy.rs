@@ -206,17 +206,14 @@ impl Paw2 {
         let formats = backend.capture_formats();
         Some(BufferConstraints {
             size: Size::<i32, BufferCoords>::from((size.w, size.h)),
-            shm: capture_shm_formats(),
+            // The two 8-bit formats every client can be asked to accept.
+            shm: vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888],
             dma: (!formats.is_empty()).then(|| DmabufConstraints {
                 node: backend.render_node(),
                 formats,
             }),
         })
     }
-}
-
-fn capture_shm_formats() -> Vec<wl_shm::Format> {
-    vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]
 }
 
 pub(crate) fn window_metadata(window: &Window) -> (String, String) {
@@ -331,18 +328,5 @@ impl ImageCopyCaptureHandler for Paw2 {
         self.screencopy_state
             .sessions
             .retain(|owned| owned.as_ref() != session);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn screenshots_offer_mandatory_8_bit_shm_formats() {
-        assert_eq!(
-            capture_shm_formats(),
-            [wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]
-        );
     }
 }
