@@ -65,7 +65,7 @@ use smithay::{
     },
 };
 use smithay_drm_extras::{display_info, drm_scanner::DrmScanner};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     config::{MonitorConfig, ThemeConfig, VrrPolicy},
@@ -506,11 +506,19 @@ fn schedule_repaint(
     }
 }
 
+/// Run `f` with the backend moved out of `state`, so both are mutable at once.
+///
+/// The backend is absent under `--nested`, and *also* absent to anything that
+/// re-enters while `f` is running - a redraw reached from inside a render, say.
+/// That second case silently drops a frame, so say so rather than letting it
+/// look like the nested no-op.
 fn with_backend(state: &mut Paw2, f: impl FnOnce(&mut DirectBackend, &mut Paw2)) {
-    if let Some(mut backend) = state.direct.take() {
-        f(&mut backend, state);
-        state.direct = Some(backend);
-    }
+    let Some(mut backend) = state.direct.take() else {
+        trace!("no DRM backend for this call; nested session, or re-entered from within one");
+        return;
+    };
+    f(&mut backend, state);
+    state.direct = Some(backend);
 }
 
 pub fn redraw(state: &mut Paw2) {
@@ -990,6 +998,12 @@ impl DirectBackend {
         };
         let active = self.outputs.remove(index);
         state.screencopy_state.fail_output(&active.output);
+        // Removing the `wl_output` global is not a close. A bar or wallpaper
+        // that pinned this output by name would otherwise keep a surface
+        // nothing will ever draw.
+        for layer in layer_map_for_output(&active.output).layers() {
+            layer.layer_surface().send_close();
+        }
         let name = active.output.name();
         if !preserve_layout {
             let destination = state.nearest_output(&name);
@@ -1058,6 +1072,7 @@ impl DirectBackend {
             &active.output,
             &mut elements,
         );
+        let mut retry = false;
         match active.kms.render_frame(
             &mut self.renderer,
             &elements,
@@ -1067,31 +1082,33 @@ impl DirectBackend {
             Ok(frame) if !frame.is_empty => {
                 let scanout_active =
                     matches!(&frame.primary_element, PrimaryPlaneElement::Element(_));
-                if frame.needs_sync()
+                // KMS cannot wait on this render fence, so finish it before
+                // submitting the buffer. A fence that keeps failing means the
+                // GPU is wedged; give up rather than spin the event loop
+                // forever with no input and no way out.
+                let synced = if frame.needs_sync()
                     && let PrimaryPlaneElement::Swapchain(element) = &frame.primary_element
                 {
-                    // KMS cannot wait on this render fence, so finish it before
-                    // submitting the buffer. A fence that keeps failing means the
-                    // GPU is wedged; give up rather than spin the event loop
-                    // forever with no input and no way out.
-                    for attempt in 1..=SYNC_WAIT_ATTEMPTS {
-                        if element.sync.wait().is_ok() {
-                            break;
-                        }
-                        if attempt == SYNC_WAIT_ATTEMPTS {
-                            warn!("render fence never signalled; submitting anyway");
-                        }
-                    }
-                }
-                let feedback = state.take_presentation_feedback(&active.output, &frame.states);
-                if let Err(error) = active.kms.queue_frame(feedback) {
-                    warn!(?error, "failed to queue DRM frame");
+                    (0..SYNC_WAIT_ATTEMPTS).any(|_| element.sync.wait().is_ok())
                 } else {
-                    active.frame_pending = true;
-                    if active.direct_scanout_active != scanout_active {
-                        active.direct_scanout_active = scanout_active;
-                        debug!(output = %active.output.name(), direct_scanout = scanout_active, "DRM presentation path changed");
+                    true
+                };
+                if synced {
+                    let feedback = state.take_presentation_feedback(&active.output, &frame.states);
+                    if let Err(error) = active.kms.queue_frame(feedback) {
+                        warn!(?error, "failed to queue DRM frame");
+                    } else {
+                        active.frame_pending = true;
+                        if active.direct_scanout_active != scanout_active {
+                            active.direct_scanout_active = scanout_active;
+                            debug!(output = %active.output.name(), direct_scanout = scanout_active, "DRM presentation path changed");
+                        }
                     }
+                } else {
+                    // Submitting now would scan out whatever the GPU had got to.
+                    // Drop the frame and come back for it.
+                    warn!("render fence never signalled; skipping the frame");
+                    retry = true;
                 }
             }
             Ok(_)
@@ -1104,9 +1121,13 @@ impl DirectBackend {
         state.finish_frame();
 
         // A frame that produced no damage queues nothing, so the vblank chain
-        // stops. Mid-animation that would strand a window short of its target.
+        // stops. Mid-animation that would strand a window short of its target,
+        // and a frame skipped over a stuck fence would never be retried.
         let active = &mut self.outputs[index];
-        if state.animations_active() && !active.frame_pending && !active.repaint_scheduled {
+        if (state.animations_active() || retry)
+            && !active.frame_pending
+            && !active.repaint_scheduled
+        {
             let delay = frame_duration(&active.output).mul_f64(0.6);
             let crtc = active.crtc;
             active.repaint_scheduled = schedule_repaint(&self.handle, crtc, delay);
@@ -1115,13 +1136,11 @@ impl DirectBackend {
 
     fn capture_output(&mut self, state: &mut Paw2, output: &Output) {
         let mut captures = state.screencopy_state.take_for_output(output);
-        if self
-            .outputs
-            .first()
-            .is_some_and(|active| active.output == *output)
-        {
-            captures.extend(state.screencopy_state.take_window_captures());
-        }
+        // A window capture renders from the window's own bounding box, not from
+        // the output being composited, so whichever output reaches here first
+        // can serve it. Waiting for a fixed index only added latency, and
+        // stalled entirely whenever that output had a frame already pending.
+        captures.extend(state.screencopy_state.take_window_captures());
         for capture in captures {
             let result = self.render_capture(state, capture);
             if let Err(error) = result {

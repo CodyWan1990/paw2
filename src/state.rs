@@ -11,7 +11,7 @@ use std::{
 
 use smithay::{
     desktop::PopupManager,
-    input::{Seat, SeatState},
+    input::{Seat, SeatState, keyboard::XkbConfig},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
@@ -204,7 +204,20 @@ impl Paw2 {
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "paw2");
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        // `XkbConfig::default()` reads the `XKB_DEFAULT_*` environment, so a
+        // typo out there must not cost the session its keyboard entirely.
+        if let Err(error) = seat.add_keyboard(XkbConfig::default(), 200, 25) {
+            tracing::error!(?error, "could not compile the keymap; falling back to us");
+            seat.add_keyboard(
+                XkbConfig {
+                    layout: "us",
+                    ..XkbConfig::default()
+                },
+                200,
+                25,
+            )
+            .expect("the built-in us keymap compiles");
+        }
         seat.add_pointer();
 
         let socket_name = Self::listen(display, event_loop);

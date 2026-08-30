@@ -120,9 +120,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    match &mode {
-        Mode::Direct => drm::init(&mut event_loop, &mut state)?,
-        Mode::Nested(_) => backend::init(&mut event_loop, &mut state)?,
+    let started = match &mode {
+        Mode::Direct => drm::init(&mut event_loop, &mut state),
+        Mode::Nested(_) => backend::init(&mut event_loop, &mut state),
+    };
+    if let Err(error) = started {
+        // Not a full `shutdown`: nothing below has touched the session
+        // environment yet, so unsetting it here would clear the display
+        // manager's. But `drm::init` installs the backend before its last few
+        // fallible steps, and only `DirectBackend::shutdown` resets the device -
+        // dropping it does not. Hand the GPU back while libseat is still up.
+        if let Some(backend) = state.direct.take() {
+            backend.shutdown();
+        }
+        return Err(error);
     }
     if mode == Mode::Direct {
         state.apply_startup_monitor();
