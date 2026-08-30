@@ -886,16 +886,24 @@ impl DirectBackend {
             .as_ref()
             .map_or(Transform::Normal, |value| value.transform);
         let scale = config.as_ref().map_or(1.0, |value| value.scale);
-        let mut position: Point<i32, Logical> = config
+        let size = logical_output_size(mode, transform, scale);
+        let configured: Option<Point<i32, Logical>> = config
             .as_ref()
             .and_then(|value| value.position)
-            .map(|[x, y]| (x, y).into())
-            .unwrap_or_else(|| self.automatic_position(state));
-        let size = logical_output_size(mode, transform, scale);
-        if self.position_overlaps(state, Rectangle::new(position, size)) {
-            warn!(connector = %name, ?position, "monitor placement overlaps; using automatic placement");
-            position = self.automatic_position(state);
-        }
+            .map(|[x, y]| (x, y).into());
+        let overlaps = |position| {
+            state
+                .output_rects()
+                .any(|geometry| geometry.overlaps(Rectangle::new(position, size)))
+        };
+        let position = match configured {
+            Some(position) if overlaps(position) => {
+                warn!(connector = %name, ?position, "monitor placement overlaps; using automatic placement");
+                automatic_position(state.output_rects(), size)
+            }
+            Some(position) => position,
+            None => automatic_position(state.output_rects(), size),
+        };
         let info = display_info::for_connector(self.manager.device(), connector.handle());
         let (width, height) = connector.size().unwrap_or((0, 0));
         let output = Output::new(
@@ -1269,21 +1277,6 @@ impl DirectBackend {
         })
     }
 
-    fn automatic_position(&self, state: &Paw2) -> Point<i32, Logical> {
-        let x = state
-            .output_rects()
-            .map(|geometry| geometry.loc.x + geometry.size.w)
-            .max()
-            .unwrap_or(0);
-        (x, 0).into()
-    }
-
-    fn position_overlaps(&self, state: &Paw2, proposed: Rectangle<i32, Logical>) -> bool {
-        state
-            .output_rects()
-            .any(|geometry| geometry.overlaps(proposed))
-    }
-
     fn add_cursor(
         renderer: &mut GlesRenderer,
         cursor: &Option<crate::cursor::Cursor>,
@@ -1366,6 +1359,26 @@ fn frame_flags(fullscreen: bool, direct_scanout: bool) -> FrameFlags {
     } else {
         FrameFlags::DEFAULT
     }
+}
+
+/// Where a newly connected output of `size` goes, given everything already on
+/// screen.
+///
+/// Defers to [`automatic_positions`] rather than carrying a second rule: this
+/// used to place at the rightmost edge while a config reload gap-packed, so the
+/// same monitor landed in two different spots depending on which path ran.
+fn automatic_position(
+    existing: impl Iterator<Item = Rectangle<i32, Logical>>,
+    size: Size<i32, Logical>,
+) -> Point<i32, Logical> {
+    let mut placements = existing
+        .map(|geometry| (geometry.size, Some(geometry.loc)))
+        .collect::<Vec<OutputPlacement>>();
+    placements.push((size, None));
+    automatic_positions(&placements)
+        .last()
+        .copied()
+        .unwrap_or_default()
 }
 
 fn automatic_positions(outputs: &[OutputPlacement]) -> Vec<Point<i32, Logical>> {
@@ -1533,6 +1546,29 @@ mod tests {
         assert!(refresh_matches(199_999, 200_000));
         assert!(refresh_matches(199_500, 200_000));
         assert!(!refresh_matches(199_000, 200_000));
+    }
+
+    #[test]
+    fn a_new_output_lands_in_the_same_gap_a_reload_would_pack_it_into() {
+        // Hot-plug and config-reload used to run different algorithms: this
+        // placed at the rightmost edge, `automatic_positions` gap-packed. A
+        // 1920-wide hole at x=0 has to swallow a 1920-wide monitor either way.
+        let existing = [Rectangle::new(
+            (1920, 0).into(),
+            Size::<i32, Logical>::from((2560, 1440)),
+        )];
+        assert_eq!(
+            automatic_position(existing.into_iter(), (1920, 1080).into()),
+            Point::<i32, Logical>::from((0, 0))
+        );
+        assert_eq!(
+            automatic_position(existing.into_iter(), (3840, 2160).into()),
+            Point::<i32, Logical>::from((4480, 0))
+        );
+        assert_eq!(
+            automatic_position(std::iter::empty(), (1920, 1080).into()),
+            Point::<i32, Logical>::from((0, 0))
+        );
     }
 
     #[test]
