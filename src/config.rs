@@ -87,8 +87,6 @@ direct_scanout = true
 privileged_clients = [
   "xdg-desktop-portal-wlr",
   "xdg-desktop-portal",
-  "wl-paste",
-  "wl-copy",
 ]
 "#;
 
@@ -319,12 +317,17 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            privileged_clients: vec![
-                "xdg-desktop-portal-wlr".into(),
-                "xdg-desktop-portal".into(),
-                "wl-paste".into(),
-                "wl-copy".into(),
-            ],
+            // The desktop portal only. It is here because dropping it silently
+            // breaks OBS window capture, which is not something a user can be
+            // expected to diagnose - see `REFERENCE.md`.
+            //
+            // `wl-paste` and `wl-copy` used to be here too, and must not come
+            // back. The allowlist also gates `ext-data-control-v1`, which sees
+            // every copy as it happens, and a bare name is a filename anyone
+            // can choose: shipping those two granted the clipboard - password
+            // manager included - to anything that called itself `wl-paste`.
+            // A clipboard history tool is worth having, and worth opting into.
+            privileged_clients: vec!["xdg-desktop-portal-wlr".into(), "xdg-desktop-portal".into()],
         }
     }
 }
@@ -1700,8 +1703,6 @@ fn invalid_data(path: &Path, message: impl std::fmt::Display) -> io::Error {
 const PRIVILEGED: &str = r#"privileged_clients = [
   "xdg-desktop-portal-wlr",
   "xdg-desktop-portal",
-  "wl-paste",
-  "wl-copy",
 ]"#;
 
 /// The annotated reference at the repo root. It names every option, so the
@@ -1919,14 +1920,11 @@ mod tests {
         assert!(config.backend.direct_scanout);
         // The shipped config and the built-in default must not drift apart.
         assert_eq!(config.security, SecurityConfig::default());
+        // No clipboard tool here on purpose: this list also gates
+        // ext-data-control-v1, and a bare name is a filename anyone can pick.
         assert_eq!(
             config.security.privileged_clients,
-            [
-                "xdg-desktop-portal-wlr",
-                "xdg-desktop-portal",
-                "wl-paste",
-                "wl-copy"
-            ]
+            ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
         );
         assert!(
             parse(&EXAMPLE_CONFIG.edited(PRIVILEGED, r#"privileged_clients = ["  "]"#))

@@ -1,0 +1,43 @@
+# Dependency gate for `cargo deny check`. Paw2 pulls ~260 crates including a
+# git-pinned Smithay; this is what notices when one of them picks up an
+# advisory or a licence the project cannot ship.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # `ttf-parser` is unmaintained with no successor release, and it arrives
+    # through `fontdue`. Ignored rather than left failing because there is no
+    # action to take: a gate that can only fail is a gate nobody runs, and
+    # blanket-warning `unmaintained` would hide the *next* one. Paw2 only ever
+    # hands it the bundled `assets/NotoSans-Regular.ttf`, never a client-supplied
+    # font, so the parser is not on an untrusted path. Revisit if tab titles ever
+    # render a font a client can choose.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; only parses the bundled font" },
+]
+
+[licenses]
+# Paw2 itself has no licence yet (see README "Licensing"), and is never
+# published, so it is skipped rather than given one here - that is a decision
+# for the project, not for its dependency gate.
+private = { ignore = true }
+# What the dependency tree is actually allowed to bring in.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Smithay is pinned by revision in Cargo.toml.
+allow-git = ["https://github.com/Smithay/smithay"]

@@ -377,18 +377,26 @@ pub fn is_privileged(client: &Client) -> bool {
         .is_some_and(|state| state.privileged)
 }
 
-/// Whether a connecting client may bind the privileged globals.
+/// Whether a connecting peer may bind the privileged globals, or read the
+/// privileged half of the control socket.
 ///
 /// Reads the peer's executable rather than `/proc/<pid>/comm`, which truncates
 /// to 15 bytes and would collapse every `xdg-desktop-portal-*` binary onto the
 /// same string.
 ///
-/// This is a soft boundary and must not be described as more. A process running
-/// as the user can already ptrace the compositor, and the peer credentials
-/// themselves are spoofable. What it buys is that an ordinary application can no
-/// longer enumerate every window title just by binding a global that was there
+/// This is a soft boundary and must not be described as more. The peer
+/// credentials are spoofable, and there is a narrow race: `socket_peercred`
+/// captures the pid at connect time and `/proc/<pid>/exe` is read after, so a
+/// peer that exits in between lets a reused pid answer for it.
+///
+/// What it is *not* is trivially bypassable by reading the compositor's memory
+/// instead: `main::restrict_process_memory` marks Paw2 non-dumpable, so a
+/// same-user process cannot ptrace it and a crash leaves no core dump.
+/// `wp_security_context_v1` is the mechanism that would replace all of this
+/// properly. What this buys today is that an ordinary application can no longer
+/// enumerate every window title just by connecting to something that was there
 /// for the taking.
-fn is_privileged_client(stream: &UnixStream, allowlist: &[String]) -> bool {
+pub(crate) fn is_privileged_client(stream: &UnixStream, allowlist: &[String]) -> bool {
     // `std::os::unix::net::UnixStream::peer_cred` is still nightly-only.
     let Ok(peer) = smithay::reexports::rustix::net::sockopt::socket_peercred(stream) else {
         return false;
@@ -402,11 +410,22 @@ fn is_privileged_client(stream: &UnixStream, allowlist: &[String]) -> bool {
 
 /// Split from [`is_privileged_client`] so the matching rule is testable without
 /// a live socket.
+///
+/// An entry containing a `/` is matched against the whole resolved path, which
+/// is the form that actually pins down *which* binary is meant. A bare name
+/// matches that basename anywhere, because the compiled default has to name the
+/// desktop portal on distributions that disagree about `/usr/lib` versus
+/// `/usr/libexec`. `/proc/<pid>/exe` resolves symlinks, so an entry has to name
+/// the real binary rather than a wrapper link.
 fn allowlisted(executable: &Path, allowlist: &[String]) -> bool {
-    executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| allowlist.iter().any(|allowed| allowed == name))
+    let name = executable.file_name().and_then(|name| name.to_str());
+    allowlist.iter().any(|allowed| {
+        if allowed.contains('/') {
+            Path::new(allowed) == executable
+        } else {
+            name == Some(allowed.as_str())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -436,5 +455,30 @@ mod tests {
             Path::new("/usr/lib/xdg-desktop-portal-wlr"),
             &[]
         ));
+    }
+
+    #[test]
+    fn an_absolute_entry_pins_the_whole_path() {
+        let allowlist = ["/usr/bin/quickshell".to_string()];
+        assert!(allowlisted(Path::new("/usr/bin/quickshell"), &allowlist));
+        // The point of the absolute form: a copy under any other name-alike
+        // path is not the binary that was allowed.
+        assert!(!allowlisted(Path::new("/tmp/quickshell"), &allowlist));
+        assert!(!allowlisted(
+            Path::new("/home/user/.local/bin/quickshell"),
+            &allowlist
+        ));
+        // A bare name in the same list still matches anywhere, so the two forms
+        // can be mixed - which is what the shipped default does.
+        let mixed = [
+            "/usr/bin/quickshell".to_string(),
+            "xdg-desktop-portal-wlr".to_string(),
+        ];
+        assert!(allowlisted(
+            Path::new("/usr/libexec/xdg-desktop-portal-wlr"),
+            &mixed
+        ));
+        assert!(allowlisted(Path::new("/usr/bin/quickshell"), &mixed));
+        assert!(!allowlisted(Path::new("/tmp/quickshell"), &mixed));
     }
 }

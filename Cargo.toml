@@ -2,6 +2,10 @@
 name = "paw2"
 version = "0.1.0"
 edition = "2024"
+# A compositor binary, not a library; this keeps `cargo publish` from ever
+# being the accident that ships it, and is what lets `cargo deny` skip the
+# licence check on Paw2 itself while still checking every dependency.
+publish = false
 
 [profile.release]
 lto = "thin"

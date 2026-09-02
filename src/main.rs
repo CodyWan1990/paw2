@@ -37,6 +37,7 @@ enum Mode {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clock = Instant::now();
     init_logging();
+    restrict_process_memory();
 
     let Some(mode) = parse_args(std::env::args_os().skip(1))? else {
         print_usage();
@@ -556,6 +557,38 @@ extern "C" fn on_terminate(_signal: libc::c_int) {
     if let Some(signal) = LOOP_SIGNAL.get() {
         signal.stop();
         signal.wakeup();
+    }
+}
+
+/// Deny same-user ptrace and suppress core dumps.
+///
+/// Paw2 holds every window's pixels, the clipboard, and the merged config in one
+/// address space, and none of the allowlists mean anything to something reading
+/// that memory directly. `ptrace(2)` access rule (4) denies a tracer without
+/// `CAP_SYS_PTRACE` when the target is not dumpable, and a non-dumpable process
+/// writes no core - so this one call closes both paths without a seccomp filter
+/// or an LSM policy. It matters more since `panic = "abort"`: aborting is right
+/// for the DRM state, but it is also what would hand a core dump full of window
+/// contents to `systemd-coredump`.
+///
+/// Children are unaffected - `dumpable` resets to 1 on `execve`, so a terminal
+/// spawned from a binding is as debuggable as it ever was. Note that
+/// `PR_SET_NO_NEW_PRIVS` is deliberately *not* set alongside this: that one *is*
+/// inherited, and would break `sudo` and `pkexec` in every such terminal.
+///
+/// `PAW2_DUMPABLE` is the escape hatch for attaching a debugger to Paw2 itself.
+fn restrict_process_memory() {
+    if std::env::var_os("PAW2_DUMPABLE").is_some() {
+        tracing::warn!("PAW2_DUMPABLE is set; core dumps and debugger attach are permitted");
+        return;
+    }
+    // SAFETY: `PR_SET_DUMPABLE` takes no pointers and touches only this
+    // process's own credentials.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        tracing::warn!(
+            error = %io::Error::last_os_error(),
+            "could not disable core dumps and debugger attach"
+        );
     }
 }
 

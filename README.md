@@ -325,16 +325,52 @@ the control socket.
 
 ### `[security]`
 
-`privileged_clients` lists the only clients allowed to bind the privileged
-globals: the window list (`ext-foreign-toplevel-list-v1`), per-window capture,
-and the clipboard manager interface (`ext-data-control-v1`, which sees every
-copy as it happens). Everything else can still capture whole outputs, so `grim`
-and `wf-recorder` work without an entry.
+`privileged_clients` lists the clients allowed the privileged view of your
+desktop:
 
-It ships allowing `xdg-desktop-portal-wlr`, `xdg-desktop-portal`, `wl-paste` and
-`wl-copy`. Names are matched against the basename of the connecting process's
-executable, so add whatever binary actually connects — for
-`wl-paste --watch cliphist store` that is `wl-paste`, not `cliphist`.
+- the window list (`ext-foreign-toplevel-list-v1`) and per-window capture,
+- the clipboard manager interface (`ext-data-control-v1`, which sees every copy
+  as it happens),
+- window titles, the merged config, and `quit` on the [control
+  socket](#control-socket).
+
+Everything else can still capture whole outputs, so `grim` and `wf-recorder`
+work without an entry, and still gets workspaces and layout on the control
+socket — just not window titles.
+
+It ships allowing `xdg-desktop-portal-wlr` and `xdg-desktop-portal`, which
+screen sharing needs. **Naming this key replaces the list**, so keep those two
+unless you mean to break OBS.
+
+An entry containing a `/` is matched against the connecting process's whole
+executable path, and that is the form worth using — a bare name matches that
+filename *anywhere*, including a copy under `/tmp`. Paths are resolved first, so
+name the real binary rather than a wrapper symlink (`quickshell`, not `qs`).
+Changing this list needs a restart.
+
+No clipboard tool is allowed by default. `ext-data-control-v1` streams every
+copy — passwords included — to whatever holds it, so that is worth opting into
+rather than inheriting. Add the binary that actually connects; for
+`wl-paste --watch cliphist store` that is `wl-paste`, not `cliphist`:
+
+```toml
+[security]
+privileged_clients = [
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal",
+  "/usr/bin/wl-paste",
+]
+```
+
+None of this is a sandbox, and peer credentials are spoofable. What it buys is
+that an ordinary application can no longer enumerate every window title just by
+binding a global that was there for the taking.
+
+Paw2 does make that boundary harder to simply walk around: it marks itself
+non-dumpable at startup, so attaching a debugger to it needs root and a crash
+writes no core dump. Both would otherwise expose every window's pixels and
+whatever is on the clipboard, without consulting any allowlist. Run
+`PAW2_DUMPABLE=1 paw2` if you need to attach a debugger or collect a core.
 
 ### `[autostart]`
 
@@ -621,15 +657,22 @@ blamed on one file.
 
 ## Control socket
 
-Paw2 listens on `$PAW2_SOCKET`, in `$XDG_RUNTIME_DIR` beside the Wayland socket
-and no more privileged than it. JSON, one message per line.
+Paw2 listens on `$PAW2_SOCKET`, in `$XDG_RUNTIME_DIR` beside the Wayland socket.
+JSON, one message per line.
 
-It sends two messages on connect, and again whenever something changes
-(coalesced to at most one per event-loop iteration):
+Peers are sorted the same way Wayland clients are, against
+[`[security] privileged_clients`](#security). A shell that reads window titles
+or the config needs an entry there; without one it still gets everything it
+needs to draw workspaces.
+
+It sends these on connect, and again whenever something changes (coalesced to at
+most one per event-loop iteration):
 
 - `snapshot` — outputs with workspace occupancy, active layout and display
-  modes; windows with title, app ID, output and workspace.
-- `config` — the merged configuration and any error from the last load.
+  modes; windows with output, workspace and focus. **Window titles and app IDs
+  are sent only to an allowlisted peer**; everyone else sees them empty.
+- `config` — the merged configuration and any error from the last load. Sent
+  **only** to an allowlisted peer.
 
 It accepts these commands:
 
@@ -648,6 +691,14 @@ It accepts these commands:
 `output` is optional on `focus-workspace` and `set-layout`; both act on the
 focused monitor, so passing it follows a click onto the bar's own monitor
 first. `set-layout` without a `layout` cycles to the next enabled one.
+
+Every command except `quit` is open to any peer — they steer the compositor and
+read nothing back. `quit` ends your session, so it is allowlisted.
+
+This is not a sandbox, and the check behind it is a soft one. What the split
+buys is that an ordinary application can no longer read every window title, or
+end your session, just by connecting to a socket that was sitting there for the
+taking.
 
 There is deliberately no "set config" command. Settings go through `config.d/`,
 so there is one path into the configuration and one thing deciding what is

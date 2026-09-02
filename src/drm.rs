@@ -120,6 +120,26 @@ where
     Ok(())
 }
 
+/// Whether `height` rows of `row_bytes` each, laid out at `offset` with `stride`
+/// between them, land inside a mapping of `length` bytes.
+///
+/// Split out of [`copy_to_shm`] because it is the bounds check standing in front
+/// of the one raw pointer write in Paw2 driven by values a client chose, and it
+/// cannot be exercised through `copy_to_shm` itself without a live `WlBuffer`.
+/// Every step is checked rather than wrapping: `stride * height` is exactly the
+/// product a hostile descriptor would pick to overflow.
+fn shm_fits(offset: usize, stride: usize, length: usize, row_bytes: usize, height: usize) -> bool {
+    if stride < row_bytes {
+        return false;
+    }
+    // The last row starts `stride` from each of its predecessors and is
+    // `row_bytes` long; rows before it cannot reach further.
+    offset
+        .checked_add(stride.saturating_mul(height.saturating_sub(1)))
+        .and_then(|last_row| last_row.checked_add(row_bytes))
+        .is_some_and(|required| required <= length)
+}
+
 fn copy_to_shm(
     buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     pixels: &[u8],
@@ -137,12 +157,7 @@ fn copy_to_shm(
         let Ok(stride) = usize::try_from(data.stride) else {
             return false;
         };
-        if stride < row_bytes
-            || offset
-                .checked_add(stride.saturating_mul(height.saturating_sub(1)))
-                .and_then(|last_row| last_row.checked_add(row_bytes))
-                .is_none_or(|required| required > length)
-        {
+        if !shm_fits(offset, stride, length, row_bytes, height) {
             return false;
         }
         for row in 0..height {
@@ -1541,6 +1556,28 @@ fn refresh_matches(actual: i32, requested: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Guards the only raw pointer write in Paw2 driven by client-chosen values.
+    #[test]
+    fn shm_bounds_reject_a_buffer_that_does_not_fit() {
+        // 4 rows of 100 bytes, tightly packed, exactly filling the mapping.
+        assert!(shm_fits(0, 100, 400, 100, 4));
+        // Padded rows: the last one ends at 3 * 128 + 100.
+        assert!(shm_fits(0, 128, 484, 100, 4));
+        assert!(!shm_fits(0, 128, 483, 100, 4));
+
+        // A stride narrower than a row would have each row overwrite the last.
+        assert!(!shm_fits(0, 99, 4096, 100, 4));
+
+        // The offset counts against the mapping.
+        assert!(shm_fits(96, 100, 496, 100, 4));
+        assert!(!shm_fits(96, 100, 400, 100, 4));
+
+        // Values picked to wrap: unchecked, `stride * height` is 0 and the
+        // whole copy would look like it fits in nothing at all.
+        assert!(!shm_fits(0, usize::MAX / 2, usize::MAX, 100, 4));
+        assert!(!shm_fits(usize::MAX, 100, usize::MAX, 100, 4));
+    }
+
     use super::*;
 
     #[test]

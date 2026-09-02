@@ -12,13 +12,39 @@
 //! no "write this key" command, and so no second path into the config with its
 //! own idea of what is valid.
 //!
-//! The trust boundary is `$XDG_RUNTIME_DIR`, exactly as it is for the Wayland
-//! socket sitting next to it. This is not an authenticated interface.
+//! # What a peer is told
+//!
+//! Every process running as the user can reach this socket - the path is even
+//! published as `PAW2_SOCKET` in the D-Bus activation environment - so peers are
+//! sorted the same way Wayland clients are, by [`state::is_privileged_client`]
+//! against `[security] privileged_clients`.
+//!
+//! - **Allowlisted**: everything. Window titles, the merged config, and `quit`.
+//! - **Anyone else**: workspace occupancy, active layout, monitor modes, and the
+//!   commands that steer the compositor. Window titles and app IDs come back
+//!   empty, no `config` message is sent, and `quit` is refused.
+//!
+//! Without that split this socket would hand out exactly what the allowlist on
+//! `ext-foreign-toplevel-list-v1` exists to withhold, which made the allowlist
+//! decorative: an application that could not ask Wayland what windows were open
+//! could just ask here instead. It is a *reduced* view rather than a refused
+//! connection so that a bar which only draws workspaces needs no configuration,
+//! and a misjudged allowlist entry costs blank titles rather than a shell that
+//! never connects and cannot say why.
+//!
+//! The allowlist is read at connect time from the config Paw2 started with;
+//! like the Wayland globals it gates, changing it needs a restart.
+//!
+//! None of this is a sandbox. See [`state::is_privileged_client`] for what the
+//! check is actually worth.
 
 use std::{
     collections::VecDeque,
     io::{ErrorKind, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::PathBuf,
 };
 
@@ -27,12 +53,12 @@ use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generi
 
 use crate::{
     config::{Action, LayoutMode},
-    state::Paw2,
+    state::{self, Paw2},
 };
 
 /// A window, as a panel needs it. `id` is the same identity
 /// `ext-foreign-toplevel-list-v1` hands out, so the two views agree.
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct WindowState {
     pub id: usize,
     pub title: String,
@@ -42,7 +68,7 @@ pub struct WindowState {
     pub focused: bool,
 }
 
-#[derive(Serialize, PartialEq)]
+#[derive(Clone, Serialize, PartialEq)]
 pub struct ScratchpadState {
     pub name: String,
     pub app_id: String,
@@ -105,6 +131,9 @@ struct Client {
     stream: UnixStream,
     /// Bytes read but not yet terminated by a newline.
     pending: Vec<u8>,
+    /// Resolved once, at accept time, exactly as `state::listen` resolves it
+    /// for a Wayland client. See this module's header for what it gates.
+    privileged: bool,
 }
 
 #[derive(Default)]
@@ -177,6 +206,14 @@ pub fn init(handle: &LoopHandle<'static, Paw2>, state: &mut Paw2) {
         }
     };
 
+    // `bind` applies the umask, which leaves this 0755 under the usual 022.
+    // It is private today only because `$XDG_RUNTIME_DIR` is 0700; say so here
+    // rather than inheriting it as an assumption. Before `insert_source`, so
+    // Paw2 is never accepting on a socket anyone may connect to.
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(?error, ?path, "could not restrict the control socket");
+    }
+
     let registered = handle.insert_source(
         Generic::new(listener, Interest::READ, Mode::Level),
         |_, listener, state| {
@@ -213,6 +250,9 @@ fn accept(state: &mut Paw2, stream: UnixStream) {
     let Ok(reader) = stream.try_clone() else {
         return;
     };
+    // Resolved here, once, while the peer is still the process that connected.
+    let privileged =
+        state::is_privileged_client(&stream, &state.config.security.privileged_clients);
     let id = state.ipc.next_id;
     state.ipc.next_id += 1;
 
@@ -228,6 +268,7 @@ fn accept(state: &mut Paw2, stream: UnixStream) {
         id,
         stream,
         pending: Vec::new(),
+        privileged,
     });
     state.ipc.greeting.push_back(id);
 }
@@ -251,8 +292,9 @@ fn read_client(state: &mut Paw2, id: u64, reader: &UnixStream) -> PostAction {
                     tracing::warn!("control client sent an oversized command");
                     return disconnect(state, id);
                 }
+                let privileged = client.privileged;
                 for line in take_lines(&mut client.pending) {
-                    run(state, &line);
+                    run(state, &line, privileged);
                 }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => return PostAction::Continue,
@@ -325,7 +367,7 @@ enum Command {
     // config watcher picks up within half a second.
 }
 
-fn run(state: &mut Paw2, line: &str) {
+fn run(state: &mut Paw2, line: &str, privileged: bool) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -337,6 +379,13 @@ fn run(state: &mut Paw2, line: &str) {
             return;
         }
     };
+    // The one command that is not just steering. Everything else moves focus
+    // or a scratchpad around and reads nothing back, so it stays open to any
+    // peer; ending the session on request does not.
+    if matches!(command, Command::Quit) && !privileged {
+        tracing::warn!("refused quit from an unprivileged control client");
+        return;
+    }
     // Follow the click before acting: the actions below only ever reach the
     // focused output.
     if let Command::FocusWorkspace {
@@ -390,28 +439,58 @@ pub fn flush(state: &mut Paw2) {
         .iter()
         .map(|layout| layout.name().to_string())
         .collect::<Vec<_>>();
-    let snapshot = serialize(&Snapshot {
-        kind: "snapshot",
-        outputs: &outputs,
-        windows: &windows,
-        scratchpads: &scratchpads,
-        layouts: &layouts,
+
+    // Each view is serialised at most once per flush, and only when a peer of
+    // that kind is actually connected - which for the usual session of one
+    // allowlisted shell means the redacted copy is never built at all.
+    let any_privileged = state.ipc.clients.iter().any(|client| client.privileged);
+    let any_ordinary = state.ipc.clients.iter().any(|client| !client.privileged);
+
+    let snapshot = |windows: &[WindowState], scratchpads: &[ScratchpadState]| {
+        serialize(&Snapshot {
+            kind: "snapshot",
+            outputs: &outputs,
+            windows,
+            scratchpads,
+            layouts: &layouts,
+        })
+    };
+    let full = any_privileged.then(|| snapshot(&windows, &scratchpads));
+    let reduced = any_ordinary.then(|| {
+        snapshot(
+            &redacted_windows(&windows),
+            &redacted_scratchpads(&scratchpads),
+        )
     });
-    let config = serialize(&ConfigMessage {
-        kind: "config",
-        values: &state.ipc.config,
-        ok: state.ipc.config_error.is_none(),
-        errors: state.ipc.config_error.as_deref().into_iter().collect(),
+    let config = any_privileged.then(|| {
+        serialize(&ConfigMessage {
+            kind: "config",
+            values: &state.ipc.config,
+            ok: state.ipc.config_error.is_none(),
+            errors: state.ipc.config_error.as_deref().into_iter().collect(),
+        })
     });
 
     let mut dropped = Vec::new();
     for client in &mut state.ipc.clients {
-        // A client that just connected has no config at all yet; everyone else
-        // needs it only when it actually changed.
-        let owed: &[&str] = if config_changed || greeting.contains(&client.id) {
-            &[&config, &snapshot]
+        let Some(snapshot) = (if client.privileged {
+            full.as_deref()
         } else {
-            &[&snapshot]
+            reduced.as_deref()
+        }) else {
+            continue;
+        };
+        let owed: &[&str] = match &config {
+            Some(config)
+                if owes_config(
+                    client.privileged,
+                    config_changed,
+                    greeting.contains(&client.id),
+                ) =>
+            {
+                &[config, snapshot]
+            }
+            _ => &[snapshot],
         };
         for message in owed {
             if !send(client, message) {
@@ -424,6 +503,51 @@ pub fn flush(state: &mut Paw2) {
         .ipc
         .clients
         .retain(|client| !dropped.contains(&client.id));
+}
+
+/// Whether this peer is owed the `config` message on this flush.
+///
+/// A client that just connected has no config at all yet; everyone else needs it
+/// only when it actually changed.
+///
+/// `privileged` is the load-bearing term and is *not* implied by the caller
+/// having a config to send: that is built whenever **any** connected peer is
+/// privileged. Dropping this term is the bug where an ordinary peer connecting
+/// alongside an allowlisted shell gets greeted with the whole config - which is
+/// exactly what happened, and why this is a named function with a test rather
+/// than a condition inline in `flush`.
+fn owes_config(privileged: bool, config_changed: bool, greeted: bool) -> bool {
+    privileged && (config_changed || greeted)
+}
+
+/// The window list as an unprivileged peer sees it: which windows exist, where
+/// they are and which has focus, but not what any of them *is*.
+///
+/// The identity stays so a bar can still count windows per workspace and send
+/// `focus-window`; the title and app ID are the disclosure, and they are the
+/// same two fields `ext-foreign-toplevel-list-v1` is allowlisted for.
+fn redacted_windows(windows: &[WindowState]) -> Vec<WindowState> {
+    windows
+        .iter()
+        .map(|window| WindowState {
+            title: String::new(),
+            app_id: String::new(),
+            ..window.clone()
+        })
+        .collect()
+}
+
+/// Scratchpads keep their name - it is a label out of the user's own config and
+/// the handle every scratchpad command takes - but not the app ID, which says
+/// what is running.
+fn redacted_scratchpads(scratchpads: &[ScratchpadState]) -> Vec<ScratchpadState> {
+    scratchpads
+        .iter()
+        .map(|scratchpad| ScratchpadState {
+            app_id: String::new(),
+            ..scratchpad.clone()
+        })
+        .collect()
 }
 
 fn serialize<T: Serialize>(message: &T) -> String {
@@ -464,6 +588,59 @@ fn send(client: &mut Client, message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_privileged_peer_is_ever_owed_the_config() {
+        // Greeted on connect, and again whenever it changes.
+        assert!(owes_config(true, false, true));
+        assert!(owes_config(true, true, false));
+        // Nothing new to say.
+        assert!(!owes_config(true, false, false));
+
+        // The regression: an ordinary peer is owed the config on no path at
+        // all, including the one where an allowlisted shell sharing the flush
+        // means a serialised config is sitting right there.
+        assert!(!owes_config(false, true, true));
+        assert!(!owes_config(false, false, true));
+        assert!(!owes_config(false, true, false));
+    }
+
+    // The reduced view is the whole point of the peer check; pin what it drops
+    // and, just as importantly, what it keeps.
+    #[test]
+    fn an_unprivileged_peer_is_told_where_windows_are_but_not_what_they_are() {
+        let windows = [WindowState {
+            id: 7,
+            title: "Bitwarden - Vault".into(),
+            app_id: "org.keepassxc.KeePassXC".into(),
+            output: "DP-1".into(),
+            workspace: 2,
+            focused: true,
+        }];
+        let [redacted] = redacted_windows(&windows).try_into().ok().unwrap();
+        assert_eq!(redacted.title, "");
+        assert_eq!(redacted.app_id, "");
+        // Everything a bar draws with survives: a workspace still knows how
+        // many windows it holds, and `focus-window` still has an id to take.
+        assert_eq!(redacted.id, 7);
+        assert_eq!(redacted.output, "DP-1");
+        assert_eq!(redacted.workspace, 2);
+        assert!(redacted.focused);
+
+        let scratchpads = [ScratchpadState {
+            name: "terminal".into(),
+            app_id: "paw2-terminal".into(),
+            loaded: true,
+            visible: false,
+            output: Some("DP-1".into()),
+        }];
+        let [redacted] = redacted_scratchpads(&scratchpads).try_into().ok().unwrap();
+        assert_eq!(redacted.app_id, "");
+        // The name is the handle every scratchpad command takes, and it came
+        // out of the user's own config rather than off a window.
+        assert_eq!(redacted.name, "terminal");
+        assert!(redacted.loaded);
+    }
 
     #[test]
     fn take_lines_keeps_a_partial_command_buffered() {

@@ -156,20 +156,36 @@ direct_scanout = true
 #vrr = "automatic"
 
 [security]
-# Clients allowed to bind the privileged globals: the window list
-# (ext-foreign-toplevel-list-v1), per-window capture, and the clipboard manager
-# interface (ext-data-control-v1, which sees every copy as it happens).
+# Clients allowed the privileged view of the desktop: the window list
+# (ext-foreign-toplevel-list-v1), per-window capture, the clipboard manager
+# interface (ext-data-control-v1, which sees every copy as it happens), and the
+# control socket's window titles, config and quit command.
 # Everything else can still capture whole outputs, so grim and wf-recorder work
-# without an entry. Matched against the basename of the connecting process's
-# executable, so a clipboard history tool needs whatever binary actually
-# connects - for `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
-# The four below are also the default; naming this key replaces the list.
+# without an entry, and still gets workspaces and layout on the control socket -
+# just not window titles.
+#
+# An entry with a / in it is matched against the connecting process's whole
+# executable path, which is the form worth using: a bare name matches that
+# filename anywhere, including a copy under /tmp. Paths are resolved first, so
+# name the real binary rather than a wrapper symlink - `quickshell`, not `qs`.
+# Changing this list needs a Paw2 restart.
+#
+# The two below are the default; naming this key replaces the list, so keep
+# them unless you want to break screen sharing.
 privileged_clients = [
   "xdg-desktop-portal-wlr",
   "xdg-desktop-portal",
-  "wl-paste",
-  "wl-copy",
 ]
+
+# A clipboard history tool is deliberately NOT in the default: this list gates
+# ext-data-control-v1, which streams every copy - passwords included - to
+# whatever holds it. Add the binary that actually connects if you want one; for
+# `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
+#privileged_clients = [
+#  "xdg-desktop-portal-wlr",
+#  "xdg-desktop-portal",
+#  "/usr/bin/wl-paste",
+#]
 
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
