@@ -16,10 +16,6 @@ ignore = [
 ]
 
 [licenses]
-# Paw2 itself has no licence yet (see README "Licensing"), and is never
-# published, so it is skipped rather than given one here - that is a decision
-# for the project, not for its dependency gate.
-private = { ignore = true }
 # What the dependency tree is actually allowed to bring in.
 allow = [
     "MIT",
