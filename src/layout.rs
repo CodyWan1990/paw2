@@ -2179,21 +2179,21 @@ impl Paw2 {
         self.sync_focus();
     }
 
-    pub fn set_fullscreen(&mut self, surface: &ToplevelSurface, requested: Option<Output>) {
+    pub fn set_fullscreen(&mut self, surface: &ToplevelSurface) {
         let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() else {
             surface.send_configure();
             return;
         };
-        self.fullscreen_managed_window(window, requested);
+        self.fullscreen_managed_window(window);
     }
 
     pub fn set_x11_fullscreen(&mut self, surface: &smithay::xwayland::X11Surface) {
         if let Some(window) = self.window_for_x11_surface(surface).cloned() {
-            self.fullscreen_managed_window(window, None);
+            self.fullscreen_managed_window(window);
         }
     }
 
-    fn fullscreen_managed_window(&mut self, window: Window, requested: Option<Output>) {
+    fn fullscreen_managed_window(&mut self, window: Window) {
         let Some((source_monitor, source_workspace, source_window)) =
             self.scroller
                 .monitors
@@ -2214,15 +2214,9 @@ impl Paw2 {
             return;
         };
 
-        let target_monitor = requested
-            .as_ref()
-            .and_then(|output| {
-                self.scroller
-                    .monitors
-                    .iter()
-                    .position(|monitor| monitor.output == *output)
-            })
-            .unwrap_or(source_monitor);
+        // The client's requested output is only a hint. Keep fullscreen windows
+        // on the monitor where Paw2 originally placed them.
+        let target_monitor = source_monitor;
         let target_workspace = self.scroller.monitors[target_monitor].active_workspace;
 
         if (source_monitor, source_workspace) != (target_monitor, target_workspace) {
@@ -2327,7 +2321,7 @@ impl Paw2 {
         if is_fullscreen {
             self.unfullscreen_window(&window);
         } else {
-            self.fullscreen_managed_window(window, None);
+            self.fullscreen_managed_window(window);
         }
     }
 

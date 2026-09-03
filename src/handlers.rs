@@ -18,7 +18,6 @@ use smithay::{
         pointer::{Focus, PointerHandle},
         tablet::TabletSeatHandler,
     },
-    output::Output,
     reexports::{
         calloop::Interest,
         wayland_server::{
@@ -414,9 +413,8 @@ impl XdgShellHandler for Paw2 {
     ) {
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
-        let output = output.as_ref().and_then(Output::from_resource);
-        self.set_fullscreen(&surface, output);
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        self.set_fullscreen(&surface);
         crate::drm::redraw(self);
     }
 
