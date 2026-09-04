@@ -111,6 +111,8 @@ const OVERVIEW_SHADOW_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
 /// Logical pixels, held constant across zoom levels so the selection stays
 /// legible however far the workspaces are shrunk.
 const OVERVIEW_RING_WIDTH: i32 = 3;
+const UNFOCUSED_RING_WIDTH: i32 = 1;
+const UNFOCUSED_RING_COLOR: [f32; 4] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0];
 
 const UPSAMPLE_SHADER: &str = r#"#version 100
 
@@ -492,6 +494,7 @@ pub struct Effects {
     /// ring is: a fresh `PixelShaderElement` takes a fresh id every frame, and
     /// the damage tracker would then repaint it forever.
     shadows: HashMap<(String, Id), PixelShaderElement>,
+    unfocused_rings: HashMap<(String, Id), PixelShaderElement>,
     blur_programs: Option<BlurPrograms>,
     blur_commit: CommitCounter,
     window_program: Option<GlesTexProgram>,
@@ -543,6 +546,7 @@ impl Effects {
             ring_program,
             shadow_program,
             shadows: HashMap::new(),
+            unfocused_rings: HashMap::new(),
             blur_programs,
             blur_commit: CommitCounter::default(),
             window_program,
@@ -573,6 +577,9 @@ impl Effects {
     ) -> Result<Vec<PawRenderElements>, OutputNoMode> {
         let appearance = state.config.appearance;
         if self.appearance != appearance {
+            if self.appearance.corner_radius != appearance.corner_radius {
+                self.unfocused_rings.clear();
+            }
             if self.appearance.blur_radius != appearance.blur_radius {
                 self.blur_commit.increment();
             }
@@ -687,6 +694,9 @@ impl Effects {
                 .transform_size(output.current_mode().ok_or(OutputNoMode)?.size),
         );
         let mut elements = Vec::with_capacity(space_elements.len() + 4);
+        let focused_root = state
+            .focused_window_render_state(output)
+            .map(|(_, root)| root);
         let mut focus_ring = self.focus_ring(state, output);
         let mut tab_elements = self.tab_elements(renderer, state, output, scale);
 
@@ -708,9 +718,12 @@ impl Effects {
             if shadow.is_some() {
                 shadowed.push(element.id().clone());
             }
-            let focused = focus_ring
-                .as_ref()
-                .is_some_and(|(_, id)| id == element.id());
+            let focused = focused_root.as_ref().is_some_and(|id| id == element.id());
+            let unfocused_ring = if focused {
+                None
+            } else {
+                self.unfocused_ring(&output_name, element.id(), window_state)
+            };
             let tab = tab_elements
                 .iter()
                 .position(|(root, _)| root == element.id())
@@ -724,6 +737,7 @@ impl Effects {
                         .map(|(ring, _)| PawRenderElements::Shader(ring)),
                 );
             }
+            elements.extend(unfocused_ring.map(PawRenderElements::Shader));
             elements.extend(blur.into_iter().map(PawRenderElements::Blur));
             // Last, so it draws first and everything else lands on top of it.
             elements.extend(shadow.map(PawRenderElements::Shader));
@@ -733,6 +747,8 @@ impl Effects {
         // ponytail: linear lookup, bounded by the windows on one workspace.
         self.shadows
             .retain(|(name, id), _| *name != output_name || shadowed.contains(id));
+        self.unfocused_rings
+            .retain(|(name, id), _| *name != output_name || window_states.contains_key(id));
         self.with_scratchpad_overview(renderer, state, output, elements)
     }
 
@@ -1216,6 +1232,35 @@ impl Effects {
         // Only bumps the commit counter when the area actually moved.
         ring.resize(area, None);
         Some((ring.clone(), root))
+    }
+
+    fn unfocused_ring(
+        &mut self,
+        output_name: &str,
+        element: &Id,
+        window_state: Option<WindowRenderState>,
+    ) -> Option<PixelShaderElement> {
+        let program = self.ring_program.clone()?;
+        let area = ring_area(window_state?.frame, UNFOCUSED_RING_WIDTH);
+        let ring = self
+            .unfocused_rings
+            .entry((output_name.to_owned(), element.clone()))
+            .or_insert_with(|| {
+                PixelShaderElement::new(
+                    program,
+                    area,
+                    None,
+                    1.0,
+                    vec![
+                        Uniform::new("corner_radius", self.appearance.corner_radius as f32),
+                        Uniform::new("ring_width", UNFOCUSED_RING_WIDTH as f32),
+                        Uniform::new("ring_color", UNFOCUSED_RING_COLOR),
+                    ],
+                    Kind::Unspecified,
+                )
+            });
+        ring.resize(area, None);
+        Some(ring.clone())
     }
 
     /// The shadow for one window, or `None` for anything that is not a window's
