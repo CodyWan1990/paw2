@@ -22,8 +22,9 @@ edges.
 - Rounded corners, shadows, blur, transparency, and animations
 - Screenshots and screen sharing through standard Wayland protocols
 - Live-reloading TOML configuration
-- An optional [Quickshell desktop](../paw2-shell/) for the bar, launcher,
-  notifications, and settings
+- An optional
+  [Quickshell desktop](https://github.com/CodyWan1990/paw2-shell) for the bar,
+  launcher, notifications, and settings
 
 Paw2 does not require its optional shell. Waybar, layer-shell wallpaper tools,
 `grim`, and `xdg-desktop-portal-wlr` can be used directly.
