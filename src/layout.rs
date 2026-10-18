@@ -138,12 +138,41 @@ pub(crate) struct OverviewWorkspace {
     pub windows: Vec<OverviewWindow>,
 }
 
-pub(crate) struct TabBar {
-    pub id: usize,
+/// The bar above a window: its titlebar, or its tab group's bar, which is a
+/// titlebar with a title per tab.
+pub(crate) struct TitleBar {
+    pub key: BarKey,
     pub root: Id,
+    /// Output-local.
     pub geometry: Rectangle<i32, Logical>,
     pub titles: Vec<String>,
+    /// The windows behind `titles`, in the same order.
+    pub windows: Vec<Window>,
     pub active: usize,
+    /// Drawn in the focus ring's colour, as the ring's top edge.
+    pub focused: bool,
+    /// The float/tile and close buttons, shown on titlebars but not on a bare
+    /// tab bar.
+    pub buttons: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BarKey {
+    TabGroup(usize),
+    Window(usize),
+}
+
+/// Where on a bar a click lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BarPart {
+    Title,
+    Float,
+    Close,
+}
+
+/// The two buttons at a titlebar's right end are squares as tall as the bar.
+pub(crate) fn bar_buttons_width(buttons: bool, height: i32) -> i32 {
+    if buttons { height * 2 } else { 0 }
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +240,8 @@ pub(crate) enum FloatingEdge {
 }
 
 pub(crate) enum MouseOperation {
+    /// A press on a titlebar: a click until the pointer travels, then a move.
+    PressTitle { window: Window },
     MoveScratchpad {
         name: String,
         initial_location: Point<i32, Logical>,
@@ -1368,6 +1399,8 @@ impl Scrollers {
                     let (title, app_id) = crate::screencopy::window_metadata(window);
                     windows.push(crate::ipc::WindowState {
                         id: window.id(),
+                        // Filled in by the IPC flush, which owns the toplevel list.
+                        identifier: String::new(),
                         title,
                         app_id,
                         output: monitor.name.clone(),
@@ -1405,6 +1438,9 @@ pub struct Scrollers {
     animations: HashMap<usize, WindowAnimation>,
     manual_floating: HashMap<usize, ManualFloating>,
     drag_preview: Option<usize>,
+    /// The last press on a titlebar - window and time in ms - so a second
+    /// one on the same window soon after counts as a double-click.
+    last_title_press: Option<(usize, u32)>,
     scratchpads: HashMap<String, ScratchpadRuntime>,
     scratchpad_geometry: HashMap<String, HashMap<String, SavedScratchpadGeometry>>,
     scratchpad_state_path: Option<PathBuf>,
@@ -1896,6 +1932,18 @@ impl Paw2 {
             return;
         };
         self.focus_window(&window);
+    }
+
+    /// Ask a window to close, as `close_window` does for the focused one.
+    pub fn close_window_by_id(&mut self, id: usize) {
+        let Some(window) = self.toplevel_window(id) else {
+            return;
+        };
+        if let Some(surface) = window.toplevel() {
+            surface.send_close();
+        } else if let Some(surface) = window.x11_surface() {
+            let _ = surface.close();
+        }
     }
 
     pub fn add_window(&mut self, surface: ToplevelSurface) {
@@ -3092,14 +3140,17 @@ impl Paw2 {
             workspace.windows.get(workspace.focused?)?
         };
         let client = monitor.space.element_geometry(window)?;
-        let frame = monitor
-            .active()
-            .tab_group_index(window)
-            .map_or(client, |_| tab_outer_rectangle(client));
+        let frame = if has_bar(monitor.active(), window, &self.config) {
+            bar_outer_rectangle(client, bar_height(&self.config))
+        } else {
+            client
+        };
         Some((frame, Id::from_wayland_resource(&window_surface(window)?)))
     }
 
-    pub(crate) fn tab_bars(&self, output: &Output) -> Vec<TabBar> {
+    /// Every bar on `output`'s active workspace: one per tab group, and one per
+    /// other window with a titlebar.
+    pub(crate) fn title_bars(&self, output: &Output) -> Vec<TitleBar> {
         if self.overview_visible() || self.scratchpad_overview_visible_on(output) {
             return Vec::new();
         }
@@ -3113,36 +3164,54 @@ impl Paw2 {
         else {
             return Vec::new();
         };
-        monitor
-            .active()
-            .tab_groups
-            .iter()
-            .filter_map(|group| {
-                let active = group.windows.get(group.active)?;
-                let client = monitor.space.element_geometry(active)?;
-                let mut geometry = tab_outer_rectangle(client);
-                geometry.size.h = TAB_BAR_HEIGHT;
-                geometry.loc -= output_location;
-                Some(TabBar {
-                    id: group.id,
-                    root: Id::from_wayland_resource(&window_surface(active)?),
-                    geometry,
-                    titles: group
-                        .windows
-                        .iter()
-                        .map(|window| {
-                            let (title, app_id) = crate::screencopy::window_metadata(window);
-                            if title.is_empty() { app_id } else { title }
-                        })
-                        .collect(),
-                    active: group.active,
-                })
+        let workspace = monitor.active();
+        let height = bar_height(&self.config);
+        let buttons = self.config.appearance.titlebars;
+        let focused = self.focused_window_render_state(output).map(|(_, id)| id);
+        let title = |window: &Window| {
+            let (title, app_id) = crate::screencopy::window_metadata(window);
+            if title.is_empty() { app_id } else { title }
+        };
+        let bar = |key: BarKey, windows: Vec<Window>, active: usize| {
+            let shown = windows.get(active)?;
+            if !has_bar(workspace, shown, &self.config) {
+                return None;
+            }
+            let root = Id::from_wayland_resource(&window_surface(shown)?);
+            let mut geometry = bar_outer_rectangle(monitor.space.element_geometry(shown)?, height);
+            geometry.size.h = height;
+            geometry.loc -= output_location;
+            Some(TitleBar {
+                key,
+                focused: focused.as_ref() == Some(&root),
+                root,
+                geometry,
+                titles: windows.iter().map(title).collect(),
+                windows,
+                active,
+                buttons,
             })
-            .collect()
+        };
+
+        let grouped = workspace.tab_groups.iter().filter_map(|group| {
+            bar(
+                BarKey::TabGroup(group.id),
+                group.windows.clone(),
+                group.active,
+            )
+        });
+        let single = workspace
+            .windows
+            .iter()
+            .filter(|window| workspace.tab_group_index(window).is_none())
+            .filter_map(|window| bar(BarKey::Window(window.id()), vec![window.clone()], 0));
+        grouped.chain(single).collect()
     }
 
-    pub(crate) fn tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
-        if !self.config.layout.tab_grouping {
+    /// The window and part of the bar under `position`, if a bar is there and
+    /// nothing covers it.
+    pub(crate) fn title_bar_at(&self, position: Point<f64, Logical>) -> Option<(Window, BarPart)> {
+        if self.session_locked() {
             return None;
         }
         let monitor = self.monitor_at(position)?;
@@ -3155,13 +3224,13 @@ impl Paw2 {
             return None;
         }
         drop(layers);
-        self.uncovered_tab_at(position)
+        self.uncovered_title_bar_at(position)
     }
 
-    /// Tab hit testing used while `surface_under` already holds Smithay's
+    /// Bar hit testing used while `surface_under` already holds Smithay's
     /// per-output layer-map lock. This must not acquire that lock itself.
-    fn uncovered_tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
-        if !self.config.layout.tab_grouping {
+    fn uncovered_title_bar_at(&self, position: Point<f64, Logical>) -> Option<(Window, BarPart)> {
+        if !self.config.layout.tab_grouping && !self.config.appearance.titlebars {
             return None;
         }
         let monitor = self.monitor_at(position)?;
@@ -3170,37 +3239,48 @@ impl Paw2 {
             .space
             .element_under(position)
             .map(|(window, _)| window);
-        for bar in self.tab_bars(&monitor.output) {
+        for bar in self.title_bars(&monitor.output) {
             let mut geometry = bar.geometry;
             geometry.loc += output_location;
             if !geometry.to_f64().contains(position) {
                 continue;
             }
-            let group = monitor
-                .active()
-                .tab_groups
-                .iter()
-                .find(|group| group.id == bar.id)?;
-            if covering.is_some_and(|window| !group.windows.contains(window)) {
+            if covering.is_some_and(|window| !bar.windows.contains(window)) {
                 return None;
             }
             let relative = (position.x - f64::from(geometry.loc.x)).max(0.0);
-            return group
-                .windows
-                .get(tab_index_at(
-                    relative,
-                    geometry.size.w,
-                    group.windows.len(),
-                )?)
-                .cloned();
+            let titles_width = geometry.size.w - bar_buttons_width(bar.buttons, geometry.size.h);
+            if relative >= f64::from(titles_width) {
+                let active = bar.windows.get(bar.active)?.clone();
+                let part = if relative >= f64::from(titles_width + geometry.size.h) {
+                    BarPart::Close
+                } else {
+                    BarPart::Float
+                };
+                return Some((active, part));
+            }
+            let index = tab_index_at(relative, titles_width, bar.windows.len())?;
+            return Some((bar.windows.get(index)?.clone(), BarPart::Title));
         }
         None
     }
 
-    fn active_tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
-        let member = self.tab_at(position)?;
+    /// The window whose title is under `position`: a tab of a group, or a
+    /// window's own titlebar.
+    pub(crate) fn tab_at(&self, position: Point<f64, Logical>) -> Option<Window> {
+        self.title_bar_at(position)
+            .filter(|(_, part)| *part == BarPart::Title)
+            .map(|(window, _)| window)
+    }
+
+    /// The window a bar under `position` belongs to - for a tab group, the tab
+    /// on show.
+    fn bar_window_at(&self, position: Point<f64, Logical>) -> Option<Window> {
+        let (member, _) = self.title_bar_at(position)?;
         let monitor = self.monitor_at(position)?;
-        let group = monitor.active().tab_group_index(&member)?;
+        let Some(group) = monitor.active().tab_group_index(&member) else {
+            return Some(member);
+        };
         let tab_group = &monitor.active().tab_groups[group];
         tab_group.windows.get(tab_group.active).cloned()
     }
@@ -3306,9 +3386,11 @@ impl Paw2 {
                 let element = Id::from_wayland_resource(&window_surface(window)?);
                 let mut client = monitor.space.element_geometry(window)?;
                 client.loc -= output_location;
-                let frame = workspace
-                    .tab_group_index(window)
-                    .map_or(client, |_| tab_outer_rectangle(client));
+                let frame = if has_bar(workspace, window, &self.config) {
+                    bar_outer_rectangle(client, bar_height(&self.config))
+                } else {
+                    client
+                };
                 let fade = self
                     .scroller
                     .animations
@@ -3397,6 +3479,7 @@ impl Paw2 {
             });
         }
         drop(layers);
+        self.send_lock_frames(output, time);
 
         self.unblock_surfaces(output, |surface, states| {
             if surface_primary_scanout_output(surface, states)
@@ -3583,8 +3666,11 @@ impl Paw2 {
     }
 
     pub fn window_under(&self, position: Point<f64, Logical>) -> Option<Window> {
+        if self.session_locked() {
+            return None;
+        }
         let monitor = self.monitor_at(position)?;
-        if let Some(window) = self.active_tab_at(position) {
+        if let Some(window) = self.bar_window_at(position) {
             return Some(window);
         }
         if let Some((window, _)) = monitor.space.element_under(position)
@@ -3617,6 +3703,9 @@ impl Paw2 {
     }
 
     pub fn keyboard_layer_under(&self, position: Point<f64, Logical>) -> Option<WlSurface> {
+        if self.session_locked() {
+            return None;
+        }
         let monitor = self.monitor_at(position)?;
         let geometry = monitor.space.output_geometry(&monitor.output)?;
         let local = position - geometry.loc.to_f64();
@@ -3637,6 +3726,9 @@ impl Paw2 {
         &self,
         position: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if self.session_locked() {
+            return self.lock_surface_under(position);
+        }
         let monitor = self.monitor_at(position)?;
         let output_geometry = monitor.space.output_geometry(&monitor.output)?;
         let local = position - output_geometry.loc.to_f64();
@@ -3683,7 +3775,7 @@ impl Paw2 {
                     })
             });
         }
-        if overlay.is_none() && top.is_none() && self.uncovered_tab_at(position).is_some() {
+        if overlay.is_none() && top.is_none() && self.uncovered_title_bar_at(position).is_some() {
             return None;
         }
         overlay
@@ -3768,12 +3860,14 @@ impl Paw2 {
                 ..
             } = monitor;
             let workspace = &mut workspaces[*active_workspace];
-            let tabbed = workspace
-                .tab_groups
+            // Windows with a bar above them, which comes out of their tile.
+            let barred = workspace
+                .windows
                 .iter()
-                .filter_map(|group| group.windows.get(group.active))
+                .filter(|window| has_bar(workspace, window, &self.config))
                 .map(Window::id)
                 .collect::<Vec<_>>();
+            let bar = bar_height(&self.config);
             for window in workspace.tab_groups.iter().flat_map(|group| {
                 group
                     .windows
@@ -3846,11 +3940,6 @@ impl Paw2 {
                 // Sizes the window, then glides it from wherever it currently sits.
                 let mut place =
                     |window: &Window, rectangle: Rectangle<i32, Logical>, client_sized: bool| {
-                        let rectangle = if tabbed.contains(&window.id()) {
-                            tab_client_rectangle(rectangle)
-                        } else {
-                            rectangle
-                        };
                         configure_window(window, rectangle, client_sized);
                         let current = space.element_location(window);
                         let position = start_motion(
@@ -3867,6 +3956,8 @@ impl Paw2 {
                 for (window, rectangle) in &placements {
                     let rectangle = if workspace.fullscreen.as_ref() == Some(window) {
                         output_geometry
+                    } else if barred.contains(&window.id()) {
+                        bar_client_rectangle(*rectangle, bar)
                     } else {
                         *rectangle
                     };
@@ -3878,9 +3969,15 @@ impl Paw2 {
                     let rectangle = if fullscreen {
                         output_geometry
                     } else {
+                        // A floating window keeps its own size; its bar comes out
+                        // of the room above it instead.
                         floating_rectangle(
                             window,
-                            geometry,
+                            if barred.contains(&window.id()) {
+                                bar_client_rectangle(geometry, bar)
+                            } else {
+                                geometry
+                            },
                             override_,
                             floating_locations.get(&window.id()).copied(),
                         )
@@ -4039,6 +4136,14 @@ impl Paw2 {
     }
 
     pub(crate) fn sync_focus(&mut self) {
+        if self.session_locked() {
+            // Nothing but the lock surface may hold the keyboard, not even
+            // an exclusive layer surface. Popup grabs end with their focus.
+            let focus = self.lock_keyboard_focus().map(KeyboardFocus::Surface);
+            self.keyboard()
+                .set_focus(self, focus, SERIAL_COUNTER.next_serial());
+            return;
+        }
         let active_output = self.scroller.focused_output.clone();
         let exclusive = self.exclusive_keyboard_surface();
         if exclusive.is_some() && self.scroller.overview.take().is_some() {
@@ -4825,9 +4930,10 @@ fn overview_window_placements(
         .collect()
     };
 
+    let bar = bar_height(config);
     for (window, rectangle) in &mut placements {
-        if workspace.tab_group_index(window).is_some() {
-            *rectangle = tab_client_rectangle(*rectangle);
+        if has_bar(workspace, window, config) {
+            *rectangle = bar_client_rectangle(*rectangle, bar);
         }
     }
     placements.extend(
@@ -4836,6 +4942,11 @@ fn overview_window_placements(
             .iter()
             .filter(|window| workspace.is_floating(window))
             .map(|window| {
+                let area = if has_bar(workspace, window, config) {
+                    bar_client_rectangle(area, bar)
+                } else {
+                    area
+                };
                 (
                     window.clone(),
                     floating_rectangle(window, area, manual_floating.get(&window.id()), None),
@@ -4845,16 +4956,44 @@ fn overview_window_placements(
     placements
 }
 
-fn tab_client_rectangle(mut outer: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
-    let height = TAB_BAR_HEIGHT.min((outer.size.h - 1).max(0));
+/// How tall the bar above a window is: the titlebar height while titlebars are
+/// on, else a tab group's fixed one.
+fn bar_height(config: &Config) -> i32 {
+    if config.appearance.titlebars {
+        config.appearance.titlebar_height
+    } else {
+        TAB_BAR_HEIGHT
+    }
+}
+
+/// Whether a bar sits above `window`: its tab group's, or its own titlebar.
+/// Never on a fullscreen window, and never on a scratchpad, which the
+/// workspace does not lay out.
+fn has_bar(workspace: &Workspace, window: &Window, config: &Config) -> bool {
+    workspace.windows.contains(window)
+        && workspace.fullscreen.as_ref() != Some(window)
+        && (workspace.tab_group_index(window).is_some()
+            || (config.appearance.titlebars && crate::decoration::has_titlebar(window)))
+}
+
+/// The window's own part of a tile whose top `height` pixels are its bar.
+fn bar_client_rectangle(
+    mut outer: Rectangle<i32, Logical>,
+    height: i32,
+) -> Rectangle<i32, Logical> {
+    let height = height.min((outer.size.h - 1).max(0));
     outer.loc.y += height;
     outer.size.h -= height;
     outer
 }
 
-fn tab_outer_rectangle(mut client: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
-    client.loc.y -= TAB_BAR_HEIGHT;
-    client.size.h += TAB_BAR_HEIGHT;
+/// A window plus the bar above it.
+fn bar_outer_rectangle(
+    mut client: Rectangle<i32, Logical>,
+    height: i32,
+) -> Rectangle<i32, Logical> {
+    client.loc.y -= height;
+    client.size.h += height;
     client
 }
 
@@ -5504,6 +5643,28 @@ mod tests {
                 serial_number: "Unknown".into(),
             },
         )
+    }
+
+    #[test]
+    fn a_bar_comes_out_of_the_top_of_its_tile() {
+        let tile = Rectangle::new((10, 20).into(), (400, 300).into());
+        let client = bar_client_rectangle(tile, 28);
+        assert_eq!(client, Rectangle::new((10, 48).into(), (400, 272).into()));
+        assert_eq!(bar_outer_rectangle(client, 28), tile);
+        // A tile shorter than its bar still leaves the window a pixel.
+        let squashed = bar_client_rectangle(Rectangle::new((0, 0).into(), (100, 10).into()), 28);
+        assert_eq!(squashed.size.h, 1);
+    }
+
+    #[test]
+    fn titlebars_set_the_bar_height_and_make_room_for_buttons() {
+        let mut config = crate::config::defaults();
+        assert_eq!(bar_height(&config), TAB_BAR_HEIGHT);
+        config.appearance.titlebars = true;
+        config.appearance.titlebar_height = 30;
+        assert_eq!(bar_height(&config), 30);
+        assert_eq!(bar_buttons_width(true, 30), 60);
+        assert_eq!(bar_buttons_width(false, 30), 0);
     }
 
     #[test]

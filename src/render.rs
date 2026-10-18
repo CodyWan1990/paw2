@@ -50,7 +50,7 @@ use smithay::{
 
 use crate::{
     config::AppearanceConfig,
-    layout::{WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
+    layout::{BarKey, WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
     state::Paw2,
 };
 
@@ -352,6 +352,32 @@ where
     source.render_elements(renderer, location, scale, 1.0)
 }
 
+/// What a locked output shows: its lock surface, over the black clear colour.
+/// An output whose locker has not drawn yet - or whose locker crashed - is
+/// left black.
+fn lock_elements(
+    renderer: &mut GlesRenderer,
+    state: &Paw2,
+    output: &Output,
+) -> Vec<PawRenderElements> {
+    let Some(surface) = state.lock_surface_for(output) else {
+        return Vec::new();
+    };
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    // `Cursor` is the variant that carries plain surface-tree elements.
+    smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+        renderer,
+        surface.wl_surface(),
+        (0, 0),
+        scale,
+        1.0,
+        smithay::backend::renderer::element::Kind::Unspecified,
+    )
+    .into_iter()
+    .map(PawRenderElements::Cursor)
+    .collect()
+}
+
 fn zoomed(
     elements: impl IntoIterator<Item = WaylandSurfaceRenderElement<GlesRenderer>>,
     zoom: f64,
@@ -366,33 +392,95 @@ fn zoomed(
     })
 }
 
-fn tab_buffer(
+/// What a bar looks like, as far as drawing it goes.
+struct BarLook<'a> {
+    titles: &'a [String],
+    active: usize,
+    focused: bool,
+    buttons: bool,
+    focus_color: [f32; 4],
+    bar_color: [f32; 4],
+}
+
+fn to_bytes(color: [f32; 4]) -> [u8; 3] {
+    let [r, g, b, _] = color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+    [r, g, b]
+}
+
+/// Dark text on a light bar, light text on a dark one.
+fn text_on(background: [u8; 3]) -> [u8; 3] {
+    let [r, g, b] = background.map(f32::from);
+    let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+    if luminance > 0.55 {
+        [20, 20, 24]
+    } else {
+        [255, 255, 255]
+    }
+}
+
+fn fill(
+    pixels: &mut [u8],
+    width: usize,
+    xs: std::ops::Range<usize>,
+    height: usize,
+    color: [u8; 3],
+) {
+    for y in 0..height {
+        for x in xs.clone() {
+            let pixel = (y * width + x) * 4;
+            pixels[pixel..pixel + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+        }
+    }
+}
+
+/// Lays `color` over one pixel at `coverage` (0-255).
+fn blend(pixels: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 3], coverage: u16) {
+    let pixel = (y * width + x) * 4;
+    for (channel, target) in pixels[pixel..pixel + 3].iter_mut().zip(color) {
+        *channel = ((*channel as u16 * (255 - coverage) + target as u16 * coverage) / 255) as u8;
+    }
+}
+
+fn title_buffer(
     font: &Font,
     size: Size<i32, Physical>,
     scale: f32,
-    titles: &[String],
-    active: usize,
-    focus_color: [f32; 4],
+    look: &BarLook,
 ) -> MemoryRenderBuffer {
+    MemoryRenderBuffer::from_slice(
+        &title_pixels(font, size, scale, look),
+        // The pixels are written R, G, B, A, which is Abgr8888 in DRM's
+        // little-endian naming (Argb8888 would swap red and blue).
+        Fourcc::Abgr8888,
+        (size.w, size.h),
+        1,
+        Transform::Normal,
+        None,
+    )
+}
+
+/// A titlebar - or a tab group's bar - as pixels: each title in its share of
+/// the width, then, on a titlebar, a float/tile square and a close cross.
+fn title_pixels(font: &Font, size: Size<i32, Physical>, scale: f32, look: &BarLook) -> Vec<u8> {
     let width = size.w as usize;
     let height = size.h as usize;
     let mut pixels = vec![0_u8; width * height * 4];
     let font_size = 13.0 * scale;
     let padding = (8.0 * scale).round() as usize;
-    for (index, title) in titles.iter().enumerate() {
-        let start = index * width / titles.len();
-        let end = (index + 1) * width / titles.len();
-        let color = if index == active {
-            focus_color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
-        } else {
-            [31, 31, 36, 255]
-        };
-        for y in 0..height {
-            for x in start..end {
-                let pixel = (y * width + x) * 4;
-                pixels[pixel..pixel + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
-            }
-        }
+    let focus = to_bytes(look.focus_color);
+    let plain = to_bytes(look.bar_color);
+    let buttons_width =
+        (crate::layout::bar_buttons_width(look.buttons, size.h) as usize).min(width);
+    let titles_width = width - buttons_width;
+
+    for (index, title) in look.titles.iter().enumerate() {
+        let start = index * titles_width / look.titles.len();
+        let end = (index + 1) * titles_width / look.titles.len();
+        // A bare tab bar always marks its active tab; a titlebar only does so
+        // while its window has the focus, as the top of the focus ring.
+        let highlighted = index == look.active && (look.focused || !look.buttons);
+        let background = if highlighted { focus } else { plain };
+        fill(&mut pixels, width, start..end, height, background);
 
         let available = end.saturating_sub(start + padding * 2) as f32;
         let title = fitted_tab_title(font, title, font_size, available);
@@ -407,6 +495,7 @@ fn tab_buffer(
             ..LayoutSettings::default()
         });
         layout.append(&[font], &TextStyle::new(&title, font_size, 0));
+        let text = text_on(background);
         for glyph in layout.glyphs() {
             let (_, coverage) = font.rasterize_config(glyph.key);
             for glyph_y in 0..glyph.height {
@@ -417,22 +506,91 @@ fn tab_buffer(
                         continue;
                     }
                     let alpha = coverage[glyph_y * glyph.width + glyph_x] as u16;
-                    let pixel = (y as usize * width + x as usize) * 4;
-                    for channel in &mut pixels[pixel..pixel + 3] {
-                        *channel = (((*channel as u16) * (255 - alpha) + 255 * alpha) / 255) as u8;
-                    }
+                    blend(&mut pixels, width, x as usize, y as usize, text, alpha);
                 }
             }
         }
     }
-    MemoryRenderBuffer::from_slice(
-        &pixels,
-        Fourcc::Argb8888,
-        (size.w, size.h),
-        1,
-        Transform::Normal,
-        None,
-    )
+
+    if buttons_width > 0 {
+        let background = if look.focused { focus } else { plain };
+        fill(&mut pixels, width, titles_width..width, height, background);
+        let ink = text_on(background);
+        let button = buttons_width / 2;
+        draw_button_icon(
+            &mut pixels,
+            width,
+            titles_width,
+            button,
+            height,
+            scale,
+            ink,
+            ButtonIcon::Float,
+        );
+        draw_button_icon(
+            &mut pixels,
+            width,
+            titles_width + button,
+            button,
+            height,
+            scale,
+            ink,
+            ButtonIcon::Close,
+        );
+    }
+
+    pixels
+}
+
+#[derive(Clone, Copy)]
+enum ButtonIcon {
+    Float,
+    Close,
+}
+
+/// A titlebar button's icon, centred in its square, anti-aliased by each
+/// pixel's distance from the stroke: a square outline for float/tile, a cross
+/// for close.
+#[allow(clippy::too_many_arguments)]
+fn draw_button_icon(
+    pixels: &mut [u8],
+    width: usize,
+    left: usize,
+    side: usize,
+    height: usize,
+    scale: f32,
+    ink: [u8; 3],
+    icon: ButtonIcon,
+) {
+    let half = side.min(height) as f32 * 0.18;
+    let stroke = (1.25 * scale).max(1.0);
+    let center_x = left as f32 + side as f32 / 2.0;
+    let center_y = height as f32 / 2.0;
+    for y in 0..height {
+        for x in left..(left + side).min(width) {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            let distance = match icon {
+                ButtonIcon::Float => {
+                    let outside = dx.abs().max(dy.abs());
+                    if outside > half + stroke {
+                        continue;
+                    }
+                    (outside - half).abs()
+                }
+                ButtonIcon::Close => {
+                    if dx.abs() > half + stroke || dy.abs() > half + stroke {
+                        continue;
+                    }
+                    (dx - dy).abs().min((dx + dy).abs()) / std::f32::consts::SQRT_2
+                }
+            };
+            let coverage = (stroke / 2.0 + 0.5 - distance).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(pixels, width, x, y, ink, (coverage * 255.0) as u16);
+            }
+        }
+    }
 }
 
 fn fitted_tab_title(font: &Font, title: &str, size: f32, available: f32) -> String {
@@ -474,7 +632,7 @@ fn fitted_tab_title(font: &Font, title: &str, size: f32, available: f32) -> Stri
 /// fullscreen window, the configured backdrop behind the overview's cards, and
 /// otherwise the near-black that shows through gaps.
 pub fn clear_color(state: &Paw2, output: &Output) -> [f32; 4] {
-    if state.renders_fullscreen(output) {
+    if state.session_locked() || state.renders_fullscreen(output) {
         [0.0, 0.0, 0.0, 1.0]
     } else if state.overview_visible() {
         state.config.overview.backdrop_color
@@ -515,13 +673,14 @@ pub struct Effects {
     /// `overview_ring` would make the two evict each other every frame.
     panel_ring: Option<((i32, i32), PixelShaderElement)>,
     tab_font: Font,
-    tab_buffers: HashMap<(String, usize), TabBuffer>,
+    tab_buffers: HashMap<(String, BarKey), TabBuffer>,
 }
 
 struct TabBuffer {
     size: Size<i32, Physical>,
     scale: u64,
     active: usize,
+    focused: bool,
     titles: Vec<String>,
     generation: usize,
     buffer: MemoryRenderBuffer,
@@ -615,6 +774,11 @@ impl Effects {
             }
         }
         state.advance_animations();
+        // Checked before anything else: while locked, nothing but the lock
+        // surface may reach the screen - or a capture of it.
+        if state.session_locked() {
+            return Ok(lock_elements(renderer, state, output));
+        }
         // Gated on visibility, not on input ownership: the closing animation
         // still has to be drawn after the overview has given focus back.
         if state.overview_visible() {
@@ -698,7 +862,7 @@ impl Effects {
             .focused_window_render_state(output)
             .map(|(_, root)| root);
         let mut focus_ring = self.focus_ring(state, output);
-        let mut tab_elements = self.tab_elements(renderer, state, output, scale);
+        let mut tab_elements = self.title_elements(renderer, state, output, scale);
 
         let output_name = output.name();
         // One pass over the windows on this output, not one per element - and
@@ -767,7 +931,8 @@ impl Effects {
         Ok(overview)
     }
 
-    fn tab_elements(
+    /// The titlebars and tab bars on `output`, each paired with the window it sits on.
+    fn title_elements(
         &mut self,
         renderer: &mut GlesRenderer,
         state: &Paw2,
@@ -775,8 +940,8 @@ impl Effects {
         scale: Scale<f64>,
     ) -> Vec<(Id, MemoryRenderBufferRenderElement<GlesRenderer>)> {
         let output_name = output.name();
-        let bars = state.tab_bars(output);
-        let active_ids = bars.iter().map(|bar| bar.id).collect::<Vec<_>>();
+        let bars = state.title_bars(output);
+        let active_ids = bars.iter().map(|bar| bar.key).collect::<Vec<_>>();
         self.tab_buffers
             .retain(|(name, id), _| *name != output_name || active_ids.contains(id));
         bars.into_iter()
@@ -785,23 +950,29 @@ impl Effects {
                 if size.w <= 0 || size.h <= 0 {
                     return None;
                 }
-                let key = (output_name.clone(), bar.id);
+                let key = (output_name.clone(), bar.key);
                 let scale_bits = scale.x.to_bits();
                 let cached = self.tab_buffers.get(&key).is_some_and(|cached| {
                     cached.size == size
                         && cached.scale == scale_bits
                         && cached.active == bar.active
+                        && cached.focused == bar.focused
                         && cached.titles == bar.titles
                         && cached.generation == self.generation
                 });
                 if !cached {
-                    let buffer = tab_buffer(
+                    let buffer = title_buffer(
                         &self.tab_font,
                         size,
                         scale.x as f32,
-                        &bar.titles,
-                        bar.active,
-                        self.appearance.focus_ring_color,
+                        &BarLook {
+                            titles: &bar.titles,
+                            active: bar.active,
+                            focused: bar.focused,
+                            buttons: bar.buttons,
+                            focus_color: self.appearance.focus_ring_color,
+                            bar_color: self.appearance.titlebar_color,
+                        },
                     );
                     self.tab_buffers.insert(
                         key.clone(),
@@ -809,6 +980,7 @@ impl Effects {
                             size,
                             scale: scale_bits,
                             active: bar.active,
+                            focused: bar.focused,
                             titles: bar.titles,
                             generation: self.generation,
                             buffer,
@@ -1879,6 +2051,9 @@ mod tests {
             blur_radius: 0,
             transparency: false,
             opacity: 1.0,
+            titlebars: false,
+            titlebar_height: 24,
+            titlebar_color: [0.0, 0.0, 0.0, 1.0],
         }
     }
 
@@ -2080,6 +2255,45 @@ mod tests {
             (area.loc.x + area.size.w) - (window.loc.x + window.size.w),
             3
         );
+    }
+
+    #[test]
+    fn titlebars_mark_focus_and_draw_their_buttons() {
+        let font = Font::from_bytes(
+            include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+            FontSettings::default(),
+        )
+        .unwrap();
+        let size = Size::from((300, 24));
+        let titles = ["kitty".to_string()];
+        let look = |focused| BarLook {
+            titles: &titles,
+            active: 0,
+            focused,
+            buttons: true,
+            focus_color: [1.0, 0.0, 0.0, 1.0],
+            bar_color: [0.0, 0.0, 1.0, 1.0],
+        };
+        let pixel = |data: &[u8], x: usize, y: usize| {
+            let offset = (y * 300 + x) * 4;
+            [data[offset], data[offset + 1], data[offset + 2]]
+        };
+        let focused = title_pixels(&font, size, 1.0, &look(true));
+        let unfocused = title_pixels(&font, size, 1.0, &look(false));
+        // Top-left corner: the focus colour only while focused.
+        assert_eq!(pixel(&focused, 1, 1), [255, 0, 0]);
+        assert_eq!(pixel(&unfocused, 1, 1), [0, 0, 255]);
+        // The close button is the last 24 px: ink at its centre, the cross.
+        assert_eq!(pixel(&unfocused, 300 - 12, 12), [255, 255, 255]);
+        // The float/tile button before it is an outline, hollow in the middle.
+        assert_eq!(pixel(&unfocused, 300 - 36, 12), [0, 0, 255]);
+    }
+
+    #[test]
+    fn bar_text_stays_readable_on_light_colours() {
+        assert_eq!(text_on([255, 255, 255]), [20, 20, 24]);
+        assert_eq!(text_on([122, 162, 247]), [20, 20, 24]);
+        assert_eq!(text_on([31, 31, 36]), [255, 255, 255]);
     }
 
     #[test]

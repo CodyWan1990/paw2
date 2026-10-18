@@ -363,7 +363,7 @@ impl Paw2 {
     /// Take the pointer for a compositor-side drag - a move, a resize, a tab
     /// regroup. `focus` is the surface the grab started over, which the grab
     /// hands back to the client when it lets go.
-    fn start_mouse_grab(
+    pub(crate) fn start_mouse_grab(
         &mut self,
         pointer: &smithay::input::pointer::PointerHandle<Self>,
         operation: MouseOperation,
@@ -389,12 +389,14 @@ impl Paw2 {
     }
 
     pub fn process_input<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        self.note_user_activity();
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
                 let key_state = event.state();
-                let inhibited = self.keyboard_inhibited();
+                // While locked only `quit` runs, as under a shortcuts inhibitor.
+                let inhibited = self.keyboard_inhibited() || self.session_locked();
                 let action = self.keyboard().input::<Option<_>, _>(
                     self,
                     event.key_code(),
@@ -407,8 +409,9 @@ impl Paw2 {
                         };
 
                         if key_state == KeyState::Pressed {
-                            let overview = state.overview_active();
-                            let scratchpad_overview = state.scratchpad_overview_active();
+                            let locked = state.session_locked();
+                            let overview = !locked && state.overview_active();
+                            let scratchpad_overview = !locked && state.scratchpad_overview_active();
                             // An open overview claims its navigation keys first,
                             // then everything else falls through to the normal
                             // bindings - so the key that opened it closes it.
@@ -627,10 +630,17 @@ impl Paw2 {
 
                 if event.state() == ButtonState::Pressed
                     && event.button_code() == BTN_LEFT
-                    && let Some(window) = tab
+                    && !pointer.is_grabbed()
+                    && let Some((window, part)) = self.title_bar_at(location)
                 {
                     self.focus_output_at(location);
                     self.focus_window(&window);
+                    if let Some(operation) = self.press_title_bar(window, part, event.time_msec()) {
+                        self.start_mouse_grab(
+                            &pointer, operation, None, BTN_LEFT, location, serial,
+                        );
+                        self.forward_button::<I>(&pointer, &event, serial);
+                    }
                     return;
                 }
 
@@ -684,6 +694,7 @@ impl Paw2 {
                     return;
                 }
                 if source == AxisSource::Wheel
+                    && !self.session_locked()
                     && let Some(amount) = event.amount_v120(Axis::Vertical)
                     && amount != 0.0
                 {

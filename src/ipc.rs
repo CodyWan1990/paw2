@@ -16,27 +16,26 @@
 //!
 //! Every process running as the user can reach this socket - the path is even
 //! published as `PAW2_SOCKET` in the D-Bus activation environment - so peers are
-//! sorted the same way Wayland clients are, by [`state::is_privileged_client`]
-//! against `[security] privileged_clients`.
+//! sorted the same way Wayland clients are, by [`state::client_trust`]: a
+//! program installed by the package manager is trusted, anything else is not.
 //!
-//! - **Allowlisted**: everything. Window titles, the merged config, and `quit`.
+//! - **Trusted**: everything. Window titles, the merged config, and `quit`.
 //! - **Anyone else**: workspace occupancy, active layout, monitor modes, and the
 //!   commands that steer the compositor. Window titles and app IDs come back
 //!   empty, no `config` message is sent, and `quit` is refused.
 //!
-//! Without that split this socket would hand out exactly what the allowlist on
-//! `ext-foreign-toplevel-list-v1` exists to withhold, which made the allowlist
+//! Without that split this socket would hand out exactly what the trust check on
+//! `ext-foreign-toplevel-list-v1` exists to withhold, which made that check
 //! decorative: an application that could not ask Wayland what windows were open
 //! could just ask here instead. It is a *reduced* view rather than a refused
 //! connection so that a bar which only draws workspaces needs no configuration,
-//! and a misjudged allowlist entry costs blank titles rather than a shell that
-//! never connects and cannot say why.
+//! and a shell running from a user-writable path costs blank titles rather
+//! than a shell that never connects and cannot say why.
 //!
-//! The allowlist is read at connect time from the config Paw2 started with;
-//! like the Wayland globals it gates, changing it needs a restart.
+//! Trust is decided once, at connect time, like the Wayland globals it mirrors.
 //!
-//! None of this is a sandbox. See [`state::is_privileged_client`] for what the
-//! check is actually worth.
+//! None of this is a sandbox. See [`state::client_trust`] for what the check
+//! is actually worth.
 
 use std::{
     collections::VecDeque,
@@ -56,11 +55,14 @@ use crate::{
     state::{self, Paw2},
 };
 
-/// A window, as a panel needs it. `id` is the same identity
-/// `ext-foreign-toplevel-list-v1` hands out, so the two views agree.
+/// A window, as a panel needs it. `id` is Paw2's own handle, the one every
+/// window command takes; `identifier` is the string
+/// `ext-foreign-toplevel-list-v1` hands out for the same window, so a shell can
+/// join the two views exactly instead of guessing by title.
 #[derive(Clone, Serialize, PartialEq)]
 pub struct WindowState {
     pub id: usize,
+    pub identifier: String,
     pub title: String,
     pub app_id: String,
     pub output: String,
@@ -252,7 +254,7 @@ fn accept(state: &mut Paw2, stream: UnixStream) {
     };
     // Resolved here, once, while the peer is still the process that connected.
     let privileged =
-        state::is_privileged_client(&stream, &state.config.security.privileged_clients);
+        state::client_trust(&stream, &state.config.security.clipboard_clients).privileged;
     let id = state.ipc.next_id;
     state.ipc.next_id += 1;
 
@@ -345,6 +347,9 @@ enum Command {
     FocusWindow {
         id: usize,
     },
+    CloseWindow {
+        id: usize,
+    },
     SetLayout {
         layout: Option<LayoutMode>,
         output: Option<String>,
@@ -362,6 +367,7 @@ enum Command {
         name: String,
     },
     ToggleScratchpadOverview,
+    ToggleOverview,
     Quit,
     // No set-config: settings are changed by writing config.d/, which the
     // config watcher picks up within half a second.
@@ -402,6 +408,7 @@ fn run(state: &mut Paw2, line: &str, privileged: bool) {
     match command {
         Command::FocusWorkspace { index, .. } => state.run_action(Action::SwitchWorkspace(index)),
         Command::FocusWindow { id } => state.focus_window_by_id(id),
+        Command::CloseWindow { id } => state.close_window_by_id(id),
         Command::SetLayout { layout, .. } => {
             state.run_action(layout.map_or(Action::CycleLayout, Action::SwitchLayout))
         }
@@ -410,6 +417,7 @@ fn run(state: &mut Paw2, line: &str, privileged: bool) {
         Command::HideScratchpad { name } => state.hide_scratchpad(&name),
         Command::ResetScratchpad { name } => state.reset_scratchpad(&name),
         Command::ToggleScratchpadOverview => state.toggle_scratchpad_overview(),
+        Command::ToggleOverview => state.run_action(Action::ToggleOverview),
         Command::Quit => state.run_action(Action::Quit),
     }
 }
@@ -430,7 +438,10 @@ pub fn flush(state: &mut Paw2) {
     state.ipc.dirty = false;
     state.ipc.config_dirty = false;
 
-    let (outputs, windows) = state.scroller.ipc_state();
+    let (outputs, mut windows) = state.scroller.ipc_state();
+    for window in &mut windows {
+        window.identifier = state.toplevel_identifier(window.id).unwrap_or_default();
+    }
     let scratchpads = state.scratchpad_ipc_state();
     let layouts = state
         .config
@@ -442,7 +453,7 @@ pub fn flush(state: &mut Paw2) {
 
     // Each view is serialised at most once per flush, and only when a peer of
     // that kind is actually connected - which for the usual session of one
-    // allowlisted shell means the redacted copy is never built at all.
+    // trusted shell means the redacted copy is never built at all.
     let any_privileged = state.ipc.clients.iter().any(|client| client.privileged);
     let any_ordinary = state.ipc.clients.iter().any(|client| !client.privileged);
 
@@ -513,7 +524,7 @@ pub fn flush(state: &mut Paw2) {
 /// `privileged` is the load-bearing term and is *not* implied by the caller
 /// having a config to send: that is built whenever **any** connected peer is
 /// privileged. Dropping this term is the bug where an ordinary peer connecting
-/// alongside an allowlisted shell gets greeted with the whole config - which is
+/// alongside an trusted shell gets greeted with the whole config - which is
 /// exactly what happened, and why this is a named function with a test rather
 /// than a condition inline in `flush`.
 fn owes_config(privileged: bool, config_changed: bool, greeted: bool) -> bool {
@@ -525,13 +536,16 @@ fn owes_config(privileged: bool, config_changed: bool, greeted: bool) -> bool {
 ///
 /// The identity stays so a bar can still count windows per workspace and send
 /// `focus-window`; the title and app ID are the disclosure, and they are the
-/// same two fields `ext-foreign-toplevel-list-v1` is allowlisted for.
+/// same two fields `ext-foreign-toplevel-list-v1` is gated for.
 fn redacted_windows(windows: &[WindowState]) -> Vec<WindowState> {
     windows
         .iter()
         .map(|window| WindowState {
             title: String::new(),
             app_id: String::new(),
+            // Only useful against the foreign-toplevel list, which this peer
+            // was not given either.
+            identifier: String::new(),
             ..window.clone()
         })
         .collect()
@@ -598,7 +612,7 @@ mod tests {
         assert!(!owes_config(true, false, false));
 
         // The regression: an ordinary peer is owed the config on no path at
-        // all, including the one where an allowlisted shell sharing the flush
+        // all, including the one where an trusted shell sharing the flush
         // means a serialised config is sitting right there.
         assert!(!owes_config(false, true, true));
         assert!(!owes_config(false, false, true));
@@ -611,6 +625,7 @@ mod tests {
     fn an_unprivileged_peer_is_told_where_windows_are_but_not_what_they_are() {
         let windows = [WindowState {
             id: 7,
+            identifier: "a1b2c3".into(),
             title: "Bitwarden - Vault".into(),
             app_id: "org.keepassxc.KeePassXC".into(),
             output: "DP-1".into(),
@@ -620,6 +635,7 @@ mod tests {
         let [redacted] = redacted_windows(&windows).try_into().ok().unwrap();
         assert_eq!(redacted.title, "");
         assert_eq!(redacted.app_id, "");
+        assert_eq!(redacted.identifier, "");
         // Everything a bar draws with survives: a workspace still knows how
         // many windows it holds, and `focus-window` still has an id to take.
         assert_eq!(redacted.id, 7);

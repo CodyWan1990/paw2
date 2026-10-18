@@ -167,6 +167,14 @@ impl Paw2 {
             .and_then(|(window, _)| window.upgrade())
     }
 
+    /// The `ext-foreign-toplevel-list-v1` identifier of a mapped window.
+    pub(crate) fn toplevel_identifier(&self, id: usize) -> Option<String> {
+        self.screencopy_state
+            .toplevels
+            .get(&id)
+            .map(|(_, handle)| handle.identifier())
+    }
+
     pub(crate) fn capture_window_metadata_changed(&mut self, window: &Window) {
         self.ipc.touch();
         let Some((_, handle)) = self.screencopy_state.toplevels.get(&window.id()) else {

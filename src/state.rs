@@ -45,13 +45,14 @@ use smithay::{
         pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
+        security_context::SecurityContextState,
         selection::{
             data_device::DataDeviceState, ext_data_control::DataControlState,
             primary_selection::PrimarySelectionState,
         },
         shell::{
             wlr_layer::WlrLayerShellState,
-            xdg::{XdgShellState, dialog::XdgDialogState},
+            xdg::{XdgShellState, decoration::XdgDecorationState, dialog::XdgDialogState},
         },
         shm::ShmState,
         single_pixel_buffer::SinglePixelBufferState,
@@ -115,6 +116,8 @@ pub struct Paw2 {
     pub workspace_state: WorkspaceState,
     pub screencopy_state: ScreencopyState,
     pub ipc: IpcState,
+    pub session: crate::session::SessionState,
+    pub gamma: crate::gamma::GammaState,
 }
 
 /// Whether the compositor is on its way out.
@@ -154,6 +157,8 @@ impl Paw2 {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
         XdgDialogState::new::<Self>(&display_handle);
+        // Answered in `decoration`: Paw2 draws titlebars for apps that ask.
+        XdgDecorationState::new::<Self>(&display_handle);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -180,15 +185,18 @@ impl Paw2 {
             PrimarySelectionState::new_with_filter::<Self, _>(&display_handle, move |_| {
                 enabled.load(Ordering::Relaxed)
             });
-        // Clipboard managers read every copy the moment it happens, so this sits
-        // behind the same allowlist as the window list rather than being there
-        // for the taking. The default allowlist covers the usual wl-clipboard
-        // pairing; another manager needs its own entry in [security].
+        // Clipboard managers read every copy the moment it happens, so this is
+        // only for the programs named in `[security] clipboard_clients`.
         let data_control_state = DataControlState::new::<Self, _>(
             &display_handle,
             middle_click_paste.then_some(&primary_selection_state),
-            is_privileged,
+            is_clipboard_client,
         );
+        // Lets a sandbox such as Flatpak hand its apps a socket of their own,
+        // so Paw2 knows they are sandboxed whatever their binary is called. A
+        // sandboxed client must not see this global, or it could open a fresh
+        // socket that looks unsandboxed.
+        SecurityContextState::new::<Self, _>(&display_handle, is_unsandboxed);
         // Both are handled entirely inside smithay's surface renderer, which
         // Paw2 already goes through; neither needs anything of its own here.
         ViewporterState::new::<Self>(&display_handle);
@@ -196,6 +204,8 @@ impl Paw2 {
         AlphaModifierState::new::<Self>(&display_handle);
         let workspace_state = WorkspaceState::new(&display_handle);
         let screencopy_state = ScreencopyState::new(&display_handle);
+        let session = crate::session::SessionState::new(&display_handle, event_loop.handle());
+        let gamma = crate::gamma::GammaState::new(&display_handle);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "paw2");
@@ -255,6 +265,8 @@ impl Paw2 {
             workspace_state,
             screencopy_state,
             ipc: IpcState::default(),
+            session,
+            gamma,
         }
     }
 
@@ -315,16 +327,8 @@ impl Paw2 {
                 // globals only get a `&Client`, and reaching credentials from
                 // there would mean storing a `DisplayHandle` inside data the
                 // display itself owns.
-                let privileged =
-                    is_privileged_client(&stream, &state.config.security.privileged_clients);
-                // Refusing one client must never end the session: hitting the
-                // open-file limit is recoverable, losing every running program is not.
-                if let Err(error) = state
-                    .display_handle
-                    .insert_client(stream, Arc::new(ClientState::new(privileged)))
-                {
-                    tracing::warn!(?error, "failed to accept Wayland client");
-                }
+                let trust = client_trust(&stream, &state.config.security.clipboard_clients);
+                state.accept_client(stream, ClientState::new(trust));
             })
             .expect("failed to listen for Wayland clients");
 
@@ -342,20 +346,44 @@ impl Paw2 {
 
         socket_name
     }
+
+    /// Hand a connected stream to the Wayland display.
+    pub fn accept_client(&mut self, stream: UnixStream, client_state: ClientState) {
+        // Refusing one client must never end the session: hitting the
+        // open-file limit is recoverable, losing every running program is not.
+        if let Err(error) = self
+            .display_handle
+            .insert_client(stream, Arc::new(client_state))
+        {
+            tracing::warn!(?error, "failed to accept Wayland client");
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     /// Whether this client may bind the globals that expose other clients'
-    /// windows. See [`is_privileged_client`] for what that is worth.
+    /// windows. See [`client_trust`] for what that is worth.
     pub privileged: bool,
+    /// Whether this client may watch the clipboard through `ext-data-control`.
+    pub clipboard: bool,
+    /// Connected through a sandbox's security-context socket. Never privileged.
+    pub sandboxed: bool,
 }
 
 impl ClientState {
-    fn new(privileged: bool) -> Self {
+    fn new(trust: ClientTrust) -> Self {
         Self {
-            privileged,
+            privileged: trust.privileged,
+            clipboard: trust.clipboard,
+            ..Default::default()
+        }
+    }
+
+    pub fn sandboxed() -> Self {
+        Self {
+            sandboxed: true,
             ..Default::default()
         }
     }
@@ -370,53 +398,97 @@ impl ClientData for ClientState {
 /// foreign-toplevel list, per-window capture, and workspace control.
 ///
 /// Whole-output capture is deliberately not gated on this, so `grim` and
-/// `wf-recorder` keep working with no allowlist entry.
+/// `wf-recorder` keep working for everyone.
 pub fn is_privileged(client: &Client) -> bool {
     client
         .get_data::<ClientState>()
         .is_some_and(|state| state.privileged)
 }
 
-/// Whether a connecting peer may bind the privileged globals, or read the
-/// privileged half of the control socket.
+/// Client filter for globals no sandboxed app may see: the security-context
+/// global itself (or it could open a fresh socket that looks unsandboxed), and
+/// session locking and idle reporting.
+pub(crate) fn is_unsandboxed(client: &Client) -> bool {
+    !client
+        .get_data::<ClientState>()
+        .is_some_and(|state| state.sandboxed)
+}
+
+/// Client filter for `ext-data-control`, which sees every copy as it happens.
+fn is_clipboard_client(client: &Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_some_and(|state| state.clipboard)
+}
+
+/// What a connecting, unsandboxed peer is allowed to see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClientTrust {
+    /// Window titles, per-window capture, and the privileged control socket.
+    pub privileged: bool,
+    /// The clipboard, through `ext-data-control`.
+    pub clipboard: bool,
+}
+
+/// Decide what a peer may see from the program it is running.
 ///
-/// Reads the peer's executable rather than `/proc/<pid>/comm`, which truncates
-/// to 15 bytes and would collapse every `xdg-desktop-portal-*` binary onto the
-/// same string.
+/// A program installed by the package manager is trusted with window titles
+/// and per-window capture; anything a user account could have written - a
+/// game under `~`, a download, a copy in `/tmp` - is not. That makes bars,
+/// shells and the screen-sharing portal work with no setup on any distro,
+/// while the programs most likely to be nosy stay out. The clipboard is more
+/// sensitive, so it also needs an entry in `clipboard_clients`.
 ///
-/// This is a soft boundary and must not be described as more. The peer
-/// credentials are spoofable, and there is a narrow race: `socket_peercred`
-/// captures the pid at connect time and `/proc/<pid>/exe` is read after, so a
-/// peer that exits in between lets a reused pid answer for it.
+/// The executable is read from `/proc/<pid>/exe` rather than `comm`, which
+/// truncates to 15 bytes and would collapse every `xdg-desktop-portal-*` binary
+/// onto the same string.
 ///
-/// What it is *not* is trivially bypassable by reading the compositor's memory
-/// instead: `main::restrict_process_memory` marks Paw2 non-dumpable, so a
-/// same-user process cannot ptrace it and a crash leaves no core dump.
-/// `wp_security_context_v1` is the mechanism that would replace all of this
-/// properly. What this buys today is that an ordinary application can no longer
-/// enumerate every window title just by connecting to something that was there
-/// for the taking.
-pub(crate) fn is_privileged_client(stream: &UnixStream, allowlist: &[String]) -> bool {
+/// This is a soft boundary and must not be described as more. A same-user
+/// process can still run a trusted program and drive it, and there is a narrow
+/// race: `socket_peercred` captures the pid at connect time and
+/// `/proc/<pid>/exe` is read after, so a peer that exits in between lets a
+/// reused pid answer for it. Sandboxed apps are handled properly, through
+/// `wp_security_context_v1`, and never reach this function.
+pub(crate) fn client_trust(stream: &UnixStream, clipboard_clients: &[String]) -> ClientTrust {
     // `std::os::unix::net::UnixStream::peer_cred` is still nightly-only.
     let Ok(peer) = smithay::reexports::rustix::net::sockopt::socket_peercred(stream) else {
-        return false;
+        return ClientTrust::default();
     };
     let Ok(executable) = std::fs::read_link(format!("/proc/{}/exe", peer.pid.as_raw_nonzero()))
     else {
-        return false;
+        return ClientTrust::default();
     };
-    allowlisted(&executable, allowlist)
+    let privileged = installed_by_root(&executable);
+    ClientTrust {
+        privileged,
+        clipboard: privileged && allowlisted(&executable, clipboard_clients),
+    }
 }
 
-/// Split from [`is_privileged_client`] so the matching rule is testable without
-/// a live socket.
+/// Whether only root could have put this file here: it and every directory
+/// above it are owned by root and writable by nobody else.
 ///
-/// An entry containing a `/` is matched against the whole resolved path, which
-/// is the form that actually pins down *which* binary is meant. A bare name
-/// matches that basename anywhere, because the compiled default has to name the
-/// desktop portal on distributions that disagree about `/usr/lib` versus
-/// `/usr/libexec`. `/proc/<pid>/exe` resolves symlinks, so an entry has to name
-/// the real binary rather than a wrapper link.
+/// A deleted executable reads back as `/path (deleted)`, which does not exist
+/// and so is never trusted.
+fn installed_by_root(executable: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    const GROUP_OR_OTHER_WRITABLE: u32 = 0o022;
+    executable.is_absolute()
+        && executable.ancestors().all(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.uid() == 0 && metadata.mode() & GROUP_OR_OTHER_WRITABLE == 0
+            })
+        })
+}
+
+/// Split from [`client_trust`] so the matching rule is testable without a live
+/// socket.
+///
+/// An entry containing a `/` is matched against the whole resolved path. A bare
+/// name matches that basename, which is safe only because [`client_trust`]
+/// checks [`installed_by_root`] first. `/proc/<pid>/exe` resolves symlinks, so
+/// an entry has to name the real binary rather than a wrapper link.
 fn allowlisted(executable: &Path, allowlist: &[String]) -> bool {
     let name = executable.file_name().and_then(|name| name.to_str());
     allowlist.iter().any(|allowed| {
@@ -433,52 +505,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_allowlisted_executables_are_privileged() {
-        let allowlist = ["xdg-desktop-portal-wlr".to_string()];
-        assert!(allowlisted(
-            Path::new("/usr/lib/xdg-desktop-portal-wlr"),
-            &allowlist
-        ));
-        // Matched on the basename, so the install prefix does not matter.
-        assert!(allowlisted(
-            Path::new("/usr/local/libexec/xdg-desktop-portal-wlr"),
-            &allowlist
-        ));
+    fn only_allowlisted_executables_match() {
+        let allowlist = ["wl-paste".to_string()];
+        assert!(allowlisted(Path::new("/usr/bin/wl-paste"), &allowlist));
         // A prefix of an allowed name is not an allowed name.
-        assert!(!allowlisted(
-            Path::new("/usr/lib/xdg-desktop-portal"),
-            &allowlist
-        ));
+        assert!(!allowlisted(Path::new("/usr/bin/wl-past"), &allowlist));
         assert!(!allowlisted(Path::new("/usr/bin/kitty"), &allowlist));
-        // An empty allowlist privileges nobody.
-        assert!(!allowlisted(
-            Path::new("/usr/lib/xdg-desktop-portal-wlr"),
-            &[]
-        ));
+
+        // A path entry pins down exactly one binary, and mixes with bare names.
+        let mixed = ["/usr/bin/cliphist".to_string(), "wl-paste".to_string()];
+        assert!(allowlisted(Path::new("/usr/bin/cliphist"), &mixed));
+        assert!(!allowlisted(Path::new("/usr/local/bin/cliphist"), &mixed));
+        assert!(allowlisted(Path::new("/usr/local/bin/wl-paste"), &mixed));
     }
 
     #[test]
-    fn an_absolute_entry_pins_the_whole_path() {
-        let allowlist = ["/usr/bin/quickshell".to_string()];
-        assert!(allowlisted(Path::new("/usr/bin/quickshell"), &allowlist));
-        // The point of the absolute form: a copy under any other name-alike
-        // path is not the binary that was allowed.
-        assert!(!allowlisted(Path::new("/tmp/quickshell"), &allowlist));
-        assert!(!allowlisted(
-            Path::new("/home/user/.local/bin/quickshell"),
-            &allowlist
-        ));
-        // A bare name in the same list still matches anywhere, so the two forms
-        // can be mixed - which is what the shipped default does.
-        let mixed = [
-            "/usr/bin/quickshell".to_string(),
-            "xdg-desktop-portal-wlr".to_string(),
-        ];
-        assert!(allowlisted(
-            Path::new("/usr/libexec/xdg-desktop-portal-wlr"),
-            &mixed
-        ));
-        assert!(allowlisted(Path::new("/usr/bin/quickshell"), &mixed));
-        assert!(!allowlisted(Path::new("/tmp/quickshell"), &mixed));
+    fn system_programs_are_installed_by_root() {
+        // Present on every distribution Paw2 supports.
+        assert!(installed_by_root(Path::new("/usr/bin/env")));
+    }
+
+    #[test]
+    fn user_writable_programs_are_not_installed_by_root() {
+        // The test binary itself lives in the user's build directory.
+        let test_binary = std::env::current_exe().unwrap();
+        assert!(!installed_by_root(&test_binary));
+        // `/tmp` is root-owned but writable by everyone.
+        assert!(!installed_by_root(Path::new("/tmp")));
+        assert!(!installed_by_root(Path::new("/usr/bin/env (deleted)")));
+        assert!(!installed_by_root(Path::new("usr/bin/env")));
     }
 }

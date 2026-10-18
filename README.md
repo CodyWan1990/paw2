@@ -16,11 +16,13 @@ edges.
 
 - Scrolling, dwindle, master-stack, and monocle tiling layouts
 - Nine workspaces per monitor, floating windows, tabs, and scratchpads
+- Optional titlebars with float and close buttons, for apps that let Paw2 decorate them
 - Multiple displays with fractional scaling and per-monitor VRR
 - Direct scanout for compatible fullscreen games
 - Rootless XWayland for Steam and legacy games
 - Rounded corners, shadows, blur, transparency, and animations
 - Screenshots and screen sharing through standard Wayland protocols
+- Screen locking, idle notifications, and night light for desktop shells
 - Live-reloading TOML configuration
 - An optional
   [Quickshell desktop](https://github.com/CodyWan1990/paw2-shell) for the bar,
@@ -163,10 +165,12 @@ xdp-wlr chooser.
 ## Security
 
 Paw2 restricts interfaces that can reveal window titles, clipboard contents,
-or individual window images. The default allowlist includes the desktop portal
-needed for screen sharing but no clipboard manager. See the `[security]`
-section in [`EXAMPLE.toml`](EXAMPLE.toml) before granting another program that
-access.
+or individual window images. Programs installed by your package manager, such
+as the screen-sharing portal and your bar, get that access automatically.
+Games, downloads, and anything else under your home folder do not, and neither
+do Flatpak apps. No program can watch the clipboard unless you list it; see the
+`[security]` section in [`EXAMPLE.toml`](EXAMPLE.toml) to add a clipboard
+manager.
 
 This is a useful boundary, not an application sandbox. Only run software you
 trust inside your desktop session.
@@ -176,7 +180,6 @@ trust inside your desktop session.
 - Tearing control when Smithay's asynchronous page-flip support is stable
 - Hardware-safe fullscreen direct scanout
 - External display tools through `wlr-output-management`
-- Session locking and idle notifications
 - Packages for more distributions
 
 ## License

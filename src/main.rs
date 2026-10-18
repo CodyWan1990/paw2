@@ -3,13 +3,16 @@
 mod backend;
 mod config;
 mod cursor;
+mod decoration;
 mod drm;
+mod gamma;
 mod handlers;
 mod input;
 mod ipc;
 mod layout;
 mod render;
 mod screencopy;
+mod session;
 mod state;
 mod workspace;
 mod xwayland;
@@ -94,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.set_middle_click_paste(state.config.input.middle_click_paste);
                     state.reconcile_scratchpads();
                     state.reconcile_tab_grouping();
+                    state.reconcile_decorations();
                     state.relayout(true);
                     drm::redraw(state);
                     state.ipc.publish_config(
@@ -103,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("reloaded configuration");
                     if restart_required {
                         tracing::warn!(
-                            "backend, monitor placement, VRR, startup focus, autostart, privileged clients, Qt style, and font changes require restarting Paw2"
+                            "backend, monitor order, VRR, startup focus, autostart, clipboard clients, Qt style, and font changes require restarting Paw2"
                         );
                     }
                 }

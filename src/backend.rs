@@ -72,6 +72,7 @@ pub fn init(
                 );
                 smithay::desktop::layer_map_for_output(&output).arrange();
                 state.relayout(true);
+                state.configure_lock_surfaces();
             }
             WinitEvent::Input(event) => state.process_input(event),
             WinitEvent::Redraw => {
@@ -107,6 +108,11 @@ pub fn init(
                 })();
                 if let Err(error) = backend.submit(Some(&[damage])) {
                     tracing::warn!(?error, "failed to submit frame");
+                } else {
+                    // The nested window has no vblank to wait for: a submitted
+                    // frame is as presented as it gets.
+                    state.session_lock_frame_queued(&output);
+                    state.session_lock_frame_presented(&output);
                 }
                 sequence += 1;
                 if let Some(mut feedback) = feedback {

@@ -37,7 +37,6 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
         fractional_scale::{FractionalScaleHandler, with_fractional_scale},
-        idle_inhibit::IdleInhibitHandler,
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
             KeyboardShortcutsInhibitor,
@@ -47,6 +46,9 @@ use smithay::{
             PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
         },
         seat::WaylandFocus,
+        security_context::{
+            SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
+        },
         selection::{
             SelectionHandler,
             data_device::{
@@ -401,16 +403,53 @@ impl XdgShellHandler for Paw2 {
         surface.send_repositioned(token);
     }
 
-    fn move_request(&mut self, _surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+    /// A drag on the app's own header bar. Honoured only while the press it
+    /// names is still held, so an app cannot grab the pointer at will.
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+        let pointer = self.pointer();
+        if !pointer.has_grab(serial) {
+            return;
+        }
+        let Some(start) = pointer.grab_start_data() else {
+            return;
+        };
+        if let Some(operation) = self.app_move_operation(&surface, start.location) {
+            self.start_mouse_grab(
+                &pointer,
+                operation,
+                start.focus,
+                start.button,
+                start.location,
+                serial,
+            );
+        }
     }
 
+    /// A drag on the app's own window edge; see `move_request`.
     fn resize_request(
         &mut self,
-        _surface: ToplevelSurface,
+        surface: ToplevelSurface,
         _seat: wl_seat::WlSeat,
-        _serial: Serial,
-        _edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+        serial: Serial,
+        edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
     ) {
+        let pointer = self.pointer();
+        if !pointer.has_grab(serial) {
+            return;
+        }
+        let Some(start) = pointer.grab_start_data() else {
+            return;
+        };
+        if let Some(operation) = self.app_resize_operation(&surface, edges) {
+            self.start_mouse_grab(
+                &pointer,
+                operation,
+                start.focus,
+                start.button,
+                start.location,
+                serial,
+            );
+        }
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
@@ -716,13 +755,6 @@ impl KeyboardShortcutsInhibitHandler for Paw2 {
     }
 }
 
-impl IdleInhibitHandler for Paw2 {
-    // The protocol stays advertised so clients can inhibit, but Paw2 has no idle
-    // or DPMS timer for the inhibitors to suppress; there is nothing to record.
-    fn inhibit(&mut self, _surface: WlSurface) {}
-
-    fn uninhibit(&mut self, _surface: WlSurface) {}
-}
 impl OutputHandler for Paw2 {
     fn output_bound(&mut self, output: smithay::output::Output, wl_output: WlOutput) {
         self.workspace_state.output_bound(&output, &wl_output);
@@ -805,6 +837,23 @@ impl PrimarySelectionHandler for Paw2 {
 impl DataControlHandler for Paw2 {
     fn data_control_state(&mut self) -> &mut DataControlState {
         &mut self.data_control_state
+    }
+}
+impl SecurityContextHandler for Paw2 {
+    /// A sandbox opened a socket for one of its apps. Everything that connects
+    /// through it is sandboxed, whatever program it claims to be.
+    fn context_created(&mut self, source: SecurityContextListenerSource, context: SecurityContext) {
+        tracing::info!(
+            sandbox = ?context.sandbox_engine,
+            app_id = ?context.app_id,
+            "sandbox opened a Wayland socket"
+        );
+        let watched = self.loop_handle.insert_source(source, |stream, _, state| {
+            state.accept_client(stream, ClientState::sandboxed());
+        });
+        if let Err(error) = watched {
+            tracing::warn!(?error, "could not watch a sandbox's Wayland socket");
+        }
     }
 }
 impl DndGrabHandler for Paw2 {}

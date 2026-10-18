@@ -46,7 +46,7 @@ use smithay::{
             EventLoop, LoopHandle,
             timer::{TimeoutAction, Timer},
         },
-        drm::control::{Mode as DrmMode, ModeTypeFlags, connector, crtc},
+        drm::control::{Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, connector, crtc},
         input::Libinput,
         rustix::fs::OFlags,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
@@ -349,6 +349,7 @@ pub fn init(
                             Ok(None) => {}
                             Err(error) => warn!(?error, "failed to finish DRM frame"),
                         }
+                        state.session_lock_frame_presented(&output.output);
                         output.frame_pending = false;
                         output.repaint_scheduled = true;
                         repaint = Some((crtc, frame_duration(&output.output).mul_f64(0.6)));
@@ -422,7 +423,7 @@ pub fn init(
     event_loop
         .handle()
         .insert_source(session_notifier, move |event, _, state| {
-            with_backend(state, |backend, _| match event {
+            with_backend(state, |backend, state| match event {
                 SessionEvent::PauseSession => {
                     info!("session paused");
                     libinput.suspend();
@@ -440,6 +441,15 @@ pub fn init(
                         output.kms.reset_buffers();
                         output.frame_pending = false;
                         output.repaint_scheduled = false;
+                    }
+                    // Whoever held the VT may have loaded its own gamma ramp.
+                    for (name, ramp) in state.gamma.ramps() {
+                        if let Some(output) =
+                            backend.outputs.iter().find(|o| o.output.name() == name)
+                            && let Err(error) = backend.load_gamma(output.crtc, ramp)
+                        {
+                            warn!(%error, output = %name, "could not reload the gamma ramp");
+                        }
                     }
                 }
             });
@@ -541,6 +551,54 @@ fn with_backend(state: &mut Paw2, f: impl FnOnce(&mut DirectBackend, &mut Paw2))
     state.direct = Some(backend);
 }
 
+/// Entries per channel in `output`'s hardware gamma table, or `None` when it
+/// cannot be set: nested, or a CRTC with no gamma table at all.
+pub fn gamma_size(state: &mut Paw2, output: &Output) -> Option<u32> {
+    let mut size = None;
+    with_backend(state, |backend, _| {
+        size = backend
+            .outputs
+            .iter()
+            .find(|active| active.output == *output)
+            .and_then(|active| backend.manager.device().get_crtc(active.crtc).ok())
+            .map(|info| info.gamma_length())
+            .filter(|length| *length > 0);
+    });
+    size
+}
+
+/// Load `ramp` - red, green and blue back to back - into `output`'s gamma
+/// table; `None` restores the linear ramp.
+pub fn set_gamma(state: &mut Paw2, output: &Output, ramp: Option<&[u16]>) -> Result<(), String> {
+    let mut result = Err("no hardware gamma on this backend".to_string());
+    with_backend(state, |backend, _| {
+        let Some(crtc) = backend
+            .outputs
+            .iter()
+            .find(|active| active.output == *output)
+            .map(|active| active.crtc)
+        else {
+            result = Err("the output is not driven by DRM".to_string());
+            return;
+        };
+        result = match ramp {
+            Some(ramp) => backend.load_gamma(crtc, ramp),
+            None => backend
+                .manager
+                .device()
+                .get_crtc(crtc)
+                .map_err(|error| error.to_string())
+                .and_then(|info| {
+                    backend.load_gamma(
+                        crtc,
+                        &crate::gamma::linear_ramp(info.gamma_length() as usize),
+                    )
+                }),
+        };
+    });
+    result
+}
+
 pub fn redraw(state: &mut Paw2) {
     if crate::state::shutting_down() {
         return;
@@ -602,6 +660,7 @@ pub fn apply_monitor_changes(state: &mut Paw2, monitors: &[MonitorConfig]) -> Ve
     with_backend(state, |backend, state| {
         errors = backend.apply_monitor_changes(state, monitors)
     });
+    state.configure_lock_surfaces();
     errors
 }
 
@@ -710,7 +769,19 @@ impl DirectBackend {
         monitors: &[MonitorConfig],
     ) -> Vec<String> {
         let mut errors = Vec::new();
-        let mut geometry_changed = false;
+        // `state.config` is still the config being replaced, so this compares
+        // the old placement with the new one.
+        let configured_position = |monitors: &[MonitorConfig], name: &str| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.connector == name)
+                .and_then(|monitor| monitor.position)
+        };
+        let mut geometry_changed = self.outputs.iter().any(|active| {
+            let name = active.output.name();
+            configured_position(&state.config.monitors, &name)
+                != configured_position(monitors, &name)
+        });
         for active in &mut self.outputs {
             let Some(connector) = self
                 .scanner
@@ -789,7 +860,7 @@ impl DirectBackend {
         }
 
         if geometry_changed {
-            self.reflow_automatic_outputs(state);
+            self.reflow_automatic_outputs(state, monitors);
             for output in &self.outputs {
                 layer_map_for_output(&output.output).arrange();
             }
@@ -797,7 +868,9 @@ impl DirectBackend {
         errors
     }
 
-    fn reflow_automatic_outputs(&self, state: &mut Paw2) {
+    /// Places every output again: the ones `monitors` positions where it says,
+    /// the rest in the first free space from the left.
+    fn reflow_automatic_outputs(&self, state: &mut Paw2, monitors: &[MonitorConfig]) {
         let specifications = self
             .outputs
             .iter()
@@ -806,9 +879,7 @@ impl DirectBackend {
                 let name = active.output.name();
                 let scale = active.output.current_scale().fractional_scale();
                 let size = logical_output_size(mode, active.output.current_transform(), scale);
-                let position = state
-                    .config
-                    .monitors
+                let position = monitors
                     .iter()
                     .find(|monitor| monitor.connector == name)
                     .and_then(|monitor| monitor.position)
@@ -999,6 +1070,18 @@ impl DirectBackend {
         Ok(())
     }
 
+    /// The legacy gamma ioctl: atomic drivers implement it with their own
+    /// commit, so it needs nothing from the frame path.
+    fn load_gamma(&self, crtc: crtc::Handle, ramp: &[u16]) -> Result<(), String> {
+        let size = ramp.len() / 3;
+        let (red, rest) = ramp.split_at(size);
+        let (green, blue) = rest.split_at(size);
+        self.manager
+            .device()
+            .set_gamma(crtc, red, green, blue)
+            .map_err(|error| error.to_string())
+    }
+
     fn disconnect(
         &mut self,
         state: &mut Paw2,
@@ -1014,6 +1097,7 @@ impl DirectBackend {
         };
         let active = self.outputs.remove(index);
         state.screencopy_state.fail_output(&active.output);
+        state.gamma_output_removed(&active.output);
         // Removing the `wl_output` global is not a close. A bar or wallpaper
         // that pinned this output by name would otherwise keep a surface
         // nothing will ever draw.
@@ -1115,6 +1199,7 @@ impl DirectBackend {
                         warn!(?error, "failed to queue DRM frame");
                     } else {
                         active.frame_pending = true;
+                        state.session_lock_frame_queued(&active.output);
                         if active.direct_scanout_active != scanout_active {
                             active.direct_scanout_active = scanout_active;
                             debug!(output = %active.output.name(), direct_scanout = scanout_active, "DRM presentation path changed");
@@ -1251,6 +1336,11 @@ impl DirectBackend {
                     .output_elements(&mut self.renderer, state, &output)?;
                 let clear = clear_color(state, &output);
                 (output, scale, crop, elements, clear)
+            }
+            CaptureTarget::Window(_) if state.session_locked() => {
+                // Output capture shows the lock screen; a window has no
+                // locked view, so it is not captured at all.
+                return Err("windows cannot be captured while the session is locked".into());
             }
             CaptureTarget::Window(target) => {
                 let window = target.upgrade().ok_or("capture window disappeared")?;
@@ -1418,18 +1508,33 @@ fn automatic_position(
 
 fn automatic_positions(outputs: &[OutputPlacement]) -> Vec<Point<i32, Logical>> {
     let mut positions = vec![Point::default(); outputs.len()];
-    let mut occupied = outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (size, position))| {
-            let position = (*position)?;
-            positions[index] = position;
-            Some(Rectangle::new(position, *size))
-        })
-        .collect::<Vec<_>>();
-
+    // Configured positions first, in order. One that overlaps an earlier one
+    // is placed automatically instead, as at startup, so two monitors never
+    // share a spot.
+    let mut occupied = Vec::new();
+    let mut fixed = vec![false; outputs.len()];
     for (index, (size, position)) in outputs.iter().enumerate() {
-        if position.is_some() {
+        let Some(position) = *position else {
+            continue;
+        };
+        let geometry = Rectangle::new(position, *size);
+        if occupied
+            .iter()
+            .any(|placed: &Rectangle<i32, Logical>| placed.overlaps(geometry))
+        {
+            warn!(
+                ?position,
+                "monitor placement overlaps; using automatic placement"
+            );
+            continue;
+        }
+        positions[index] = position;
+        fixed[index] = true;
+        occupied.push(geometry);
+    }
+
+    for (index, (size, _)) in outputs.iter().enumerate() {
+        if fixed[index] {
             continue;
         }
         let mut x = 0;
@@ -1639,6 +1744,19 @@ mod tests {
         assert_eq!(
             automatic_positions(&outputs),
             [(0, 0).into(), (2560, 0).into(), (5120, 0).into()]
+        );
+    }
+
+    #[test]
+    fn an_overlapping_configured_position_is_placed_automatically() {
+        // DP-1 moved to the left while DP-2 still claims x = 0.
+        let outputs = [
+            ((2560, 1440).into(), Some((0, 0).into())),
+            ((2560, 1440).into(), Some((0, 0).into())),
+        ];
+        assert_eq!(
+            automatic_positions(&outputs),
+            [(0, 0).into(), (2560, 0).into()]
         );
     }
 

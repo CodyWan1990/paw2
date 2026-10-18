@@ -41,9 +41,9 @@ const FALLBACK_CONFIG: &str = r#"# Paw2's built-in fallback: enough to move arou
 # on here - gaps, rounded corners, blur, shadows, animations, the overview,
 # scratchpads, and the rest of the keybindings.
 #
-# The exceptions are the three sections at the bottom. Primary selection,
-# fullscreen scanout and the privileged-client allowlist are not decoration:
-# a session missing them reads as broken rather than as minimal.
+# The exceptions are the two sections at the bottom. Primary selection and
+# fullscreen scanout are not decoration: a session missing them reads as
+# broken rather than as minimal.
 #
 # The annotated reference for all of it is /usr/share/doc/paw2/EXAMPLE.toml.
 
@@ -82,12 +82,6 @@ middle_click_paste = true
 
 [backend]
 direct_scanout = true
-
-[security]
-privileged_clients = [
-  "xdg-desktop-portal-wlr",
-  "xdg-desktop-portal",
-]
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +238,11 @@ pub struct AppearanceConfig {
     pub blur_radius: i32,
     pub transparency: bool,
     pub opacity: f32,
+    /// Bars Paw2 draws above windows that let it decorate them.
+    pub titlebars: bool,
+    pub titlebar_height: i32,
+    /// An unfocused bar; the focused one takes `focus_ring_color`.
+    pub titlebar_color: [f32; 4],
 }
 
 impl AppearanceConfig {
@@ -300,36 +299,32 @@ impl Default for InputConfig {
             focus_follows_mouse: false,
             // Primary selection is what every other desktop does; a session
             // that silently lost middle-click paste reads as broken, not as
-            // minimal. It sits with `direct_scanout` and `privileged_clients`
-            // on the short list of defaults that are not decoration.
+            // minimal. It sits with `direct_scanout` on the short list of
+            // defaults that are not decoration.
             middle_click_paste: true,
         }
     }
 }
 
-/// Which clients may bind the globals that expose other clients' windows.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+/// Which clients may watch the clipboard.
+///
+/// Window titles and per-window capture are not configured here: they follow
+/// where a client is installed. See `state::client_trust`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecurityConfig {
-    pub privileged_clients: Vec<String>,
+    /// Empty by default, and it must stay that way. `ext-data-control-v1` sees
+    /// every copy as it happens, password manager included, so a clipboard
+    /// history tool is worth having and worth opting into.
+    pub clipboard_clients: Vec<String>,
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            // The desktop portal only. It is here because dropping it silently
-            // breaks OBS window capture, which is not something a user can be
-            // expected to diagnose - see `REFERENCE.md`.
-            //
-            // `wl-paste` and `wl-copy` used to be here too, and must not come
-            // back. The allowlist also gates `ext-data-control-v1`, which sees
-            // every copy as it happens, and a bare name is a filename anyone
-            // can choose: shipping those two granted the clipboard - password
-            // manager included - to anything that called itself `wl-paste`.
-            // A clipboard history tool is worth having, and worth opting into.
-            privileged_clients: vec!["xdg-desktop-portal-wlr".into(), "xdg-desktop-portal".into()],
-        }
-    }
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawSecurity {
+    clipboard_clients: Vec<String>,
+    /// Replaced by install-location trust. Still accepted, and ignored with a
+    /// warning, so an older config keeps loading instead of falling back.
+    privileged_clients: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -525,9 +520,9 @@ fn monitors_require_restart(current: &[MonitorConfig], updated: &[MonitorConfig]
     })
 }
 
-fn monitor_restart_fields(monitor: Option<&MonitorConfig>) -> (bool, Option<[i32; 2]>, VrrPolicy) {
-    monitor.map_or((false, None, VrrPolicy::Automatic), |monitor| {
-        (monitor.focus_at_startup, monitor.position, monitor.vrr)
+fn monitor_restart_fields(monitor: Option<&MonitorConfig>) -> (bool, VrrPolicy) {
+    monitor.map_or((false, VrrPolicy::Automatic), |monitor| {
+        (monitor.focus_at_startup, monitor.vrr)
     })
 }
 
@@ -541,11 +536,13 @@ fn apply_live_monitor_fields(current: &mut Vec<MonitorConfig>, updated: &[Monito
         {
             monitor.resolution = updated.resolution;
             monitor.refresh = updated.refresh;
+            monitor.position = updated.position;
             monitor.scale = updated.scale;
             monitor.transform = updated.transform;
         } else {
             monitor.resolution = None;
             monitor.refresh = None;
+            monitor.position = None;
             monitor.scale = 1.0;
             monitor.transform = Transform::Normal;
         }
@@ -562,7 +559,7 @@ fn apply_live_monitor_fields(current: &mut Vec<MonitorConfig>, updated: &[Monito
             focus_at_startup: false,
             resolution: monitor.resolution,
             refresh: monitor.refresh,
-            position: None,
+            position: monitor.position,
             scale: monitor.scale,
             transform: monitor.transform,
             vrr: VrrPolicy::Automatic,
@@ -870,7 +867,7 @@ struct RawConfig {
     #[serde(default)]
     backend: BackendConfig,
     #[serde(default)]
-    security: SecurityConfig,
+    security: RawSecurity,
     #[serde(default)]
     monitors: Vec<MonitorConfig>,
     #[serde(default)]
@@ -925,6 +922,9 @@ struct RawAppearance {
     blur_radius: u16,
     transparency: bool,
     opacity: f64,
+    titlebars: bool,
+    titlebar_height: u16,
+    titlebar_color: String,
 }
 
 impl Default for RawAppearance {
@@ -943,6 +943,9 @@ impl Default for RawAppearance {
             blur_radius: 0,
             transparency: false,
             opacity: 1.0,
+            titlebars: false,
+            titlebar_height: 24,
+            titlebar_color: "#1f1f24".into(),
         }
     }
 }
@@ -1191,7 +1194,7 @@ pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
 
 /// The compiled defaults, as a `Config`. Also the base layer of every merge,
 /// so `parse(FALLBACK_CONFIG)` is already covered by the tests.
-fn defaults() -> Config {
+pub(crate) fn defaults() -> Config {
     parse_value(toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML"))
         .expect("the compiled default config is valid")
 }
@@ -1323,6 +1326,10 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         }
     }
     finite_in("appearance.opacity", raw.appearance.opacity, 0.1..=1.0)?;
+    if !(16..=48).contains(&raw.appearance.titlebar_height) {
+        return Err("appearance.titlebar_height must be between 16 and 48".into());
+    }
+    let titlebar_color = parse_color(&raw.appearance.titlebar_color, "appearance.titlebar_color")?;
     at_most("animations.duration_ms", raw.animations.duration_ms, 5000)?;
     finite_in("animations.slowdown", raw.animations.slowdown, 0.1..=100.0)?;
     for (name, value) in [
@@ -1368,11 +1375,18 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     }
     if raw
         .security
-        .privileged_clients
+        .clipboard_clients
         .iter()
         .any(|name| name.trim().is_empty())
     {
-        return Err("security.privileged_clients entries cannot be empty".into());
+        return Err("security.clipboard_clients entries cannot be empty".into());
+    }
+    if raw.security.privileged_clients.is_some() {
+        tracing::warn!(
+            "security.privileged_clients is no longer used and can be removed; \
+             system-installed programs are trusted automatically, and clipboard \
+             access is granted with security.clipboard_clients"
+        );
     }
     for (index, command) in raw.autostart.commands.iter().enumerate() {
         executable(&format!("autostart.commands[{index}]"), command)?;
@@ -1596,6 +1610,9 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
             blur_radius: raw.appearance.blur_radius.into(),
             transparency: raw.appearance.transparency,
             opacity: raw.appearance.opacity as f32,
+            titlebars: raw.appearance.titlebars,
+            titlebar_height: raw.appearance.titlebar_height.into(),
+            titlebar_color,
         },
         animations: AnimationConfig {
             enabled: raw.animations.enabled,
@@ -1611,7 +1628,9 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         input: raw.input,
         theme: raw.theme,
         backend: raw.backend,
-        security: raw.security,
+        security: SecurityConfig {
+            clipboard_clients: raw.security.clipboard_clients,
+        },
         monitors,
         autostart: raw.autostart.commands,
         scratchpads,
@@ -1698,12 +1717,9 @@ fn invalid_data(path: &Path, message: impl std::fmt::Display) -> io::Error {
     )
 }
 
-/// The shipped allowlist, verbatim, for the tests that swap it out.
+/// The shipped clipboard allowlist, verbatim, for the tests that swap it out.
 #[cfg(test)]
-const PRIVILEGED: &str = r#"privileged_clients = [
-  "xdg-desktop-portal-wlr",
-  "xdg-desktop-portal",
-]"#;
+const CLIPBOARD: &str = "clipboard_clients = []\n";
 
 /// The annotated reference at the repo root. It names every option, so the
 /// tests use it as the document to mutate one value in - and compiling it here
@@ -1876,6 +1892,12 @@ mod tests {
         assert!(config.appearance.shadow_enabled());
         assert!(config.appearance.blur_enabled());
         assert_eq!(config.appearance.window_opacity(), 0.95);
+        assert!(config.appearance.titlebars);
+        assert_eq!(config.appearance.titlebar_height, 24);
+        assert_eq!(
+            config.appearance.titlebar_color,
+            [31.0 / 255.0, 31.0 / 255.0, 36.0 / 255.0, 1.0]
+        );
         assert!(config.animations.active());
         assert_eq!(config.overview.zoom, 0.5);
         assert_eq!(
@@ -1920,17 +1942,19 @@ mod tests {
         assert!(config.backend.direct_scanout);
         // The shipped config and the built-in default must not drift apart.
         assert_eq!(config.security, SecurityConfig::default());
-        // No clipboard tool here on purpose: this list also gates
-        // ext-data-control-v1, and a bare name is a filename anyone can pick.
-        assert_eq!(
-            config.security.privileged_clients,
-            ["xdg-desktop-portal-wlr", "xdg-desktop-portal"]
-        );
+        // No clipboard tool here on purpose: ext-data-control-v1 sees every copy.
+        assert!(config.security.clipboard_clients.is_empty());
         assert!(
-            parse(&EXAMPLE_CONFIG.edited(PRIVILEGED, r#"privileged_clients = ["  "]"#))
+            parse(&EXAMPLE_CONFIG.edited(CLIPBOARD, "clipboard_clients = [\"  \"]\n"))
                 .unwrap_err()
                 .contains("cannot be empty")
         );
+        // An older config naming the retired key still loads.
+        let legacy = EXAMPLE_CONFIG.edited(
+            CLIPBOARD,
+            "clipboard_clients = []\nprivileged_clients = [\"xdg-desktop-portal\"]\n",
+        );
+        assert_eq!(parse(&legacy).unwrap().security, SecurityConfig::default());
         assert_eq!(config.animations.duration, Duration::from_millis(150));
         // The shipped config configures no monitors; they are auto-detected.
         assert!(config.monitors.is_empty());
@@ -2013,6 +2037,21 @@ mod tests {
             parse(&invalid_corner)
                 .unwrap_err()
                 .contains("corner_radius")
+        );
+
+        let invalid_titlebar =
+            EXAMPLE_CONFIG.edited("titlebar_height = 24", "titlebar_height = 12");
+        assert!(
+            parse(&invalid_titlebar)
+                .unwrap_err()
+                .contains("titlebar_height")
+        );
+        let invalid_titlebar_color =
+            EXAMPLE_CONFIG.edited("titlebar_color = \"#1f1f24\"", "titlebar_color = \"grey\"");
+        assert!(
+            parse(&invalid_titlebar_color)
+                .unwrap_err()
+                .contains("appearance.titlebar_color")
         );
 
         let invalid_shadow = EXAMPLE_CONFIG.edited("shadow_radius = 12", "shadow_radius = 65");
@@ -2800,7 +2839,8 @@ swap_right = ["Super+Shift+l"]
         );
 
         let updated =
-            parse(&with_monitors.edited(PRIVILEGED, r#"privileged_clients = ["waybar"]"#)).unwrap();
+            parse(&with_monitors.edited(CLIPBOARD, "clipboard_clients = [\"wl-paste\"]\n"))
+                .unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.security, SecurityConfig::default());
 
@@ -2881,8 +2921,8 @@ swap_right = ["Super+Shift+l"]
             MONITORS.replacen("position = [0, 0]", "position = [100, 0]", 1)
         ))
         .unwrap();
-        assert!(active.apply_runtime(updated));
-        assert_eq!(active.monitors[0].position, Some([0, 0]));
+        assert!(!active.apply_runtime(updated));
+        assert_eq!(active.monitors[0].position, Some([100, 0]));
         assert_eq!(active.monitors[0].scale, 1.0);
         assert_eq!(active.monitors[0].transform, Transform::Normal);
 

@@ -6,9 +6,143 @@
 //! [`Paw2::update_mouse_operation`], and ends in
 //! [`Paw2::finish_mouse_operation`].
 
+use smithay::{
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+    wayland::shell::xdg::ToplevelSurface,
+};
+
 use super::*;
 
+/// How far the pointer travels before a press on a titlebar becomes a move,
+/// in logical pixels. Below it the press is a click.
+const TITLE_DRAG_THRESHOLD: f64 = 6.0;
+/// The most time between two presses on a titlebar that still makes a
+/// double-click, in milliseconds.
+const DOUBLE_CLICK_MS: u32 = 400;
+
 impl Paw2 {
+    /// A left press on a bar, its window already focused. Returns the grab to
+    /// start when the press may turn into a drag.
+    pub(crate) fn press_title_bar(
+        &mut self,
+        window: Window,
+        part: BarPart,
+        time: u32,
+    ) -> Option<MouseOperation> {
+        match part {
+            BarPart::Close => {
+                self.run_action(Action::CloseWindow);
+                None
+            }
+            BarPart::Float => {
+                self.run_action(Action::ToggleFloating);
+                None
+            }
+            // A tab only selects; its group moves with the tab-group drag.
+            BarPart::Title if self.in_tab_group(&window) => None,
+            BarPart::Title => {
+                let previous = self.scroller.last_title_press.replace((window.id(), time));
+                if previous.is_some_and(|(id, at)| {
+                    id == window.id() && time.wrapping_sub(at) <= DOUBLE_CLICK_MS
+                }) {
+                    self.scroller.last_title_press = None;
+                    self.run_action(Action::ToggleFloating);
+                    return None;
+                }
+                Some(MouseOperation::PressTitle { window })
+            }
+        }
+    }
+
+    fn in_tab_group(&self, window: &Window) -> bool {
+        self.scroller.monitors.iter().any(|monitor| {
+            monitor.active().windows.contains(window)
+                && monitor.active().tab_group_index(window).is_some()
+        })
+    }
+
+    /// A titlebar always moves its window, never resizes it: a floating window
+    /// follows the pointer, a tiled one becomes the drag preview Super+drag
+    /// gives.
+    fn begin_titlebar_move(
+        &mut self,
+        window: Window,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let monitor = self
+            .scroller
+            .monitors
+            .iter()
+            .find(|monitor| monitor.active().windows.contains(&window))?;
+        let workspace = monitor.active();
+        if workspace.fullscreen.is_some() {
+            return None;
+        }
+        if workspace.is_floating(&window) {
+            return Some(MouseOperation::MoveFloating {
+                initial_location: monitor.space.element_location(&window)?,
+                window,
+            });
+        }
+        self.begin_tiled_drag(window, location, false)
+    }
+
+    /// An app asked to move its window - a drag on its own header bar.
+    pub(crate) fn app_move_operation(
+        &mut self,
+        surface: &ToplevelSurface,
+        location: Point<f64, Logical>,
+    ) -> Option<MouseOperation> {
+        let window = self
+            .find_window(|window| window.toplevel() == Some(surface))?
+            .clone();
+        self.begin_titlebar_move(window, location)
+    }
+
+    /// An app asked to resize its window from `edges`. Only a floating window
+    /// can be: the layout sizes tiles.
+    pub(crate) fn app_resize_operation(
+        &mut self,
+        surface: &ToplevelSurface,
+        edges: ResizeEdge,
+    ) -> Option<MouseOperation> {
+        let window = self
+            .find_window(|window| window.toplevel() == Some(surface))?
+            .clone();
+        let monitor = self
+            .scroller
+            .monitors
+            .iter()
+            .find(|monitor| monitor.active().windows.contains(&window))?;
+        if !monitor.active().is_floating(&window) || window_is_fixed_size(&window) {
+            return None;
+        }
+        let x = match edges {
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => {
+                Some(FloatingEdge::Start)
+            }
+            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => {
+                Some(FloatingEdge::End)
+            }
+            _ => None,
+        };
+        let y = match edges {
+            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => {
+                Some(FloatingEdge::Start)
+            }
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+                Some(FloatingEdge::End)
+            }
+            _ => None,
+        };
+        Some(MouseOperation::ResizeFloating {
+            initial_geometry: monitor.space.element_geometry(&window)?,
+            window,
+            x,
+            y,
+        })
+    }
+
     pub(crate) fn begin_mouse_operation(
         &mut self,
         window: Window,
@@ -251,7 +385,18 @@ impl Paw2 {
         start: Point<f64, Logical>,
         location: Point<f64, Logical>,
     ) {
+        if let MouseOperation::PressTitle { window } = operation {
+            let travel = location - start;
+            if travel.x.hypot(travel.y) < TITLE_DRAG_THRESHOLD {
+                return;
+            }
+            let Some(moving) = self.begin_titlebar_move(window.clone(), start) else {
+                return;
+            };
+            *operation = moving;
+        }
         match operation {
+            MouseOperation::PressTitle { .. } => {}
             MouseOperation::MoveScratchpad {
                 name,
                 initial_location,

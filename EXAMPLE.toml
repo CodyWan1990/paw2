@@ -9,7 +9,7 @@
 # top to bottom is closer to "everything at once" than to a starting point.
 #
 # Three things are not decoration and so start on regardless: middle-click
-# paste, direct scanout, and the privileged-client allowlist.
+# paste and direct scanout.
 #
 # The one exception is the built-in fallback, which is what a first run writes
 # to config.toml and what Paw2 falls back to when your config cannot be parsed:
@@ -18,7 +18,7 @@
 # terminal on Super+Return. Those stay bound unless you rebind them.
 #
 # Most settings apply within about half a second of saving. Backend,
-# monitor position, VRR, startup focus, autostart, privileged clients, Qt
+# monitor position, VRR, startup focus, autostart, clipboard clients, Qt
 # style and font need a restart. An invalid save is reported and the last
 # working configuration keeps running.
 #
@@ -80,6 +80,14 @@ blur_radius = 8
 transparency = true
 # From 0.1 to 1.0. Default: 1.0.
 opacity = 0.95
+# Titlebars Paw2 draws above windows: the title, a button that floats or
+# tiles the window, and a close button. Drag one to move its window,
+# double-click it to float or tile. The focused window's bar takes
+# focus_ring_color. Apps that draw their own header bar, such as GTK ones,
+# keep it and get no second bar. Height from 16 to 48. Default: false.
+titlebars = true
+titlebar_height = 24
+titlebar_color = "#1f1f24"
 
 # Window movement and resize animations. The duration is in milliseconds,
 # at most 5000; the slowdown multiplier runs from 0.1 to 100.0.
@@ -156,36 +164,27 @@ direct_scanout = true
 #vrr = "automatic"
 
 [security]
-# Clients allowed the privileged view of the desktop: the window list
-# (ext-foreign-toplevel-list-v1), per-window capture, the clipboard manager
-# interface (ext-data-control-v1, which sees every copy as it happens), and the
-# control socket's window titles, config and quit command.
-# Everything else can still capture whole outputs, so grim and wf-recorder work
-# without an entry, and still gets workspaces and layout on the control socket -
-# just not window titles.
+# Programs installed by your package manager (owned by root, in a directory
+# only root can write) automatically get the privileged view of the desktop:
+# the window list (ext-foreign-toplevel-list-v1), per-window capture, and the
+# control socket's window titles, config and quit command. That covers the
+# screen-sharing portal, bars and shells with no setup.
 #
-# An entry with a / in it is matched against the connecting process's whole
-# executable path, which is the form worth using: a bare name matches that
-# filename anywhere, including a copy under /tmp. Paths are resolved first, so
-# name the real binary rather than a wrapper symlink - `quickshell`, not `qs`.
-# Changing this list needs a Paw2 restart.
+# Everything else - games under your home directory, downloads, anything in
+# /tmp - does not. Flatpak apps never do, whatever their binary is called.
+# Every client can still capture whole outputs, so grim and wf-recorder work,
+# and still gets workspaces and layout on the control socket.
 #
-# The two below are the default; naming this key replaces the list, so keep
-# them unless you want to break screen sharing.
-privileged_clients = [
-  "xdg-desktop-portal-wlr",
-  "xdg-desktop-portal",
-]
-
-# A clipboard history tool is deliberately NOT in the default: this list gates
-# ext-data-control-v1, which streams every copy - passwords included - to
-# whatever holds it. Add the binary that actually connects if you want one; for
-# `wl-paste --watch cliphist store` that is wl-paste, not cliphist.
-#privileged_clients = [
-#  "xdg-desktop-portal-wlr",
-#  "xdg-desktop-portal",
-#  "/usr/bin/wl-paste",
-#]
+# The clipboard is more sensitive: ext-data-control-v1 streams every copy -
+# passwords included - to whatever holds it. Only programs listed here get it,
+# and they must also be system-installed. The list is empty by default.
+#
+# A bare name matches that filename; an entry with a / in it matches only that
+# exact path. Name the real binary rather than a wrapper symlink. For
+# `wl-paste --watch cliphist store` the program that connects is wl-paste, not
+# cliphist. Changing this list needs a Paw2 restart.
+clipboard_clients = []
+#clipboard_clients = ["/usr/bin/wl-paste"]
 
 [autostart]
 # Commands are argv arrays and run once when Paw2 starts.
