@@ -32,10 +32,27 @@ Paw2 does not require its optional shell. Waybar, layer-shell wallpaper tools,
 ## Before you install
 
 Paw2 currently expects a Linux system with DRM/KMS, logind or seatd, and a
-working graphics stack. Fedora is the tested path; packages for other
-distributions are still on the roadmap.
+working graphics stack. Fedora and Arch Linux are the supported
+distributions.
 
-On Fedora, install the build and runtime dependencies:
+## Install on Arch Linux
+
+The Arch package builds the latest commit on GitHub and installs its
+dependencies for you:
+
+```sh
+sudo pacman -S --needed base-devel git
+git clone https://github.com/CodyWan1990/paw2.git
+cd paw2/packaging/arch
+makepkg -si
+```
+
+To update later, run `makepkg -si` again from the same directory. Continue
+with [Starting Paw2](#starting-paw2).
+
+## Install on Fedora
+
+Install the build and runtime dependencies:
 
 ```sh
 sudo dnf install cargo gcc pkgconf-pkg-config \
@@ -47,9 +64,8 @@ sudo dnf install cargo gcc pkgconf-pkg-config \
 ```
 
 If you use another distribution, install the equivalent development libraries
-plus XWayland, `xdg-desktop-portal-wlr`, GNOME Keyring, `grim`, and `slurp`.
-
-## Build and install
+plus XWayland, `xdg-desktop-portal-wlr`, GNOME Keyring, `grim`, and `slurp`,
+then follow the same steps.
 
 Build a release binary from the repository root:
 
@@ -71,6 +87,8 @@ sudo install -Dm644 LICENSES/NotoSans.txt /usr/share/licenses/paw2/NotoSans.txt
 sudo install -Dm644 THIRD_PARTY_LICENSES.html /usr/share/licenses/paw2/THIRD_PARTY_LICENSES.html
 systemctl --user daemon-reload
 ```
+
+## Starting Paw2
 
 Log out, choose **Paw2** in your display manager, and sign back in.
 
@@ -159,7 +177,7 @@ trust inside your desktop session.
 - Hardware-safe fullscreen direct scanout
 - External display tools through `wlr-output-management`
 - Session locking and idle notifications
-- Distribution packages
+- Packages for more distributions
 
 ## License
 

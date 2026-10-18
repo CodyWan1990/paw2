@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Paw2
 Comment=Gaming-focused Wayland compositor
-Exec=/usr/local/bin/paw2
-TryExec=/usr/local/bin/paw2
+Exec=paw2
+TryExec=paw2
 Type=Application

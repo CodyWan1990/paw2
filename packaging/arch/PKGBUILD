@@ -1,0 +1,80 @@
+# Builds Paw2 from the latest commit on GitHub's main branch.
+#
+#   cd packaging/arch
+#   makepkg -si
+
+pkgname=paw2-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Gaming-focused Wayland compositor'
+arch=('x86_64' 'aarch64')
+url='https://github.com/CodyWan1990/paw2'
+license=('MIT' 'OFL-1.1')
+depends=(
+  'dbus'
+  'glib2'
+  'gnome-keyring'
+  'libdisplay-info'
+  'libglvnd'
+  'libinput'
+  'libsecret'
+  'libxkbcommon'
+  'mesa'
+  'seatd'
+  'systemd-libs'
+  'wayland'
+  'xdg-desktop-portal'
+  'xdg-desktop-portal-gtk'
+  'xdg-desktop-portal-wlr'
+  'xorg-xwayland'
+)
+makedepends=('cargo' 'git' 'pkgconf')
+optdepends=(
+  'grim: screenshots'
+  'kitty: terminal used by the fallback Super+Return shortcut'
+  'slurp: region and monitor selection for screenshots and screen sharing'
+)
+provides=('paw2')
+conflicts=('paw2')
+source=('paw2::git+https://github.com/CodyWan1990/paw2.git')
+sha256sums=('SKIP')
+
+pkgver() {
+  cd paw2
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd paw2
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd paw2
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd paw2
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd paw2
+  install -Dm755 target/release/paw2 "$pkgdir/usr/bin/paw2"
+  install -Dm644 packaging/paw2.desktop "$pkgdir/usr/share/wayland-sessions/paw2.desktop"
+  install -Dm644 packaging/paw2-portals.conf "$pkgdir/usr/share/xdg-desktop-portal/paw2-portals.conf"
+  install -Dm644 packaging/paw2-session.target "$pkgdir/usr/lib/systemd/user/paw2-session.target"
+  install -Dm644 EXAMPLE.toml "$pkgdir/usr/share/doc/paw2/EXAMPLE.toml"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSES/Smithay.txt "$pkgdir/usr/share/licenses/$pkgname/Smithay.txt"
+  install -Dm644 LICENSES/NotoSans.txt "$pkgdir/usr/share/licenses/$pkgname/NotoSans.txt"
+  install -Dm644 THIRD_PARTY_LICENSES.html "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.html"
+}
