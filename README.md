@@ -25,9 +25,10 @@ edges.
 - Screenshots and screen sharing through standard Wayland protocols
 - Screen locking, idle notifications, and night light for desktop shells
 - Live-reloading TOML configuration
-- An optional
-  [Quickshell desktop](https://github.com/CodyWan1990/paw2-shell) for the bar,
-  launcher, notifications, and settings
+- An optional desktop shell,
+  [paw2-shell](https://github.com/CodyWan1990/paw2-shell), a native C++ fork
+  of Noctalia with a bar, dock, launcher, notifications, lock screen, themes,
+  and settings for paw2 itself
 
 Paw2 does not require its optional shell. Waybar, layer-shell wallpaper tools,
 `grim`, and `xdg-desktop-portal-wlr` can be used directly.
