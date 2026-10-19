@@ -34,6 +34,10 @@ impl Paw2 {
                 self.run_action(Action::CloseWindow);
                 None
             }
+            BarPart::Minimize => {
+                self.minimize_window(&window);
+                None
+            }
             BarPart::Float => {
                 self.run_action(Action::ToggleFloating);
                 None

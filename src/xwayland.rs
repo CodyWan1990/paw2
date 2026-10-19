@@ -187,6 +187,19 @@ impl XwmHandler for Paw2 {
         }
     }
 
+    /// Iconify, as a game's own minimize or a Wine taskbar asks for it.
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(managed) = self.window_for_x11_surface(&window).cloned() {
+            self.minimize_window(&managed);
+        }
+    }
+
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(managed) = self.window_for_x11_surface(&window).cloned() {
+            self.restore_window(managed.id());
+        }
+    }
+
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         self.set_x11_fullscreen(&window);
         crate::drm::redraw(self);

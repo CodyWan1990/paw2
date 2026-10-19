@@ -33,6 +33,7 @@ use smithay::{
 };
 
 mod drag;
+mod minimize;
 mod overview;
 mod scratchpad;
 
@@ -151,9 +152,11 @@ pub(crate) struct TitleBar {
     pub active: usize,
     /// Drawn in the focus ring's colour, as the ring's top edge.
     pub focused: bool,
-    /// The float/tile and close buttons, shown on titlebars but not on a bare
-    /// tab bar.
+    /// The minimize, float/tile and close buttons, shown on titlebars but not
+    /// on a bare tab bar.
     pub buttons: bool,
+    /// The button under the pointer, if any.
+    pub hovered: Option<BarPart>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -166,13 +169,27 @@ pub(crate) enum BarKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BarPart {
     Title,
+    Minimize,
     Float,
     Close,
 }
 
-/// The two buttons at a titlebar's right end are squares as tall as the bar.
+/// A titlebar's buttons, left to right.
+pub(crate) const BAR_BUTTONS: [BarPart; 3] = [BarPart::Minimize, BarPart::Float, BarPart::Close];
+
+/// The button `offset` pixels into a titlebar's button area.
+fn bar_button_at(offset: f64, height: i32) -> BarPart {
+    let index = (offset / f64::from(height.max(1))) as usize;
+    BAR_BUTTONS[index.min(BAR_BUTTONS.len() - 1)]
+}
+
+/// The buttons at a titlebar's right end are squares as tall as the bar.
 pub(crate) fn bar_buttons_width(buttons: bool, height: i32) -> i32 {
-    if buttons { height * 2 } else { 0 }
+    if buttons {
+        height * BAR_BUTTONS.len() as i32
+    } else {
+        0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1410,9 +1427,24 @@ impl Scrollers {
                         focused: focused_output
                             && index == monitor.active_workspace
                             && workspace.focused == Some(position),
+                        minimized: false,
                     });
                 }
             }
+        }
+        // Listed under the workspace they left, so a taskbar keeps them in place.
+        for minimized in &self.minimized {
+            let (title, app_id) = crate::screencopy::window_metadata(&minimized.window);
+            windows.push(crate::ipc::WindowState {
+                id: minimized.window.id(),
+                identifier: String::new(),
+                title,
+                app_id,
+                output: minimized.output.clone(),
+                workspace: minimized.workspace,
+                focused: false,
+                minimized: true,
+            });
         }
         (outputs, windows)
     }
@@ -1441,6 +1473,11 @@ pub struct Scrollers {
     /// The last press on a titlebar - window and time in ms - so a second
     /// one on the same window soon after counts as a double-click.
     last_title_press: Option<(usize, u32)>,
+    /// The titlebar button under the pointer, by window id, so it can light up.
+    hovered_bar_button: Option<(usize, BarPart)>,
+    /// Minimized windows, oldest first. They stay out of every workspace until
+    /// restored.
+    minimized: Vec<minimize::MinimizedWindow>,
     scratchpads: HashMap<String, ScratchpadRuntime>,
     scratchpad_geometry: HashMap<String, HashMap<String, SavedScratchpadGeometry>>,
     scratchpad_state_path: Option<PathBuf>,
@@ -1928,6 +1965,9 @@ impl Paw2 {
     /// socket both use. Reuses the toplevel table rather than walking every
     /// workspace, since that table exists precisely to map ids to windows.
     pub fn focus_window_by_id(&mut self, id: usize) {
+        if self.restore_window(id) {
+            return;
+        }
         let Some(window) = self.toplevel_window(id) else {
             return;
         };
@@ -2042,6 +2082,10 @@ impl Paw2 {
 
     /// Removes the window from whichever workspace holds it, mapped or parked.
     fn remove_managed_window(&mut self, predicate: impl Fn(&Window) -> bool) -> bool {
+        if let Some(window) = self.forget_minimized(&predicate) {
+            self.forget_window(&window);
+            return true;
+        }
         let scratchpad = self
             .scroller
             .scratchpads
@@ -2507,6 +2551,22 @@ impl Paw2 {
             // the keyboard action dispatcher.
             Action::TabGroupDrag => false,
             Action::ToggleFloating => self.toggle_floating(),
+            Action::MinimizeWindow => {
+                let window = self.scroller.focused_mut().and_then(|scroller| {
+                    let workspace = scroller.active();
+                    workspace
+                        .focused
+                        .and_then(|index| workspace.windows.get(index).cloned())
+                });
+                if let Some(window) = window {
+                    self.minimize_window(&window);
+                }
+                false
+            }
+            Action::RestoreMinimized => {
+                self.restore_last_minimized();
+                false
+            }
             Action::CloseWindow => {
                 let scratchpad = self
                     .scroller
@@ -3168,6 +3228,7 @@ impl Paw2 {
         let height = bar_height(&self.config);
         let buttons = self.config.appearance.titlebars;
         let focused = self.focused_window_render_state(output).map(|(_, id)| id);
+        let hovered = self.scroller.hovered_bar_button;
         let title = |window: &Window| {
             let (title, app_id) = crate::screencopy::window_metadata(window);
             if title.is_empty() { app_id } else { title }
@@ -3181,6 +3242,9 @@ impl Paw2 {
             let mut geometry = bar_outer_rectangle(monitor.space.element_geometry(shown)?, height);
             geometry.size.h = height;
             geometry.loc -= output_location;
+            let hovered = hovered
+                .filter(|(id, _)| buttons && *id == shown.id())
+                .map(|(_, part)| part);
             Some(TitleBar {
                 key,
                 focused: focused.as_ref() == Some(&root),
@@ -3190,6 +3254,7 @@ impl Paw2 {
                 windows,
                 active,
                 buttons,
+                hovered,
             })
         };
 
@@ -3252,17 +3317,25 @@ impl Paw2 {
             let titles_width = geometry.size.w - bar_buttons_width(bar.buttons, geometry.size.h);
             if relative >= f64::from(titles_width) {
                 let active = bar.windows.get(bar.active)?.clone();
-                let part = if relative >= f64::from(titles_width + geometry.size.h) {
-                    BarPart::Close
-                } else {
-                    BarPart::Float
-                };
+                let part = bar_button_at(relative - f64::from(titles_width), geometry.size.h);
                 return Some((active, part));
             }
             let index = tab_index_at(relative, titles_width, bar.windows.len())?;
             return Some((bar.windows.get(index)?.clone(), BarPart::Title));
         }
         None
+    }
+
+    /// Light up the titlebar button under `position`. Nothing lights up while
+    /// a drag holds the pointer.
+    pub(crate) fn hover_bar_button(&mut self, position: Point<f64, Logical>, grabbed: bool) {
+        self.scroller.hovered_bar_button = if grabbed {
+            None
+        } else {
+            self.title_bar_at(position)
+                .filter(|(_, part)| *part != BarPart::Title)
+                .map(|(window, part)| (window.id(), part))
+        };
     }
 
     /// The window whose title is under `position`: a tab of a group, or a
@@ -3637,6 +3710,13 @@ impl Paw2 {
                             .flat_map(|workspace| &workspace.windows)
                             .find(|window| predicate(window))
                     })
+            })
+            .or_else(|| {
+                self.scroller
+                    .minimized
+                    .iter()
+                    .map(|minimized| &minimized.window)
+                    .find(|window| predicate(window))
             })
     }
 
@@ -5663,7 +5743,10 @@ mod tests {
         config.appearance.titlebars = true;
         config.appearance.titlebar_height = 30;
         assert_eq!(bar_height(&config), 30);
-        assert_eq!(bar_buttons_width(true, 30), 60);
+        assert_eq!(bar_buttons_width(true, 30), 90);
+        assert_eq!(bar_button_at(0.0, 30), BarPart::Minimize);
+        assert_eq!(bar_button_at(45.0, 30), BarPart::Float);
+        assert_eq!(bar_button_at(89.9, 30), BarPart::Close);
         assert_eq!(bar_buttons_width(false, 30), 0);
     }
 

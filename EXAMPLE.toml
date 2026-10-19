@@ -123,7 +123,8 @@ middle_click_paste = true
 
 # Desktop theme values are optional. Cursor, GTK and icon changes apply live;
 # Qt style and font changes apply at startup. The cursor size is between 1
-# and 256, and no value here may be left blank.
+# and 256, and no value here may be left blank. titlebar_font is a fontconfig
+# family for titlebar text; it applies live, and unset uses font's family.
 #[theme]
 #cursor_theme = "Oxygen_Zion"
 #cursor_size = 24
@@ -131,6 +132,7 @@ middle_click_paste = true
 #gtk_theme = "Breeze"
 #qt_style = "Breeze"
 #font = "Monofur Nerd Font Propo 12"
+#titlebar_font = "Inter"
 
 # Hand-edited only. paw2-shell never writes this section, so drm_device and
 # connector stay yours for fixing a machine that will not start.
@@ -256,6 +258,10 @@ increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
 decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
 increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
 toggle_floating = ["Super+Shift+space"]
+# Minimized windows come back from the shell's taskbar or dock, or with
+# restore_minimized, newest first.
+minimize_window = ["Super+m"]
+restore_minimized = ["Super+Shift+m"]
 close_window = ["Super+q", "Super+BackSpace"]
 toggle_fullscreen = ["Super+Shift+f"]
 toggle_overview = ["Super+o"]

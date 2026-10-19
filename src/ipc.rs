@@ -68,6 +68,8 @@ pub struct WindowState {
     pub output: String,
     pub workspace: usize,
     pub focused: bool,
+    /// Out of its workspace until restored; `focus-window` brings it back.
+    pub minimized: bool,
 }
 
 #[derive(Clone, Serialize, PartialEq)]
@@ -350,6 +352,9 @@ enum Command {
     CloseWindow {
         id: usize,
     },
+    MinimizeWindow {
+        id: usize,
+    },
     SetLayout {
         layout: Option<LayoutMode>,
         output: Option<String>,
@@ -409,6 +414,11 @@ fn run(state: &mut Paw2, line: &str, privileged: bool) {
         Command::FocusWorkspace { index, .. } => state.run_action(Action::SwitchWorkspace(index)),
         Command::FocusWindow { id } => state.focus_window_by_id(id),
         Command::CloseWindow { id } => state.close_window_by_id(id),
+        Command::MinimizeWindow { id } => {
+            if let Some(window) = state.toplevel_window(id) {
+                state.minimize_window(&window);
+            }
+        }
         Command::SetLayout { layout, .. } => {
             state.run_action(layout.map_or(Action::CycleLayout, Action::SwitchLayout))
         }
@@ -631,6 +641,7 @@ mod tests {
             output: "DP-1".into(),
             workspace: 2,
             focused: true,
+            minimized: false,
         }];
         let [redacted] = redacted_windows(&windows).try_into().ok().unwrap();
         assert_eq!(redacted.title, "");

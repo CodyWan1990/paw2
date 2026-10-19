@@ -452,6 +452,13 @@ impl XdgShellHandler for Paw2 {
         }
     }
 
+    /// An app's own minimize button, from a client-side header bar.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()).cloned() {
+            self.minimize_window(&window);
+        }
+    }
+
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
         self.set_fullscreen(&surface);
         crate::drm::redraw(self);

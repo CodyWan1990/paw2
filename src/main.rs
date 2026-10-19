@@ -722,6 +722,7 @@ mod tests {
             gtk_theme: Some("Gtk".into()),
             qt_style: Some("Qt".into()),
             font: Some("Sans 11".into()),
+            titlebar_font: None,
         };
         assert_eq!(
             theme_environment(&theme),

@@ -16,7 +16,8 @@ edges.
 
 - Scrolling, dwindle, master-stack, and monocle tiling layouts
 - Nine workspaces per monitor, floating windows, tabs, and scratchpads
-- Optional titlebars with float and close buttons, for apps that let Paw2 decorate them
+- Optional titlebars with minimize, float and close buttons, for apps that let Paw2 decorate them
+- Minimizing, with windows restored from the shell's taskbar or dock
 - Multiple displays with fractional scaling and per-monitor VRR
 - Direct scanout for compatible fullscreen games
 - Rootless XWayland for Steam and legacy games

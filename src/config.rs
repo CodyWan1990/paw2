@@ -109,6 +109,8 @@ pub enum Action {
     DecreaseRowHeight,
     IncreaseRowHeight,
     ToggleFloating,
+    MinimizeWindow,
+    RestoreMinimized,
     CloseWindow,
     ToggleFullscreen,
     ToggleOverview,
@@ -353,6 +355,9 @@ pub struct ThemeConfig {
     pub gtk_theme: Option<String>,
     pub qt_style: Option<String>,
     pub font: Option<String>,
+    /// A fontconfig family for titlebar and tab text. Unlike `font` it applies
+    /// live; unset falls back to `font`'s family, then the bundled Noto Sans.
+    pub titlebar_font: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -469,6 +474,7 @@ impl Config {
         self.theme.cursor_size = updated.theme.cursor_size;
         self.theme.icon_theme = updated.theme.icon_theme;
         self.theme.gtk_theme = updated.theme.gtk_theme;
+        self.theme.titlebar_font = updated.theme.titlebar_font;
         apply_live_monitor_fields(&mut self.monitors, &updated.monitors);
         self.binding_commands = updated.binding_commands;
         self.scratchpads = updated.scratchpads;
@@ -1051,6 +1057,8 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("decrease_row_height",    Action::DecreaseRowHeight,    ""),
     ("increase_row_height",    Action::IncreaseRowHeight,    ""),
     ("toggle_floating",        Action::ToggleFloating,       ""),
+    ("minimize_window",        Action::MinimizeWindow,       ""),
+    ("restore_minimized",      Action::RestoreMinimized,     ""),
     ("close_window",           Action::CloseWindow,          "Super+q Super+BackSpace"),
     ("toggle_fullscreen",      Action::ToggleFullscreen,     ""),
     ("toggle_overview",        Action::ToggleOverview,       ""),
@@ -1338,6 +1346,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         ("gtk_theme", &raw.theme.gtk_theme),
         ("qt_style", &raw.theme.qt_style),
         ("font", &raw.theme.font),
+        ("titlebar_font", &raw.theme.titlebar_font),
     ] {
         if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
             return Err(format!("theme.{name} cannot be empty"));
@@ -1816,7 +1825,7 @@ mod tests {
     #[test]
     fn the_reference_config_parses_to_its_documented_values() {
         let config = parse(EXAMPLE_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 87);
+        assert_eq!(config.bindings.len(), 89);
         assert_eq!(
             pressed(&config, "Super+Alt+1"),
             Some(Action::ToggleNumberedScratchpad(0))
@@ -2264,8 +2273,8 @@ mod tests {
         let legacy = parse(&legacy).unwrap();
         // `close_window` and `quit` are in the fallback set, so dropping them
         // hands them back. `toggle_fullscreen` and `focus_monitor_left` are
-        // not, so dropping them leaves them unbound: 87 - 2.
-        assert_eq!(legacy.bindings.len(), 85);
+        // not, so dropping them leaves them unbound: 89 - 2.
+        assert_eq!(legacy.bindings.len(), 87);
         // Whole-struct comparison: the built-in defaults and FALLBACK_CONFIG
         // must not drift apart.
         let fallback = parse(FALLBACK_CONFIG).unwrap();
@@ -2887,6 +2896,13 @@ swap_right = ["Super+Shift+l"]
         let updated = parse(&format!("{with_monitors}\n[theme]\nfont = \"Sans 12\"\n")).unwrap();
         assert!(active.apply_runtime(updated));
         assert_eq!(active.theme.font, None);
+
+        let updated = parse(&format!(
+            "{with_monitors}\n[theme]\ntitlebar_font = \"Inter\"\n"
+        ))
+        .unwrap();
+        assert!(!active.apply_runtime(updated));
+        assert_eq!(active.theme.titlebar_font.as_deref(), Some("Inter"));
 
         fs::write(&path, "not toml").unwrap();
         assert!(watcher.reload().is_err());

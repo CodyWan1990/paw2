@@ -953,9 +953,21 @@ impl DirectBackend {
                 name.clone(),
             )
         });
+        let connected = !candidates.is_empty();
         for (_, connector, crtc) in candidates {
             if let Err(error) = self.connect(state, connector, crtc) {
                 warn!(?error, "failed to enable connector");
+            }
+        }
+        // `connect` places each output against the ones before it, so an
+        // automatic monitor listed first takes the spot a later one is
+        // configured for. Placing them all again, configured first, gives the
+        // same layout a config reload would.
+        if connected {
+            let monitors = state.config.monitors.clone();
+            self.reflow_automatic_outputs(state, &monitors);
+            for output in &self.outputs {
+                layer_map_for_output(&output.output).arrange();
             }
         }
         Ok(())

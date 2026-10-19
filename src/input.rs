@@ -330,6 +330,7 @@ impl Paw2 {
         time: u32,
     ) {
         self.send_motion(pointer, location, under.clone(), time);
+        self.hover_bar_button(location, pointer.is_grabbed());
         if pointer.is_grabbed() {
             return;
         }

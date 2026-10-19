@@ -50,7 +50,10 @@ use smithay::{
 
 use crate::{
     config::AppearanceConfig,
-    layout::{BarKey, WindowRenderState, is_exclusive_keyboard_layer, overview_screen_rect},
+    layout::{
+        BAR_BUTTONS, BarKey, BarPart, WindowRenderState, is_exclusive_keyboard_layer,
+        overview_screen_rect,
+    },
     state::Paw2,
 };
 
@@ -398,6 +401,7 @@ struct BarLook<'a> {
     active: usize,
     focused: bool,
     buttons: bool,
+    hovered: Option<BarPart>,
     focus_color: [f32; 4],
     bar_color: [f32; 4],
 }
@@ -407,14 +411,43 @@ fn to_bytes(color: [f32; 4]) -> [u8; 3] {
     [r, g, b]
 }
 
+fn luminance(color: [u8; 3]) -> f32 {
+    let [r, g, b] = color.map(f32::from);
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+}
+
 /// Dark text on a light bar, light text on a dark one.
 fn text_on(background: [u8; 3]) -> [u8; 3] {
-    let [r, g, b] = background.map(f32::from);
-    let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-    if luminance > 0.55 {
+    if luminance(background) > 0.55 {
         [20, 20, 24]
     } else {
         [255, 255, 255]
+    }
+}
+
+/// `from` moved `amount` (0-1) of the way to `to`.
+fn mix(from: [u8; 3], to: [u8; 3], amount: f32) -> [u8; 3] {
+    std::array::from_fn(|channel| {
+        let (from, to) = (f32::from(from[channel]), f32::from(to[channel]));
+        (from + (to - from) * amount).round() as u8
+    })
+}
+
+/// `color` partway towards `background`, for the text of what is not focused.
+fn faded(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
+    mix(color, background, 0.4)
+}
+
+/// The square behind a hovered close button.
+const CLOSE_HOVER: [u8; 3] = [0xE0, 0x48, 0x4D];
+
+/// The ink a focused titlebar draws in: the focus colour, unless it is too
+/// close to the bar to read, when plain text stands in.
+fn accent_on(accent: [u8; 3], background: [u8; 3]) -> [u8; 3] {
+    if (luminance(accent) - luminance(background)).abs() < 0.25 {
+        text_on(background)
+    } else {
+        accent
     }
 }
 
@@ -473,14 +506,39 @@ fn title_pixels(font: &Font, size: Size<i32, Physical>, scale: f32, look: &BarLo
         (crate::layout::bar_buttons_width(look.buttons, size.h) as usize).min(width);
     let titles_width = width - buttons_width;
 
+    // A titlebar keeps its own colour and marks the focus in its ink, leaving
+    // the ring to frame the window; a bare tab bar fills its active tab.
+    let ink = if look.focused {
+        accent_on(focus, plain)
+    } else {
+        faded(text_on(plain), plain)
+    };
     for (index, title) in look.titles.iter().enumerate() {
         let start = index * titles_width / look.titles.len();
         let end = (index + 1) * titles_width / look.titles.len();
-        // A bare tab bar always marks its active tab; a titlebar only does so
-        // while its window has the focus, as the top of the focus ring.
-        let highlighted = index == look.active && (look.focused || !look.buttons);
-        let background = if highlighted { focus } else { plain };
+        let active = index == look.active;
+        let background = if active && !look.buttons {
+            focus
+        } else {
+            plain
+        };
         fill(&mut pixels, width, start..end, height, background);
+        let text = match (look.buttons, active) {
+            (true, true) => ink,
+            (true, false) => faded(text_on(plain), plain),
+            (false, _) => text_on(background),
+        };
+        // In a titlebar holding a tab group, a rule under the active tab says
+        // which one the window is showing.
+        if look.buttons && active && look.titles.len() > 1 {
+            let rule = (2.0 * scale).round().max(1.0) as usize;
+            for y in height.saturating_sub(rule)..height {
+                for x in start..end {
+                    let pixel = (y * width + x) * 4;
+                    pixels[pixel..pixel + 3].copy_from_slice(&ink);
+                }
+            }
+        }
 
         let available = end.saturating_sub(start + padding * 2) as f32;
         let title = fitted_tab_title(font, title, font_size, available);
@@ -495,7 +553,6 @@ fn title_pixels(font: &Font, size: Size<i32, Physical>, scale: f32, look: &BarLo
             ..LayoutSettings::default()
         });
         layout.append(&[font], &TextStyle::new(&title, font_size, 0));
-        let text = text_on(background);
         for glyph in layout.glyphs() {
             let (_, coverage) = font.rasterize_config(glyph.key);
             for glyph_y in 0..glyph.height {
@@ -513,44 +570,61 @@ fn title_pixels(font: &Font, size: Size<i32, Physical>, scale: f32, look: &BarLo
     }
 
     if buttons_width > 0 {
-        let background = if look.focused { focus } else { plain };
-        fill(&mut pixels, width, titles_width..width, height, background);
-        let ink = text_on(background);
-        let button = buttons_width / 2;
-        draw_button_icon(
-            &mut pixels,
-            width,
-            titles_width,
-            button,
-            height,
-            scale,
-            ink,
-            ButtonIcon::Float,
-        );
-        draw_button_icon(
-            &mut pixels,
-            width,
-            titles_width + button,
-            button,
-            height,
-            scale,
-            ink,
-            ButtonIcon::Close,
-        );
+        fill(&mut pixels, width, titles_width..width, height, plain);
+        let side = buttons_width / BAR_BUTTONS.len();
+        for (index, part) in BAR_BUTTONS.into_iter().enumerate() {
+            let left = titles_width + index * side;
+            let mut ink = ink;
+            if look.hovered == Some(part) {
+                // Close hovers red, as a warning; the others just lift a little.
+                let backdrop = if part == BarPart::Close {
+                    ink = [255, 255, 255];
+                    CLOSE_HOVER
+                } else {
+                    mix(plain, text_on(plain), 0.15)
+                };
+                draw_hover_square(&mut pixels, width, left, side, height, scale, backdrop);
+            }
+            draw_button_icon(&mut pixels, width, left, side, height, scale, ink, part);
+        }
     }
 
     pixels
 }
 
-#[derive(Clone, Copy)]
-enum ButtonIcon {
-    Float,
-    Close,
+/// The rounded square behind a hovered button, inset from the button's edges.
+fn draw_hover_square(
+    pixels: &mut [u8],
+    width: usize,
+    left: usize,
+    side: usize,
+    height: usize,
+    scale: f32,
+    color: [u8; 3],
+) {
+    let inset = 3.0 * scale;
+    let radius = 4.0 * scale;
+    let half_width = side as f32 / 2.0 - inset;
+    let half_height = height as f32 / 2.0 - inset;
+    let center_x = left as f32 + side as f32 / 2.0;
+    let center_y = height as f32 / 2.0;
+    for y in 0..height {
+        for x in left..(left + side).min(width) {
+            // Signed distance to a rounded rectangle: negative inside.
+            let dx = (x as f32 + 0.5 - center_x).abs() - (half_width - radius);
+            let dy = (y as f32 + 0.5 - center_y).abs() - (half_height - radius);
+            let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - radius;
+            let coverage = (0.5 - outside).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(pixels, width, x, y, color, (coverage * 255.0) as u16);
+            }
+        }
+    }
 }
 
 /// A titlebar button's icon, centred in its square, anti-aliased by each
-/// pixel's distance from the stroke: a square outline for float/tile, a cross
-/// for close.
+/// pixel's distance from the stroke: a bar for minimize, a square outline for
+/// float/tile, a cross for close.
 #[allow(clippy::too_many_arguments)]
 fn draw_button_icon(
     pixels: &mut [u8],
@@ -560,7 +634,7 @@ fn draw_button_icon(
     height: usize,
     scale: f32,
     ink: [u8; 3],
-    icon: ButtonIcon,
+    icon: BarPart,
 ) {
     let half = side.min(height) as f32 * 0.18;
     let stroke = (1.25 * scale).max(1.0);
@@ -571,14 +645,21 @@ fn draw_button_icon(
             let dx = x as f32 + 0.5 - center_x;
             let dy = y as f32 + 0.5 - center_y;
             let distance = match icon {
-                ButtonIcon::Float => {
+                BarPart::Title => return,
+                BarPart::Minimize => {
+                    if dx.abs() > half + stroke {
+                        continue;
+                    }
+                    dy.abs()
+                }
+                BarPart::Float => {
                     let outside = dx.abs().max(dy.abs());
                     if outside > half + stroke {
                         continue;
                     }
                     (outside - half).abs()
                 }
-                ButtonIcon::Close => {
+                BarPart::Close => {
                     if dx.abs() > half + stroke || dy.abs() > half + stroke {
                         continue;
                     }
@@ -591,6 +672,52 @@ fn draw_button_icon(
             }
         }
     }
+}
+
+fn bundled_font() -> Font {
+    Font::from_bytes(
+        include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
+        FontSettings::default(),
+    )
+    .expect("bundled Noto Sans must be a valid font")
+}
+
+/// The family titlebars ask fontconfig for: `titlebar_font`, else `font`
+/// without its trailing point size.
+fn titlebar_family(theme: &crate::config::ThemeConfig) -> Option<String> {
+    if let Some(family) = &theme.titlebar_font {
+        return Some(family.trim().to_owned());
+    }
+    let font = theme.font.as_deref()?.trim();
+    let family = match font.rsplit_once(' ') {
+        Some((family, size)) if size.parse::<f32>().is_ok() => family.trim_end(),
+        _ => font,
+    };
+    (!family.is_empty()).then(|| family.to_owned())
+}
+
+/// The file fontconfig picks for `family`, as a font. Runs once per change of
+/// family, so shelling out to `fc-match` is cheaper than linking fontconfig.
+fn system_font(family: &str) -> Option<Font> {
+    let output = std::process::Command::new("fc-match")
+        .args(["--format=%{file}\n%{index}", family])
+        .output()
+        .inspect_err(|error| tracing::warn!(?error, "fc-match failed; using the bundled font"))
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (file, index) = text.split_once('\n')?;
+    let bytes = std::fs::read(file)
+        .inspect_err(|error| tracing::warn!(?error, file, "could not read titlebar font"))
+        .ok()?;
+    Font::from_bytes(
+        bytes,
+        FontSettings {
+            collection_index: index.trim().parse().unwrap_or(0),
+            ..FontSettings::default()
+        },
+    )
+    .inspect_err(|error| tracing::warn!(%error, file, "unusable titlebar font"))
+    .ok()
 }
 
 fn fitted_tab_title(font: &Font, title: &str, size: f32, available: f32) -> String {
@@ -673,6 +800,8 @@ pub struct Effects {
     /// `overview_ring` would make the two evict each other every frame.
     panel_ring: Option<((i32, i32), PixelShaderElement)>,
     tab_font: Font,
+    /// The family `tab_font` was looked up for; `None` is the bundled font.
+    tab_font_family: Option<String>,
     tab_buffers: HashMap<(String, BarKey), TabBuffer>,
 }
 
@@ -681,6 +810,7 @@ struct TabBuffer {
     scale: u64,
     active: usize,
     focused: bool,
+    hovered: Option<BarPart>,
     titles: Vec<String>,
     generation: usize,
     buffer: MemoryRenderBuffer,
@@ -715,11 +845,8 @@ impl Effects {
             overview_shadows: std::array::from_fn(|_| None),
             overview_ring: None,
             panel_ring: None,
-            tab_font: Font::from_bytes(
-                include_bytes!("../assets/NotoSans-Regular.ttf") as &[u8],
-                FontSettings::default(),
-            )
-            .expect("bundled Noto Sans must be a valid font"),
+            tab_font: bundled_font(),
+            tab_font_family: None,
             tab_buffers: HashMap::new(),
         }
     }
@@ -772,6 +899,15 @@ impl Effects {
             if self.blur_programs.is_some() {
                 state.enable_background_effects();
             }
+        }
+        let family = titlebar_family(&state.config.theme);
+        if family != self.tab_font_family {
+            self.tab_font = family
+                .as_deref()
+                .and_then(system_font)
+                .unwrap_or_else(bundled_font);
+            self.tab_font_family = family;
+            self.generation = self.generation.wrapping_add(1);
         }
         state.advance_animations();
         // Checked before anything else: while locked, nothing but the lock
@@ -957,6 +1093,7 @@ impl Effects {
                         && cached.scale == scale_bits
                         && cached.active == bar.active
                         && cached.focused == bar.focused
+                        && cached.hovered == bar.hovered
                         && cached.titles == bar.titles
                         && cached.generation == self.generation
                 });
@@ -970,6 +1107,7 @@ impl Effects {
                             active: bar.active,
                             focused: bar.focused,
                             buttons: bar.buttons,
+                            hovered: bar.hovered,
                             focus_color: self.appearance.focus_ring_color,
                             bar_color: self.appearance.titlebar_color,
                         },
@@ -981,6 +1119,7 @@ impl Effects {
                             scale: scale_bits,
                             active: bar.active,
                             focused: bar.focused,
+                            hovered: bar.hovered,
                             titles: bar.titles,
                             generation: self.generation,
                             buffer,
@@ -2271,8 +2410,9 @@ mod tests {
             active: 0,
             focused,
             buttons: true,
-            focus_color: [1.0, 0.0, 0.0, 1.0],
-            bar_color: [0.0, 0.0, 1.0, 1.0],
+            hovered: None,
+            focus_color: [1.0, 0.8, 0.0, 1.0],
+            bar_color: [0.0, 0.0, 0.2, 1.0],
         };
         let pixel = |data: &[u8], x: usize, y: usize| {
             let offset = (y * 300 + x) * 4;
@@ -2280,13 +2420,68 @@ mod tests {
         };
         let focused = title_pixels(&font, size, 1.0, &look(true));
         let unfocused = title_pixels(&font, size, 1.0, &look(false));
-        // Top-left corner: the focus colour only while focused.
-        assert_eq!(pixel(&focused, 1, 1), [255, 0, 0]);
-        assert_eq!(pixel(&unfocused, 1, 1), [0, 0, 255]);
-        // The close button is the last 24 px: ink at its centre, the cross.
-        assert_eq!(pixel(&unfocused, 300 - 12, 12), [255, 255, 255]);
+        // The bar keeps its own colour either way.
+        assert_eq!(pixel(&focused, 1, 1), [0, 0, 51]);
+        assert_eq!(pixel(&unfocused, 1, 1), [0, 0, 51]);
+        // The close button is the last 24 px: ink at its centre, the cross -
+        // the focus colour while focused, faded text otherwise.
+        assert_eq!(pixel(&focused, 300 - 12, 12), [255, 204, 0]);
+        assert_eq!(pixel(&unfocused, 300 - 12, 12), [153, 153, 173]);
         // The float/tile button before it is an outline, hollow in the middle.
-        assert_eq!(pixel(&unfocused, 300 - 36, 12), [0, 0, 255]);
+        assert_eq!(pixel(&unfocused, 300 - 36, 12), [0, 0, 51]);
+        // Minimize, first of the three, is a bar through the middle - which
+        // falls between two pixel rows, so it only partly covers each.
+        assert_ne!(pixel(&unfocused, 300 - 60, 12), [0, 0, 51]);
+        assert_eq!(pixel(&unfocused, 300 - 60, 6), [0, 0, 51]);
+
+        // Hovered: close sits on red with a white cross, the others on the
+        // bar lifted a little towards its text colour.
+        let hovered = |part| {
+            title_pixels(
+                &font,
+                size,
+                1.0,
+                &BarLook {
+                    hovered: Some(part),
+                    ..look(false)
+                },
+            )
+        };
+        let close = hovered(BarPart::Close);
+        assert_eq!(pixel(&close, 300 - 12, 12), [255, 255, 255]);
+        assert_eq!(pixel(&close, 300 - 12, 5), [0xE0, 0x48, 0x4D]);
+        assert_eq!(pixel(&close, 300 - 12, 1), [0, 0, 51]);
+        let float = hovered(BarPart::Float);
+        assert_eq!(pixel(&float, 300 - 36, 12), [38, 38, 82]);
+        assert_eq!(pixel(&float, 300 - 12, 5), [0, 0, 51]);
+    }
+
+    #[test]
+    fn focus_ink_falls_back_to_text_when_it_would_not_read() {
+        assert_eq!(accent_on([255, 204, 0], [0, 0, 51]), [255, 204, 0]);
+        assert_eq!(accent_on([40, 40, 60], [36, 40, 59]), [255, 255, 255]);
+    }
+
+    #[test]
+    fn titlebar_font_falls_back_to_the_theme_font_family() {
+        let theme = |titlebar_font: Option<&str>, font: Option<&str>| crate::config::ThemeConfig {
+            titlebar_font: titlebar_font.map(str::to_owned),
+            font: font.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(
+            titlebar_family(&theme(Some("Inter"), Some("Sans 11"))).as_deref(),
+            Some("Inter")
+        );
+        assert_eq!(
+            titlebar_family(&theme(None, Some("Fira Sans 10.5"))).as_deref(),
+            Some("Fira Sans")
+        );
+        assert_eq!(
+            titlebar_family(&theme(None, Some("Monofur"))).as_deref(),
+            Some("Monofur")
+        );
+        assert_eq!(titlebar_family(&theme(None, None)), None);
     }
 
     #[test]
