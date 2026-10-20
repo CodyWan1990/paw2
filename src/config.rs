@@ -293,6 +293,8 @@ impl AnimationConfig {
 pub struct InputConfig {
     pub focus_follows_mouse: bool,
     pub middle_click_paste: bool,
+    /// Highlighted text goes on the clipboard as well as the primary selection.
+    pub copy_on_select: bool,
 }
 
 impl Default for InputConfig {
@@ -304,6 +306,7 @@ impl Default for InputConfig {
             // minimal. It sits with `direct_scanout` on the short list of
             // defaults that are not decoration.
             middle_click_paste: true,
+            copy_on_select: false,
         }
     }
 }

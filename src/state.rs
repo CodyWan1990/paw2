@@ -116,6 +116,7 @@ pub struct Paw2 {
     pub workspace_state: WorkspaceState,
     pub screencopy_state: ScreencopyState,
     pub ipc: IpcState,
+    pub clipboard: crate::clipboard::ClipboardState,
     pub session: crate::session::SessionState,
     pub gamma: crate::gamma::GammaState,
 }
@@ -265,6 +266,7 @@ impl Paw2 {
             workspace_state,
             screencopy_state,
             ipc: IpcState::default(),
+            clipboard: Default::default(),
             session,
             gamma,
         }

@@ -25,7 +25,7 @@ use smithay::{
     },
 };
 
-use crate::{handlers::KeyboardFocus, state::Paw2};
+use crate::{clipboard::SelectionOwner, handlers::KeyboardFocus, state::Paw2};
 
 pub fn start(handle: LoopHandle<'static, Paw2>, state: &mut Paw2) -> io::Result<u32> {
     let (xwayland, client) = XWayland::spawn(
@@ -277,25 +277,38 @@ impl XwmHandler for Paw2 {
 
     fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         match selection {
-            SelectionTarget::Clipboard => {
-                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ())
-            }
+            SelectionTarget::Clipboard => set_data_device_selection(
+                &self.display_handle,
+                &self.seat,
+                mime_types,
+                SelectionOwner::X11,
+            ),
             SelectionTarget::Primary if self.config.input.middle_click_paste => {
-                set_primary_selection(&self.display_handle, &self.seat, mime_types, ())
+                self.x11_primary_changed(&mime_types);
+                set_primary_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types,
+                    SelectionOwner::X11,
+                );
             }
             SelectionTarget::Primary => {}
         }
     }
 
+    /// The X11 owner gave a selection up. Only clear it if X11 still holds it:
+    /// text Paw2 copied on select outlives the app it came from.
     fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
         match selection {
             SelectionTarget::Clipboard
-                if current_data_device_selection_userdata(&self.seat).is_some() =>
+                if current_data_device_selection_userdata(&self.seat)
+                    .is_some_and(|owner| matches!(*owner, SelectionOwner::X11)) =>
             {
                 clear_data_device_selection(&self.display_handle, &self.seat)
             }
             SelectionTarget::Primary
-                if current_primary_selection_userdata(&self.seat).is_some() =>
+                if current_primary_selection_userdata(&self.seat)
+                    .is_some_and(|owner| matches!(*owner, SelectionOwner::X11)) =>
             {
                 clear_primary_selection(&self.display_handle, &self.seat)
             }

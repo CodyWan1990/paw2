@@ -1,6 +1,7 @@
 #![allow(irrefutable_let_patterns)]
 
 mod backend;
+mod clipboard;
 mod config;
 mod cursor;
 mod decoration;

@@ -120,6 +120,10 @@ focus_follows_mouse = false
 # Turning it off applies on save for new clients and for XWayland; a clipboard
 # manager that already bound ext-data-control keeps its access until restart.
 middle_click_paste = true
+# Also put highlighted text on the clipboard, so Ctrl+V pastes it too. Paw2
+# keeps its own copy, which outlives the app it came from. Needs
+# middle_click_paste. Default: false.
+copy_on_select = false
 
 # Desktop theme values are optional. Cursor, GTK and icon changes apply live;
 # Qt style and font changes apply at startup. The cursor size is between 1

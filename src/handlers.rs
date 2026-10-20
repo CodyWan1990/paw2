@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, os::fd::OwnedFd};
 
 use smithay::{
     backend::{
@@ -50,7 +50,7 @@ use smithay::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
         },
         selection::{
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
             data_device::{
                 DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
             },
@@ -72,7 +72,10 @@ use smithay::{
     xwayland::{X11Surface, XWaylandClientData},
 };
 
-use crate::state::{ClientState, Paw2};
+use crate::{
+    clipboard::SelectionOwner,
+    state::{ClientState, Paw2},
+};
 
 impl CompositorHandler for Paw2 {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -829,7 +832,27 @@ impl ExtBackgroundEffectHandler for Paw2 {
     }
 }
 impl SelectionHandler for Paw2 {
-    type SelectionUserData = ();
+    type SelectionUserData = SelectionOwner;
+
+    fn new_selection(
+        &mut self,
+        target: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        self.client_selection_changed(target, source);
+    }
+
+    fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        owner: &SelectionOwner,
+    ) {
+        self.send_owned_selection(target, mime_type, fd, owner);
+    }
 }
 impl DataDeviceHandler for Paw2 {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
