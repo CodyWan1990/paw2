@@ -360,6 +360,11 @@ struct Workspace {
     master_ratio: Option<f64>,
     master_weights: Vec<f64>,
     dwindle_ratios: Vec<f64>,
+    /// The newest window and the one that had focus when it opened. Closing the
+    /// newest window while it still has focus goes back there, so a window that
+    /// flashes open and shut - `wl-copy` grabbing the clipboard, a launcher -
+    /// leaves you where you were instead of on whatever sits next to it.
+    opened_from: Option<(Window, Window)>,
 }
 
 impl Default for Workspace {
@@ -376,6 +381,7 @@ impl Default for Workspace {
             master_ratio: None,
             master_weights: Vec::new(),
             dwindle_ratios: Vec::new(),
+            opened_from: None,
         }
     }
 }
@@ -390,6 +396,10 @@ impl Workspace {
     }
 
     fn add(&mut self, window: Window, floating: bool) {
+        self.opened_from = self
+            .focused
+            .and_then(|index| self.windows.get(index))
+            .map(|previous| (window.clone(), previous.clone()));
         if !floating {
             let index = column_insertion_index(self.focused_column(), self.columns.len());
             self.columns.insert(index, Column::new(window.clone()));
@@ -673,7 +683,17 @@ impl Workspace {
             self.fullscreen = None;
         }
         self.remove_from_column(&window);
+        let was_focused = self.focused == Some(index);
         self.focused = focus_after_removal(self.focused, index, self.windows.len());
+        match self.opened_from.take() {
+            Some((newest, previous)) if newest == window => {
+                if was_focused && let Some(previous) = self.window_index(&previous) {
+                    self.focused = Some(previous);
+                }
+            }
+            Some((_, previous)) if previous == window => {}
+            other => self.opened_from = other,
+        }
         Some(window)
     }
 
