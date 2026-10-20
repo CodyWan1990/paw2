@@ -3280,6 +3280,11 @@ impl Paw2 {
             return None;
         }
         let monitor = self.monitor_at(position)?;
+        // A fullscreen output draws no bars. Checking first also keeps every
+        // pointer motion over a fullscreen game from building them all.
+        if self.renders_fullscreen(&monitor.output) {
+            return None;
+        }
         let output_location = monitor.space.output_geometry(&monitor.output)?.loc;
         let local = position - output_location.to_f64();
         let layers = layer_map_for_output(&monitor.output);
