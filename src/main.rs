@@ -197,6 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     phase(&clock, "startup complete");
     let result = event_loop.run(None, &mut state, |state| {
+        state.end_activity_iteration();
         ipc::flush(state);
         let _ = state.display_handle.flush_clients();
     });

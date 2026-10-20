@@ -42,6 +42,8 @@ pub struct SessionState {
     lock_surfaces: HashMap<String, LockSurface>,
     /// Surfaces holding an `zwp_idle_inhibitor_v1`.
     idle_inhibitors: Vec<WlSurface>,
+    /// Whether this event-loop iteration already reset the idle timers.
+    activity_noted: bool,
 }
 
 enum LockStatus {
@@ -72,6 +74,7 @@ impl SessionState {
             lock: LockStatus::Unlocked,
             lock_surfaces: HashMap::new(),
             idle_inhibitors: Vec::new(),
+            activity_noted: false,
         }
     }
 }
@@ -207,10 +210,23 @@ impl Paw2 {
         self.session.idle_notifier.set_is_inhibited(inhibited);
     }
 
-    /// Any input at all resets every client's idle timers.
+    /// Any input at all resets every client's idle timers. Resetting them
+    /// re-arms one event-loop timer per idle notification, so a 1000 Hz mouse
+    /// would do that thousands of times a second; once per event-loop
+    /// iteration is just as accurate.
     pub(crate) fn note_user_activity(&mut self) {
+        if self.session.activity_noted {
+            return;
+        }
+        self.session.activity_noted = true;
         let seat = self.seat.clone();
         self.session.idle_notifier.notify_activity(&seat);
+    }
+
+    /// Called once per event-loop iteration, so the next input resets the
+    /// idle timers again.
+    pub(crate) fn end_activity_iteration(&mut self) {
+        self.session.activity_noted = false;
     }
 }
 
