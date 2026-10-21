@@ -327,6 +327,7 @@ smithay::backend::renderer::element::render_elements! {
     Cursor=WaylandSurfaceRenderElement<GlesRenderer>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Constrained=ConstrainedWindowElement,
+    Cropped=CropRenderElement<SpaceElements>,
     Solid=SolidColorRenderElement,
 }
 
@@ -1013,8 +1014,9 @@ impl Effects {
             if scratchpad_overview && window_state.is_some_and(|window| window.scratchpad) {
                 continue;
             }
-            let blur = self.blur_elements(state, &element, scale, output_bounds, window_state);
-            let shadow = self.shadow_element(&output_name, element.id(), window_state);
+            let root_state = window_state.filter(|window| !window.subsurface);
+            let blur = self.blur_elements(state, &element, scale, output_bounds, root_state);
+            let shadow = self.shadow_element(&output_name, element.id(), root_state);
             if shadow.is_some() {
                 shadowed.push(element.id().clone());
             }
@@ -1022,13 +1024,13 @@ impl Effects {
             let unfocused_ring = if focused {
                 None
             } else {
-                self.unfocused_ring(&output_name, element.id(), window_state)
+                self.unfocused_ring(&output_name, element.id(), root_state)
             };
             let tab = tab_elements
                 .iter()
                 .position(|(root, _)| root == element.id())
                 .map(|index| tab_elements.remove(index).1);
-            elements.push(self.window_element(element, scale, window_state));
+            elements.extend(self.window_element(element, scale, window_state));
             elements.extend(tab.map(PawRenderElements::Memory));
             if focused {
                 elements.extend(
@@ -1408,33 +1410,37 @@ impl Effects {
     }
 
     /// Wraps a window in the corner/opacity shader. Anything that is not a
-    /// window - layer surfaces, the cursor - and any window with no effect to
-    /// apply is passed through untouched, so the opaque fast path survives.
+    /// window - layer surfaces, the cursor - is passed through untouched. A
+    /// window with no effect to apply is only cropped to its geometry, so the
+    /// opaque fast path survives.
     fn window_element(
         &self,
         element: SpaceElements,
         scale: Scale<f64>,
         window_state: Option<WindowRenderState>,
-    ) -> PawRenderElements {
+    ) -> Option<PawRenderElements> {
         let radius = self.appearance.corner_radius as f64 * scale.x;
-        if !matches!(element, SpaceElements::Element(_)) || !window_effects(&self.appearance) {
-            return PawRenderElements::Space(element);
+        if !matches!(element, SpaceElements::Element(_)) {
+            return Some(PawRenderElements::Space(element));
         }
-        let Some(program) = self.window_program.clone() else {
-            return PawRenderElements::Space(element);
-        };
         let Some(WindowRenderState {
             client: window,
             opacity,
             ..
         }) = window_state
         else {
-            return PawRenderElements::Space(element);
+            return Some(PawRenderElements::Space(element));
         };
         let window = window.to_f64().to_physical(scale).to_i32_round();
+        let program = window_effects(&self.appearance)
+            .then(|| self.window_program.clone())
+            .flatten();
+        let Some(program) = program else {
+            return cropped_to_window(element, scale, window);
+        };
         let (elem_size, geo_offset, geo_size) =
             window_shader_geometry(window, element.geometry(scale));
-        PawRenderElements::Window(WindowShaderElement {
+        Some(PawRenderElements::Window(WindowShaderElement {
             id: element.id().namespaced(window_namespace(self.generation)),
             inner: element,
             program,
@@ -1446,7 +1452,7 @@ impl Effects {
                 Uniform::new("opacity", opacity),
             ],
             opaque_inset: (opacity >= 1.0).then_some((window, radius.ceil() as i32)),
-        })
+        }))
     }
 
     fn blur_elements(
@@ -1633,6 +1639,21 @@ struct BlurPrograms {
 
 /// True when a window needs the shader at all. Kept in one place so the "no
 /// effects configured" path stays byte-identical to having no shader support.
+/// Cut a window's surface down to its geometry when nothing else will. Without
+/// rounded corners or transparency the window shader is skipped, and clients
+/// that paint past their geometry - Chromium draws a frame line there - would
+/// cover the focus ring. `None` for a surface wholly outside its window.
+fn cropped_to_window(
+    element: SpaceElements,
+    scale: Scale<f64>,
+    window: Rectangle<i32, Physical>,
+) -> Option<PawRenderElements> {
+    if window.contains_rect(element.geometry(scale)) {
+        return Some(PawRenderElements::Space(element));
+    }
+    CropRenderElement::from_element(element, scale, window).map(PawRenderElements::Cropped)
+}
+
 fn window_effects(appearance: &AppearanceConfig) -> bool {
     appearance.corner_radius > 0 || appearance.window_opacity() < 1.0
 }

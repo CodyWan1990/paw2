@@ -19,7 +19,9 @@ use smithay::{
     utils::{Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Size, Time},
     wayland::{
         commit_timing::CommitTimerBarrierStateUserData,
-        compositor::{CompositorHandler, SurfaceData, with_states},
+        compositor::{
+            CompositorHandler, SurfaceData, TraversalAction, with_states, with_surface_tree_downward,
+        },
         fifo::FifoBarrierCachedState,
         fractional_scale::with_fractional_scale,
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
@@ -198,6 +200,9 @@ pub(crate) struct WindowRenderState {
     pub frame: Rectangle<i32, Logical>,
     pub opacity: f32,
     pub scratchpad: bool,
+    /// Keyed by one of the window's subsurfaces rather than its root. These
+    /// only share the root's clip; blur, shadow and rings belong to the root.
+    pub subsurface: bool,
 }
 
 /// One column of the scrolling layout, and the row it remembers.
@@ -3425,12 +3430,6 @@ impl Paw2 {
             .collect()
     }
 
-    /// Output-relative geometry and effective opacity for a rendered element,
-    /// or `None` when the element is not a window's root surface. Matches only
-    /// root surfaces, so subsurfaces fall through untouched.
-    // ponytail: linear scan per element, so O(n^2) per frame in window count.
-    // Never runs on the fullscreen path and n is small; index by surface id if a
-    // workspace ever holds enough windows for it to show up in a profile.
     /// Output-relative geometry and effective opacity for every window that is
     /// rendering on `output`, keyed by the render element id of its root
     /// surface.
@@ -3441,8 +3440,10 @@ impl Paw2 {
     /// twice over for the elements that are not windows at all, like layer
     /// surfaces and the cursor.
     ///
-    /// Only root surfaces appear, so subsurfaces are neither blurred nor
-    /// rounded.
+    /// Subsurfaces appear too, marked `subsurface`, so they are clipped to the
+    /// window like the root is. Chromium draws its frame in subsurfaces that
+    /// reach past its window geometry; left unclipped, they cover the focus
+    /// ring.
     // `Id` hashes by the render element's identity - a `wl_resource` id or an
     // allocation - which never changes. The interior mutability clippy sees is
     // in the object it points at, not in what the hash is taken from.
@@ -3481,7 +3482,8 @@ impl Paw2 {
             .chain(scratchpads.map(|window| (window, true)))
             .chain(dragged.map(|window| (window, false)))
             .filter_map(|(window, scratchpad)| {
-                let element = Id::from_wayland_resource(&window_surface(window)?);
+                let root = window_surface(window)?;
+                let element = Id::from_wayland_resource(&root);
                 let mut client = monitor.space.element_geometry(window)?;
                 client.loc -= output_location;
                 let frame = if has_bar(workspace, window, &self.config) {
@@ -3494,16 +3496,32 @@ impl Paw2 {
                     .animations
                     .get(&window.id())
                     .map_or(1.0, |animation| animation.opacity(now));
-                Some((
-                    element,
-                    WindowRenderState {
-                        client,
-                        frame,
-                        opacity: opacity * fade,
-                        scratchpad: scratchpad || self.scratchpad_name_for_window(window).is_some(),
+                let state = WindowRenderState {
+                    client,
+                    frame,
+                    opacity: opacity * fade,
+                    scratchpad: scratchpad || self.scratchpad_name_for_window(window).is_some(),
+                    subsurface: false,
+                };
+                let mut surfaces = vec![(element, state)];
+                let subsurface = WindowRenderState {
+                    subsurface: true,
+                    ..state
+                };
+                with_surface_tree_downward(
+                    &root,
+                    (),
+                    |_, _, _| TraversalAction::DoChildren(()),
+                    |surface, _, _| {
+                        if *surface != root {
+                            surfaces.push((Id::from_wayland_resource(surface), subsurface));
+                        }
                     },
-                ))
+                    |_, _, _| true,
+                );
+                Some(surfaces)
             })
+            .flatten()
             .collect()
     }
 
