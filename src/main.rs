@@ -431,7 +431,9 @@ fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)>
     if let Some(value) = &theme.qt_style {
         variables.push(("QT_STYLE_OVERRIDE", value.clone()));
     }
-    if theme.icon_theme.is_some() || theme.font.is_some() {
+    if let Some(value) = &theme.qt_platform_theme {
+        variables.push(("QT_QPA_PLATFORMTHEME", value.clone()));
+    } else if theme.icon_theme.is_some() || theme.font.is_some() {
         variables.push(("QT_QPA_PLATFORMTHEME", "gtk3".into()));
     }
     variables
@@ -716,6 +718,19 @@ mod tests {
     }
 
     #[test]
+    fn qt_platform_theme_replaces_the_gtk3_default() {
+        let theme = config::ThemeConfig {
+            icon_theme: Some("Icons".into()),
+            qt_platform_theme: Some("qt6ct".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            theme_environment(&theme),
+            [("QT_QPA_PLATFORMTHEME", "qt6ct".into())]
+        );
+    }
+
+    #[test]
     fn maps_theme_to_desktop_interfaces() {
         let theme = config::ThemeConfig {
             cursor_theme: Some("Cursor".into()),
@@ -723,6 +738,7 @@ mod tests {
             icon_theme: Some("Icons".into()),
             gtk_theme: Some("Gtk".into()),
             qt_style: Some("Qt".into()),
+            qt_platform_theme: None,
             font: Some("Sans 11".into()),
             titlebar_font: None,
         };

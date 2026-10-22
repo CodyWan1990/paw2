@@ -126,15 +126,19 @@ middle_click_paste = true
 copy_on_select = false
 
 # Desktop theme values are optional. Cursor, GTK and icon changes apply live;
-# Qt style and font changes apply at startup. The cursor size is between 1
-# and 256, and no value here may be left blank. titlebar_font is a fontconfig
-# family for titlebar text; it applies live, and unset uses font's family.
+# Qt style, Qt platform theme and font changes apply at startup. The cursor
+# size is between 1 and 256, and no value here may be left blank.
+# titlebar_font is a fontconfig family for titlebar text; it applies live, and
+# unset uses font's family. qt_platform_theme sets QT_QPA_PLATFORMTHEME, for
+# example "qt5ct" or "qt6ct"; unset uses "gtk3" whenever icon_theme or font is
+# set, so Qt apps follow them.
 #[theme]
 #cursor_theme = "Oxygen_Zion"
 #cursor_size = 24
 #icon_theme = "Papirus-Dark"
 #gtk_theme = "Breeze"
 #qt_style = "Breeze"
+#qt_platform_theme = "qt6ct"
 #font = "Monofur Nerd Font Propo 12"
 #titlebar_font = "Inter"
 

@@ -694,8 +694,11 @@ impl Paw2 {
                     }
                     return;
                 }
+                // Wheel bindings are modifier shortcuts too, so an inhibiting client (a shortcut
+                // recorder, a VM) gets the wheel the same way it gets keys.
                 if source == AxisSource::Wheel
                     && !self.session_locked()
+                    && !self.keyboard_inhibited()
                     && let Some(amount) = event.amount_v120(Axis::Vertical)
                     && amount != 0.0
                 {

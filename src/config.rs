@@ -357,6 +357,9 @@ pub struct ThemeConfig {
     pub icon_theme: Option<String>,
     pub gtk_theme: Option<String>,
     pub qt_style: Option<String>,
+    /// `QT_QPA_PLATFORMTHEME` for Qt apps, such as "qt5ct" or "qt6ct". Unset
+    /// keeps "gtk3" whenever `icon_theme` or `font` is set, so Qt apps follow them.
+    pub qt_platform_theme: Option<String>,
     pub font: Option<String>,
     /// A fontconfig family for titlebar and tab text. Unlike `font` it applies
     /// live; unset falls back to `font`'s family, then the bundled Noto Sans.
@@ -500,7 +503,9 @@ impl Action {
 }
 
 fn theme_requires_restart(current: &ThemeConfig, updated: &ThemeConfig) -> bool {
-    current.qt_style != updated.qt_style || current.font != updated.font
+    current.qt_style != updated.qt_style
+        || current.qt_platform_theme != updated.qt_platform_theme
+        || current.font != updated.font
 }
 
 fn monitors_require_restart(current: &[MonitorConfig], updated: &[MonitorConfig]) -> bool {
@@ -1348,6 +1353,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         ("icon_theme", &raw.theme.icon_theme),
         ("gtk_theme", &raw.theme.gtk_theme),
         ("qt_style", &raw.theme.qt_style),
+        ("qt_platform_theme", &raw.theme.qt_platform_theme),
         ("font", &raw.theme.font),
         ("titlebar_font", &raw.theme.titlebar_font),
     ] {
