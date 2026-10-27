@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use smithay::reexports::rustix;
 use smithay::{
     input::keyboard::{Keysym, ModifiersState, keysyms, xkb},
     utils::Transform,
@@ -82,6 +83,10 @@ middle_click_paste = true
 
 [backend]
 direct_scanout = true
+
+# Empty, so every colour comes from its own section. Present so a settings tool
+# reading the effective config over IPC can tell this Paw2 understands it.
+[colors]
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,25 +208,133 @@ impl LayoutMode {
 /// only the keys it has a control for. Unlike the cosmetic sections these
 /// defaults are not "off": a layout has to place windows somewhere, and
 /// `enabled_layouts` may not be empty.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayoutConfig {
     pub enabled_layouts: Vec<LayoutMode>,
-    pub column_width: f64,
-    pub preset_column_widths: Vec<f64>,
-    pub center_focused_column: bool,
+    /// The layout a workspace starts in. One of `enabled_layouts`.
+    pub default: LayoutMode,
     pub tab_grouping: bool,
+    pub scrolling: ScrollingConfig,
+    pub master_stack: MasterStackConfig,
+    pub dwindle: DwindleConfig,
+    pub monocle: MonocleConfig,
 }
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
             enabled_layouts: default_enabled_layouts(),
+            default: LayoutMode::Scrolling,
+            tab_grouping: false,
+            scrolling: ScrollingConfig::default(),
+            master_stack: MasterStackConfig::default(),
+            dwindle: DwindleConfig::default(),
+            monocle: MonocleConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollingConfig {
+    /// Default fraction of the output width a column takes.
+    pub column_width: f64,
+    /// Widths `cycle_column_width` steps through.
+    pub preset_column_widths: Vec<f64>,
+    pub center_focused_column: bool,
+}
+
+impl Default for ScrollingConfig {
+    fn default() -> Self {
+        Self {
             column_width: 0.6,
             preset_column_widths: default_preset_column_widths(),
             center_focused_column: false,
-            tab_grouping: false,
         }
+    }
+}
+
+/// Which side of the output the master area takes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterPosition {
+    #[default]
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl MasterPosition {
+    /// Master and stack sit one above the other rather than side by side.
+    pub fn transposed(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom)
+    }
+
+    /// The master area is at the far end of its axis.
+    pub fn mirrored(self) -> bool {
+        matches!(self, Self::Right | Self::Bottom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MasterStackConfig {
+    /// The master area's share of the output, until a workspace is resized.
+    pub master_ratio: f64,
+    /// How many windows start in the master area.
+    pub master_count: u8,
+    pub position: MasterPosition,
+}
+
+impl Default for MasterStackConfig {
+    fn default() -> Self {
+        Self {
+            master_ratio: 0.6,
+            master_count: 1,
+            position: MasterPosition::Left,
+        }
+    }
+}
+
+/// Which way each dwindle split cuts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DwindleSplit {
+    /// Side by side, then one above the other, and so on.
+    #[default]
+    Alternate,
+    /// Across the longer side of the space being split, so windows stay
+    /// closest to square - side by side first on a wide output.
+    Longest,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DwindleConfig {
+    /// Each new split's share for the window it makes room for.
+    pub split_ratio: f64,
+    pub split: DwindleSplit,
+}
+
+impl Default for DwindleConfig {
+    fn default() -> Self {
+        Self {
+            split_ratio: 0.5,
+            split: DwindleSplit::Alternate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonocleConfig {
+    /// Keep `appearance.gaps` around the window; false fills the output.
+    pub gaps: bool,
+}
+
+impl Default for MonocleConfig {
+    fn default() -> Self {
+        Self { gaps: true }
     }
 }
 
@@ -636,7 +749,7 @@ pub struct ConfigWatcher {
     /// file without changing it does not churn the compositor.
     sources: Vec<String>,
     /// The merged document behind the live `Config`. Kept so the IPC layer can
-    /// hand a shell the effective config without a second copy of the defaults.
+    /// hand a settings tool the effective config without a second copy of the defaults.
     document: toml::Value,
 }
 
@@ -688,7 +801,7 @@ impl ConfigWatcher {
     /// Starting from `FALLBACK_CONFIG` rather than an empty document is what
     /// keeps the fallback bindings alive under a config that never mentions
     /// them, and it means the merged document is the effective config - which
-    /// is what the shell is handed over IPC.
+    /// is what a settings tool is handed over IPC.
     fn merge_sources(layers: &[PathBuf], sources: &[String]) -> io::Result<toml::Value> {
         let mut document =
             toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML");
@@ -713,6 +826,29 @@ impl ConfigWatcher {
         Ok((Self::merge_sources(layers, &sources)?, sources))
     }
 
+    /// Watch the directories holding every layer, so an edit is picked up
+    /// when it lands instead of on the next poll.
+    ///
+    /// Directories rather than files: editors and settings tools save by
+    /// renaming a new file over the old one, which a watch on the old file
+    /// would never see. Call again after each event - `config.d/` may only
+    /// have been created since, and re-adding an existing watch is a no-op.
+    pub fn watch(&self, inotify: impl rustix::fd::AsFd) {
+        use rustix::fs::inotify::{WatchFlags, add_watch};
+        let flags = WatchFlags::CLOSE_WRITE
+            | WatchFlags::MOVED_TO
+            | WatchFlags::MOVED_FROM
+            | WatchFlags::CREATE
+            | WatchFlags::DELETE;
+        let Some(directory) = self.path.parent() else {
+            return;
+        };
+        for directory in [directory.to_path_buf(), directory.join(OVERLAY_DIR)] {
+            // A missing config.d/ is the normal case.
+            let _ = add_watch(&inotify, &directory, flags);
+        }
+    }
+
     /// The merged config as it was last parsed successfully.
     pub fn document(&self) -> &toml::Value {
         &self.document
@@ -723,8 +859,8 @@ impl ConfigWatcher {
         // Compared by content, not by mtime. A layer can be rewritten with an
         // older or preserved timestamp - `cp -p`, `rsync --times`, a `git
         // checkout` - and a gate keyed on the newest mtime would call that no
-        // change and never reload. Reading three small page-cached files twice
-        // a second is not worth a class of missed edits.
+        // change and never reload. Reading three small page-cached files on a
+        // slow fallback poll is not worth a class of missed edits.
         let sources = Self::read_sources(&layers)?;
         if sources == self.sources {
             return Ok(None);
@@ -733,7 +869,8 @@ impl ConfigWatcher {
         // rather than on every poll until the user fixes it.
         self.sources = sources;
         let document = Self::merge_sources(&layers, &self.sources)?;
-        let config = parse_value(document.clone()).map_err(|error| blame(&layers, error))?;
+        let config =
+            parse_value(document.clone()).map_err(|error| blame(&layers, &self.sources, error))?;
         // Only now: `document()` is what Paw2 is running, and a rejected save
         // must leave the last config that parsed on show, not its own values
         // under a banner saying they were refused.
@@ -743,39 +880,40 @@ impl ConfigWatcher {
 
     /// Parse `config.toml` alone, ignoring `config.d/`.
     ///
-    /// A drop-in is generated by the shell's settings UI. A value it rejects
-    /// would otherwise cost the session the whole config, `autostart` included,
-    /// so the shell that would show the error is the one thing that cannot
-    /// start. Keeping the hand-written layer breaks that circle.
+    /// A drop-in is generated by a settings tool. A value it rejects would
+    /// otherwise cost the session the whole config, `autostart` included, so
+    /// the panel that would show the error - usually autostarted itself - is
+    /// the one thing that cannot start. Keeping the hand-written layer breaks that circle.
     ///
     /// `sources` holds the text the failed [`Self::reload`] rejected, so the
     /// next edit to the drop-in - and only an edit - retries the full merge.
     fn base_only(&mut self) -> io::Result<Config> {
         let layers = [self.path.clone()];
-        let (document, _) = Self::read(&layers)?;
-        let config = parse_value(document.clone()).map_err(|error| blame(&layers, error))?;
+        let (document, sources) = Self::read(&layers)?;
+        let config =
+            parse_value(document.clone()).map_err(|error| blame(&layers, &sources, error))?;
         self.document = document;
         Ok(config)
     }
 }
 
-/// Name every layer that fed a merge in the error from validating it.
+/// Name the layer that broke validation in the error from it.
 ///
 /// Validation runs on the merged document, which carries no record of which
-/// layer supplied a given key. Naming them all beats confidently blaming
-/// config.toml for a drop-in's typo.
-fn blame(layers: &[PathBuf], error: String) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "{}: {error}",
-            layers
-                .iter()
-                .map(|layer| layer.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" + ")
-        ),
-    )
+/// layer supplied a given key. So merge the layers one at a time and name the
+/// first one whose addition fails - a typo in config.toml is then never pinned
+/// on a drop-in, and a settings tool can tell its own write apart from someone
+/// else's broken hand edit. Only runs on failure, so the extra merges are free
+/// in the normal case.
+fn blame(layers: &[PathBuf], sources: &[String], error: String) -> io::Error {
+    // The count of layers whose merge first fails; all of them did, so at most `len`.
+    let culprit = (1..=layers.len())
+        .find(|&count| {
+            ConfigWatcher::merge_sources(&layers[..count], &sources[..count])
+                .map_or(true, |document| parse_value(document).is_err())
+        })
+        .unwrap_or(layers.len());
+    invalid_data(&layers[culprit - 1], error)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -867,11 +1005,55 @@ impl Binding {
     }
 }
 
+/// `[layout]` as written. The scrolling keys once sat directly in `[layout]`;
+/// they still parse there, but `[layout.scrolling]` wins and a warning says so.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawLayout {
+    enabled_layouts: Vec<LayoutMode>,
+    default: Option<LayoutMode>,
+    tab_grouping: bool,
+    scrolling: RawScrolling,
+    master_stack: MasterStackConfig,
+    dwindle: DwindleConfig,
+    monocle: MonocleConfig,
+    // The scrolling keys' old home.
+    column_width: Option<f64>,
+    preset_column_widths: Option<Vec<f64>>,
+    center_focused_column: Option<bool>,
+}
+
+impl Default for RawLayout {
+    fn default() -> Self {
+        let defaults = LayoutConfig::default();
+        Self {
+            enabled_layouts: defaults.enabled_layouts,
+            default: None,
+            tab_grouping: defaults.tab_grouping,
+            scrolling: RawScrolling::default(),
+            master_stack: defaults.master_stack,
+            dwindle: defaults.dwindle,
+            monocle: defaults.monocle,
+            column_width: None,
+            preset_column_widths: None,
+            center_focused_column: None,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawScrolling {
+    column_width: Option<f64>,
+    preset_column_widths: Option<Vec<f64>>,
+    center_focused_column: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
-    layout: LayoutConfig,
+    layout: RawLayout,
     #[serde(default)]
     appearance: RawAppearance,
     #[serde(default)]
@@ -890,6 +1072,8 @@ struct RawConfig {
     animations: RawAnimations,
     #[serde(default)]
     overview: RawOverview,
+    #[serde(default)]
+    colors: RawColors,
     #[serde(default)]
     scratchpads: BTreeMap<String, RawScratchpad>,
     #[serde(default)]
@@ -997,6 +1181,36 @@ impl Default for RawOverview {
             backdrop_color: "#1c1c1c".into(),
             scratchpad_position: ScratchpadOverviewPosition::Centered,
         }
+    }
+}
+
+/// Palette overrides, kept apart from `[appearance]` and `[overview]` so a
+/// theming tool can own this one section in its own `config.d/` drop-in and
+/// leave the hand-written look sections alone. Each key, when set, wins over
+/// the matching `*_color` key it names.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawColors {
+    /// `appearance.focus_ring_color`
+    focus_ring: Option<String>,
+    /// `appearance.titlebar_color`
+    titlebar: Option<String>,
+    /// `appearance.shadow_color`
+    shadow: Option<String>,
+    /// `overview.backdrop_color`
+    backdrop: Option<String>,
+}
+
+/// Parse `[colors] override` when it is set, else the section's own key.
+fn color_with_override(
+    override_value: &Option<String>,
+    override_field: &str,
+    value: &str,
+    field: &str,
+) -> Result<[f32; 4], String> {
+    match override_value {
+        Some(value) => parse_color(value, override_field),
+        None => parse_color(value, field),
     }
 }
 
@@ -1158,11 +1372,11 @@ fn default_monitor_scale() -> f64 {
 /// keep, so Paw2 drops layers instead. Exiting here would mean a display
 /// manager returns the user to the greeter with the reason on a stderr nobody
 /// will read - a whole session lost to a typo. Starting means they get a
-/// desktop, the error reaches the log and the shell, and the watcher picks up
-/// the fix within half a second.
+/// desktop, the error reaches the log and any settings tool, and the watcher
+/// picks up the fix as soon as it is saved.
 ///
 /// Layers are dropped in the order that keeps the most of what a person wrote:
-/// the full merge, then `config.toml` alone without the shell's generated
+/// the full merge, then `config.toml` alone without a settings tool's generated
 /// `config.d/`, then the compiled defaults.
 pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
     let path = config_path()?;
@@ -1199,7 +1413,7 @@ pub fn load() -> io::Result<(Config, ConfigWatcher, Option<String>)> {
         }
         Err(_) => {
             tracing::error!(%error, "starting with the default configuration");
-            // What Paw2 is running, so a shell has something to show beside the
+            // What Paw2 is running, so a settings tool has something to show beside the
             // error rather than an empty document.
             watcher.document =
                 toml::from_str(FALLBACK_CONFIG).expect("the compiled default config is valid TOML");
@@ -1261,6 +1475,99 @@ fn parse(source: &str) -> Result<Config, String> {
 ///
 /// The bounds are `{:?}`-formatted so a whole number still reads as `1.0`
 /// rather than `1`, which is how every one of these messages is worded.
+fn parse_layout(raw: RawLayout) -> Result<LayoutConfig, String> {
+    if raw.enabled_layouts.is_empty() {
+        return Err("layout.enabled_layouts must not be empty".into());
+    }
+    if raw
+        .enabled_layouts
+        .iter()
+        .enumerate()
+        .any(|(index, layout)| raw.enabled_layouts[..index].contains(layout))
+    {
+        return Err("layout.enabled_layouts must not contain duplicates".into());
+    }
+    // Unset means the first layout in the cycle, so trimming `enabled_layouts`
+    // never needs a matching edit here.
+    let default = raw.default.unwrap_or(raw.enabled_layouts[0]);
+    if !raw.enabled_layouts.contains(&default) {
+        return Err(format!(
+            "layout.default must be one of layout.enabled_layouts, not {}",
+            default.name()
+        ));
+    }
+
+    let legacy = RawScrolling {
+        column_width: raw.column_width,
+        preset_column_widths: raw.preset_column_widths,
+        center_focused_column: raw.center_focused_column,
+    };
+    if legacy.column_width.is_some()
+        || legacy.preset_column_widths.is_some()
+        || legacy.center_focused_column.is_some()
+    {
+        tracing::warn!(
+            "column_width, preset_column_widths and center_focused_column belong in [layout.scrolling] now; reading them from [layout] for the moment"
+        );
+    }
+    let defaults = ScrollingConfig::default();
+    let current = raw.scrolling;
+    let scrolling = ScrollingConfig {
+        column_width: current
+            .column_width
+            .or(legacy.column_width)
+            .unwrap_or(defaults.column_width),
+        preset_column_widths: current
+            .preset_column_widths
+            .or(legacy.preset_column_widths)
+            .unwrap_or(defaults.preset_column_widths),
+        center_focused_column: current
+            .center_focused_column
+            .or(legacy.center_focused_column)
+            .unwrap_or(defaults.center_focused_column),
+    };
+    finite_in(
+        "layout.scrolling.column_width",
+        scrolling.column_width,
+        0.1..=1.0,
+    )?;
+    if scrolling.preset_column_widths.is_empty()
+        || scrolling
+            .preset_column_widths
+            .iter()
+            .any(|width| !width.is_finite() || !(0.1..=1.0).contains(width))
+    {
+        return Err(
+            "layout.scrolling.preset_column_widths must contain values between 0.1 and 1.0".into(),
+        );
+    }
+
+    // The same bounds a split can be dragged or keyed to.
+    finite_in(
+        "layout.master_stack.master_ratio",
+        raw.master_stack.master_ratio,
+        0.1..=0.9,
+    )?;
+    if !(1..=16).contains(&raw.master_stack.master_count) {
+        return Err("layout.master_stack.master_count must be between 1 and 16".into());
+    }
+    finite_in(
+        "layout.dwindle.split_ratio",
+        raw.dwindle.split_ratio,
+        0.1..=0.9,
+    )?;
+
+    Ok(LayoutConfig {
+        enabled_layouts: raw.enabled_layouts,
+        default,
+        tab_grouping: raw.tab_grouping,
+        scrolling,
+        master_stack: raw.master_stack,
+        dwindle: raw.dwindle,
+        monocle: raw.monocle,
+    })
+}
+
 fn finite_in(field: &str, value: f64, range: std::ops::RangeInclusive<f64>) -> Result<(), String> {
     if !value.is_finite() || !range.contains(&value) {
         return Err(format!(
@@ -1296,28 +1603,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     let raw: RawConfig = document
         .try_into()
         .map_err(|error: toml::de::Error| error.to_string())?;
-    if raw.layout.enabled_layouts.is_empty() {
-        return Err("layout.enabled_layouts must not be empty".into());
-    }
-    if raw
-        .layout
-        .enabled_layouts
-        .iter()
-        .enumerate()
-        .any(|(index, layout)| raw.layout.enabled_layouts[..index].contains(layout))
-    {
-        return Err("layout.enabled_layouts must not contain duplicates".into());
-    }
-    finite_in("layout.column_width", raw.layout.column_width, 0.1..=1.0)?;
-    if raw.layout.preset_column_widths.is_empty()
-        || raw
-            .layout
-            .preset_column_widths
-            .iter()
-            .any(|width| !width.is_finite() || !(0.1..=1.0).contains(width))
-    {
-        return Err("layout.preset_column_widths must contain values between 0.1 and 1.0".into());
-    }
+    let layout = parse_layout(raw.layout)?;
     at_most("appearance.gaps", raw.appearance.gaps, 256)?;
     if raw.appearance.focus_ring_width > raw.appearance.gaps {
         return Err(
@@ -1345,7 +1631,12 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     if !(16..=48).contains(&raw.appearance.titlebar_height) {
         return Err("appearance.titlebar_height must be between 16 and 48".into());
     }
-    let titlebar_color = parse_color(&raw.appearance.titlebar_color, "appearance.titlebar_color")?;
+    let titlebar_color = color_with_override(
+        &raw.colors.titlebar,
+        "colors.titlebar",
+        &raw.appearance.titlebar_color,
+        "appearance.titlebar_color",
+    )?;
     at_most("animations.duration_ms", raw.animations.duration_ms, 5000)?;
     finite_in("animations.slowdown", raw.animations.slowdown, 0.1..=100.0)?;
     for (name, value) in [
@@ -1368,16 +1659,28 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     {
         return Err("theme.cursor_size must be between 1 and 256".into());
     }
-    let focus_ring_color = parse_color(
+    let focus_ring_color = color_with_override(
+        &raw.colors.focus_ring,
+        "colors.focus_ring",
         &raw.appearance.focus_ring_color,
         "appearance.focus_ring_color",
     )?;
     let shadow_color = premultiply(
-        parse_color(&raw.appearance.shadow_color, "appearance.shadow_color")?,
+        color_with_override(
+            &raw.colors.shadow,
+            "colors.shadow",
+            &raw.appearance.shadow_color,
+            "appearance.shadow_color",
+        )?,
         raw.appearance.shadow_opacity as f32,
     );
     finite_in("overview.zoom", raw.overview.zoom, OVERVIEW_ZOOM_RANGE)?;
-    let backdrop_color = parse_color(&raw.overview.backdrop_color, "overview.backdrop_color")?;
+    let backdrop_color = color_with_override(
+        &raw.colors.backdrop,
+        "colors.backdrop",
+        &raw.overview.backdrop_color,
+        "overview.backdrop_color",
+    )?;
     if let Some(path) = &raw.backend.drm_device
         && !path.is_absolute()
     {
@@ -1614,7 +1917,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
     }
 
     Ok(Config {
-        layout: raw.layout,
+        layout,
         appearance: AppearanceConfig {
             gaps: raw.appearance.gaps.into(),
             focus_ring_width: raw.appearance.focus_ring_width.into(),
@@ -1832,6 +2135,80 @@ mod tests {
     /// parses to is the contract. Note that the *defaults* are the off state in
     /// `Default` and `FALLBACK_CONFIG`, not these values.
     #[test]
+    fn layout_options_parse_validate_and_migrate() {
+        let config = parse(EXAMPLE_CONFIG).unwrap();
+        assert_eq!(config.layout.default, LayoutMode::Scrolling);
+        assert_eq!(config.layout.master_stack, MasterStackConfig::default());
+        assert_eq!(config.layout.dwindle, DwindleConfig::default());
+        assert!(config.layout.monocle.gaps);
+
+        let edited = EXAMPLE_CONFIG
+            .edited(r#"position = "left""#, r#"position = "bottom""#)
+            .edited(r#"split = "alternate""#, r#"split = "longest""#)
+            .edited(r#"default = "scrolling""#, r#"default = "dwindle""#);
+        let config = parse(&edited).unwrap();
+        assert_eq!(config.layout.master_stack.position, MasterPosition::Bottom);
+        assert_eq!(config.layout.dwindle.split, DwindleSplit::Longest);
+        assert_eq!(config.layout.default, LayoutMode::Dwindle);
+
+        for (from, to, field) in [
+            ("master_ratio = 0.6", "master_ratio = 0.95", "master_ratio"),
+            ("master_count = 1", "master_count = 0", "master_count"),
+            ("split_ratio = 0.5", "split_ratio = 0.0", "split_ratio"),
+            (
+                r#"enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]"#,
+                r#"enabled_layouts = ["dwindle"]"#,
+                "layout.default",
+            ),
+        ] {
+            let error = parse(&EXAMPLE_CONFIG.edited(from, to)).unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+
+        // Unset, the default is the first layout in the cycle.
+        let config = parse(
+            &EXAMPLE_CONFIG
+                .edited(r#"default = "scrolling""#, "")
+                .edited(
+                    r#"enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]"#,
+                    r#"enabled_layouts = ["monocle", "dwindle"]"#,
+                ),
+        )
+        .unwrap();
+        assert_eq!(config.layout.default, LayoutMode::Monocle);
+
+        // The scrolling keys still work in their old place; the new one wins.
+        let legacy = parse("[layout]\ncolumn_width = 0.4\ncenter_focused_column = true\n").unwrap();
+        assert_eq!(legacy.layout.scrolling.column_width, 0.4);
+        assert!(legacy.layout.scrolling.center_focused_column);
+        let both = parse("[layout]\ncolumn_width = 0.4\n[layout.scrolling]\ncolumn_width = 0.8\n")
+            .unwrap();
+        assert_eq!(both.layout.scrolling.column_width, 0.8);
+    }
+
+    #[test]
+    fn colors_section_overrides_the_look_sections() {
+        let config = parse(&format!(
+            "{}\n[colors]\nfocus_ring = \"#ff0000\"\nbackdrop = \"#00ff00\"\n",
+            EXAMPLE_CONFIG
+        ))
+        .unwrap();
+        assert_eq!(config.appearance.focus_ring_color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(config.overview.backdrop_color, [0.0, 1.0, 0.0, 1.0]);
+        // Unset keys keep the section's own colour.
+        assert_eq!(
+            config.appearance.titlebar_color,
+            [31.0 / 255.0, 31.0 / 255.0, 36.0 / 255.0, 1.0]
+        );
+        let error = parse(&format!(
+            "{}\n[colors]\nshadow = \"black\"\n",
+            EXAMPLE_CONFIG
+        ))
+        .unwrap_err();
+        assert!(error.contains("colors.shadow"), "{error}");
+    }
+
+    #[test]
     fn the_reference_config_parses_to_its_documented_values() {
         let config = parse(EXAMPLE_CONFIG).unwrap();
         assert_eq!(config.bindings.len(), 89);
@@ -1891,9 +2268,12 @@ mod tests {
         assert!(!config.input.focus_follows_mouse);
         assert!(config.input.middle_click_paste);
         assert_eq!(config.theme, ThemeConfig::default());
-        assert_eq!(config.layout.column_width, 0.6);
+        assert_eq!(config.layout.scrolling.column_width, 0.6);
         assert_eq!(config.layout.enabled_layouts, default_enabled_layouts());
-        assert_eq!(config.layout.preset_column_widths, [0.33333, 0.5, 0.66667]);
+        assert_eq!(
+            config.layout.scrolling.preset_column_widths,
+            [0.33333, 0.5, 0.66667]
+        );
         assert_eq!(pressed(&config, "Super+Tab"), Some(Action::CycleLayout));
         assert_eq!(config.appearance.gaps, 15);
         assert_eq!(config.appearance.focus_ring_width, 1);
@@ -2674,7 +3054,7 @@ swap_right = ["Super+Shift+l"]
         // the compiled default rather than lingering under the new owner.
         assert_eq!(config.appearance.corner_radius, 0);
         // A section nobody claimed is still config.toml's.
-        assert_eq!(config.layout.column_width, 0.6);
+        assert_eq!(config.layout.scrolling.column_width, 0.6);
     }
 
     #[test]
@@ -2695,16 +3075,16 @@ swap_right = ["Super+Shift+l"]
         // The drop-in claims [layout] while naming only the one key it has a
         // control for. Partial sections are legal because every field defaults.
         fs::write(
-            root.join(OVERLAY_DIR).join("shell.toml"),
+            root.join(OVERLAY_DIR).join("settings.toml"),
             "[layout]\ncolumn_width = 0.35\n",
         )
         .unwrap();
 
         let config = watcher_at(&root).reload().unwrap().unwrap();
-        assert_eq!(config.layout.column_width, 0.35);
+        assert_eq!(config.layout.scrolling.column_width, 0.35);
         // The claimed section comes from the drop-in entirely: config.toml's
         // `center_focused_column` is inert, not merged underneath.
-        assert!(!config.layout.center_focused_column);
+        assert!(!config.layout.scrolling.center_focused_column);
         // ... and the keys it never named fall back to the compiled defaults.
         assert_eq!(config.layout.enabled_layouts, default_enabled_layouts());
         // Sections the drop-in did not claim are untouched.
@@ -2715,7 +3095,7 @@ swap_right = ["Super+Shift+l"]
     #[test]
     fn watches_drop_ins_being_added_edited_and_removed() {
         let root = config_tree("overlay-watch");
-        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        let drop_in = root.join(OVERLAY_DIR).join("settings.toml");
         let mut watcher = watcher_at(&root);
         assert_eq!(
             watcher.reload().unwrap().unwrap().appearance.gaps,
@@ -2745,13 +3125,13 @@ swap_right = ["Super+Shift+l"]
     #[test]
     fn a_broken_drop_in_names_itself_and_leaves_the_config_alone() {
         let root = config_tree("overlay-broken");
-        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        let drop_in = root.join(OVERLAY_DIR).join("settings.toml");
         let mut watcher = watcher_at(&root);
         watcher.reload().unwrap().unwrap();
 
         fs::write(&drop_in, "[appearance]\ngaps = \"forty\"\n").unwrap();
         let error = watcher.reload().unwrap_err().to_string();
-        assert!(error.contains("shell.toml"), "{error}");
+        assert!(error.contains("settings.toml"), "{error}");
 
         // The caller keeps the last good config, and a fixed file recovers
         // without needing config.toml to be touched.
@@ -2760,19 +3140,47 @@ swap_right = ["Super+Shift+l"]
     }
 
     #[test]
+    fn a_broken_config_toml_is_not_blamed_on_a_drop_in() {
+        let root = config_tree("overlay-blame");
+        let drop_in = root.join(OVERLAY_DIR).join("settings.toml");
+        fs::write(&drop_in, "[input]\nfocus_follows_mouse = true\n").unwrap();
+        let mut watcher = watcher_at(&root);
+        watcher.reload().unwrap().unwrap();
+
+        // A hand edit to config.toml that fails validation, not parsing.
+        let config = root.join("config.toml");
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(&config, text.replace("gaps = 15", "gaps = 999")).unwrap();
+        let error = watcher.reload().unwrap_err().to_string();
+        assert!(
+            error.contains("config.toml") && !error.contains("settings.toml"),
+            "{error}"
+        );
+
+        // And the drop-in is named when it is the one at fault.
+        fs::write(&config, text).unwrap();
+        fs::write(&drop_in, "[appearance]\ngaps = 999\n").unwrap();
+        let error = watcher.reload().unwrap_err().to_string();
+        assert!(
+            error.contains("settings.toml") && !error.contains("config.toml:"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_rejected_drop_in_falls_back_to_config_toml_at_startup() {
         // The real failure this exists for: the settings UI wrote a focus ring
         // wider than the user's gaps, and dropping the whole config took
-        // `autostart` with it - so the shell that would have shown the error
+        // `autostart` with it - so the panel that would have shown the error
         // was the one thing that could not start.
         let root = config_tree("overlay-rejected");
         // A fragment, not a whole config: every layer merges over FALLBACK_CONFIG.
         fs::write(
             root.join("config.toml"),
-            "[autostart]\ncommands = [[\"qs\", \"-c\", \"paw2-shell\"]]\n",
+            "[autostart]\ncommands = [[\"waybar\"]]\n",
         )
         .unwrap();
-        let drop_in = root.join(OVERLAY_DIR).join("shell.toml");
+        let drop_in = root.join(OVERLAY_DIR).join("settings.toml");
         fs::write(&drop_in, "[appearance]\nfocus_ring_width = 17\n").unwrap();
         let mut watcher = watcher_at(&root);
 
@@ -2780,18 +3188,18 @@ swap_right = ["Super+Shift+l"]
         assert!(error.contains("focus_ring_width"), "{error}");
 
         // config.toml alone still parses, autostart included, and that document
-        // is what a shell is shown.
+        // is what a settings tool is shown.
         let config = watcher.base_only().unwrap();
-        assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
+        assert_eq!(config.autostart, [["waybar"]]);
         assert_eq!(config.appearance.focus_ring_width, 0);
-        // The rejected section never reaches the document a shell is shown.
+        // The rejected section never reaches the document a settings tool is shown.
         assert!(watcher.document().get("appearance").is_none());
 
         // Fixing the drop-in recovers the full merge, with config.toml untouched.
         fs::write(&drop_in, "[appearance]\ngaps = 40\nfocus_ring_width = 3\n").unwrap();
         let config = watcher.reload().unwrap().unwrap();
         assert_eq!(config.appearance.focus_ring_width, 3);
-        assert_eq!(config.autostart, [["qs", "-c", "paw2-shell"]]);
+        assert_eq!(config.autostart, [["waybar"]]);
     }
 
     #[test]
@@ -2846,7 +3254,7 @@ swap_right = ["Super+Shift+l"]
         let updated = watcher.reload().unwrap().unwrap();
         let mut active = parse(&with_monitors).unwrap();
         assert!(active.apply_runtime(updated));
-        assert_eq!(active.layout.column_width, 0.7);
+        assert_eq!(active.layout.scrolling.column_width, 0.7);
         assert_eq!(active.monitors[0].resolution, Some([1920, 1080]));
         assert!(active.autostart.is_empty());
         assert!(

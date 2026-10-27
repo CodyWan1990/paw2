@@ -450,6 +450,7 @@ impl Paw2 {
                         }
                     },
                 );
+                self.note_keyboard_layout();
 
                 if let Some(action) = action.flatten() {
                     match action {

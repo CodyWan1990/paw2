@@ -187,6 +187,9 @@ struct ActiveOutput {
     kms: KmsOutput,
     frame_pending: bool,
     repaint_scheduled: bool,
+    /// A frame that drew nothing defers its frame callbacks to about when the
+    /// next vblank would have been; see `defer_frame_callbacks`.
+    frame_callbacks_deferred: bool,
     direct_scanout_active: bool,
     vrr_policy: VrrPolicy,
     vrr_support: VrrSupport,
@@ -352,7 +355,16 @@ pub fn init(
                         state.session_lock_frame_presented(&output.output);
                         output.frame_pending = false;
                         output.repaint_scheduled = true;
-                        repaint = Some((crtc, frame_duration(&output.output).mul_f64(0.6)));
+                        // The delay gathers commits into one frame on a fixed
+                        // refresh. Under VRR the display waits for the next
+                        // flip instead, so holding a game's frame back would
+                        // only add latency and jitter.
+                        let delay = if output.vrr_active {
+                            Duration::ZERO
+                        } else {
+                            frame_duration(&output.output).mul_f64(0.6)
+                        };
+                        repaint = Some((crtc, delay));
                     }
                 }
                 DrmEvent::Error(error) => warn!(?error, "DRM event error"),
@@ -531,6 +543,44 @@ fn schedule_repaint(
         Ok(_) => true,
         Err(error) => {
             warn!(?error, "failed to schedule DRM repaint");
+            false
+        }
+    }
+}
+
+/// Send `crtc`'s frame callbacks after `delay`, about when the next vblank
+/// would have been, instead of now.
+///
+/// A frame that drew nothing queues no flip, so there is no vblank to pace the
+/// callbacks. Sent at once, a client that commits without damage, or any
+/// client on an idle monitor while the pointer moves on another, would be
+/// redrawn as fast as commits and input arrive rather than once a refresh.
+fn defer_frame_callbacks(
+    handle: &LoopHandle<'static, Paw2>,
+    crtc: crtc::Handle,
+    delay: Duration,
+) -> bool {
+    let scheduled = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        let mut output = None;
+        with_backend(state, |backend, _| {
+            if let Some(active) = backend
+                .outputs
+                .iter_mut()
+                .find(|active| active.crtc == crtc)
+            {
+                active.frame_callbacks_deferred = false;
+                output = Some(active.output.clone());
+            }
+        });
+        if let Some(output) = output {
+            state.send_frames(&output);
+        }
+        TimeoutAction::Drop
+    });
+    match scheduled {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(?error, "failed to defer frame callbacks");
             false
         }
     }
@@ -1072,6 +1122,7 @@ impl DirectBackend {
             kms,
             frame_pending: false,
             repaint_scheduled: false,
+            frame_callbacks_deferred: false,
             direct_scanout_active: false,
             vrr_policy,
             vrr_support,
@@ -1185,6 +1236,7 @@ impl DirectBackend {
             &mut elements,
         );
         let mut retry = false;
+        let mut queued = false;
         match active.kms.render_frame(
             &mut self.renderer,
             &elements,
@@ -1211,6 +1263,7 @@ impl DirectBackend {
                         warn!(?error, "failed to queue DRM frame");
                     } else {
                         active.frame_pending = true;
+                        queued = true;
                         state.session_lock_frame_queued(&active.output);
                         if active.direct_scanout_active != scanout_active {
                             active.direct_scanout_active = scanout_active;
@@ -1230,7 +1283,15 @@ impl DirectBackend {
             )) => {}
             Err(error) => warn!(?error, "failed to render DRM frame"),
         }
-        state.send_frames(&active.output);
+        if queued {
+            state.send_frames(&active.output);
+        } else if !active.frame_callbacks_deferred {
+            active.frame_callbacks_deferred =
+                defer_frame_callbacks(&self.handle, crtc, frame_duration(&active.output));
+            if !active.frame_callbacks_deferred {
+                state.send_frames(&active.output);
+            }
+        }
         state.finish_frame();
 
         // A frame that produced no damage queues nothing, so the vblank chain

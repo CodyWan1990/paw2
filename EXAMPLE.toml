@@ -36,16 +36,46 @@
 # Choose from scrolling, dwindle, master_stack and monocle. At least one,
 # no duplicates. A binding for a layout left out here does nothing.
 enabled_layouts = ["scrolling", "dwindle", "master_stack", "monocle"]
+# The layout a workspace starts in, until you switch it. One of
+# enabled_layouts. Default: the first of them.
+default = "scrolling"
+# Group tiled windows behind a clickable tab bar.
+tab_grouping = false
+
+# Each layout's own options. Resizing or changing the master count on a
+# workspace overrides these there; everywhere else they apply live.
+[layout.scrolling]
 # Default fraction of the output width used by each column.
 # Between 0.1 and 1.0.
 column_width = 0.6
-# Widths cycled on the focused column.
+# Widths cycled on the focused column, and on master_stack's master area.
 # Each between 0.1 and 1.0. The list must not be empty.
 preset_column_widths = [0.33333, 0.5, 0.66667]
 # When false, the viewport moves only enough to reveal the focused column.
 center_focused_column = false
-# Group tiled windows behind a clickable tab bar.
-tab_grouping = false
+
+[layout.master_stack]
+# The master area's share of the output, from 0.1 to 0.9. Default: 0.6.
+master_ratio = 0.6
+# How many windows sit in the master area, from 1 to 16. Default: 1.
+master_count = 1
+# Which side the master area takes: left, right, top or bottom.
+# Default: left.
+position = "left"
+
+[layout.dwindle]
+# Each split's share for the window it makes room for, from 0.1 to 0.9.
+# Default: 0.5.
+split_ratio = 0.5
+# alternate cuts side by side, then one above the other, and so on.
+# longest cuts across the longer side, so windows stay closest to square -
+# better on ultrawide and portrait outputs. Default: alternate.
+split = "alternate"
+
+[layout.monocle]
+# Keep appearance.gaps around the window; false fills the output.
+# Default: true.
+gaps = true
 
 # Every switch here defaults to off. With corner_radius at 0 and no
 # transparency, Paw2 skips the window shader entirely - that is the gaming
@@ -112,6 +142,17 @@ backdrop_color = "#1c1c1c"
 # down.
 scratchpad_position = "centered"
 
+# Optional palette overrides. Each key, when set, replaces the colour key it
+# names: focus_ring -> appearance.focus_ring_color, titlebar ->
+# appearance.titlebar_color, shadow -> appearance.shadow_color, backdrop ->
+# overview.backdrop_color. A theming tool can own this section in its own
+# config.d/ file without taking over [appearance] or [overview].
+#[colors]
+#focus_ring = "#0b3d91"
+#titlebar = "#1f1f24"
+#shadow = "#000000"
+#backdrop = "#1c1c1c"
+
 [input]
 # Focus windows as the pointer enters them without moving the workspace
 # viewport. Default: false.
@@ -142,7 +183,7 @@ copy_on_select = false
 #font = "Monofur Nerd Font Propo 12"
 #titlebar_font = "Inter"
 
-# Hand-edited only. paw2-shell never writes this section, so drm_device and
+# Hand-edited only. A settings tool should never write this section, so drm_device and
 # connector stay yours for fixing a machine that will not start.
 [backend]
 # Automatically scan out compatible fullscreen buffers on the DRM primary

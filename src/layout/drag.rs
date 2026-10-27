@@ -214,7 +214,9 @@ impl Paw2 {
         let row_edge = row_boundary(location.y, geometry, row, column.windows.len(), 8);
         let x = column_edge.map(|(edge, _)| AxisResize::Column {
             edge,
-            initial_width: column.width.unwrap_or(self.config.layout.column_width),
+            initial_width: column
+                .width
+                .unwrap_or(self.config.layout.scrolling.column_width),
             initial_offset: workspace.offset,
         });
         let y = row_edge.and_then(|(boundary, _)| {
@@ -309,22 +311,19 @@ impl Paw2 {
         let inner = inset_rectangle(area, gap);
         match workspace.layout {
             LayoutMode::Dwindle => {
-                let (vertical, horizontal) = dwindle_dividers_at(
-                    inner,
-                    tiled.len(),
-                    gap,
-                    &workspace.dwindle_ratios,
-                    location,
-                    8,
-                );
+                let config = &self.config.layout.dwindle;
+                let cuts = dwindle_cuts(inner, tiled.len(), gap, &workspace.dwindle_ratios, config);
+                let (vertical, horizontal) = dwindle_dividers_at(&cuts, location, 8);
                 let split = |hit: DividerHit| AxisResize::Split {
                     target: LayoutResizeTarget::Dwindle(hit.split),
                     initial_ratio: workspace
                         .dwindle_ratios
                         .get(hit.split)
                         .copied()
-                        .unwrap_or(0.5),
+                        .flatten()
+                        .unwrap_or(config.split_ratio),
                     length: hit.length,
+                    reversed: false,
                 };
                 (vertical.is_some() || horizontal.is_some()).then(|| MouseOperation::ResizeTiled {
                     window,
@@ -333,18 +332,25 @@ impl Paw2 {
                 })
             }
             LayoutMode::MasterStack if !tiled.is_empty() => {
-                let master_count = workspace.effective_master_count(tiled.len());
-                let ratio = workspace
-                    .master_ratio
-                    .unwrap_or(self.config.layout.column_width);
-                let x = (master_count < tiled.len())
+                // Worked out with the master area on the left (see `MasterFrame`),
+                // then handed back on the axes the output actually has.
+                let config = &self.config.layout.master_stack;
+                let frame = MasterFrame::new(inner, config.position);
+                let inner = frame.area();
+                let pointer = frame.point_to_frame(location);
+                let master_count = workspace.effective_master_count(tiled.len(), config);
+                let ratio = workspace.master_ratio(config);
+                let split = (master_count < tiled.len())
                     .then(|| {
                         let (master, stack) = split_rectangle(inner, true, ratio, gap);
-                        divider_distance(location, master, stack, true, 8).map(|_| {
+                        divider_distance(pointer, master, stack, true, 8).map(|_| {
                             AxisResize::Split {
                                 target: LayoutResizeTarget::Master,
                                 initial_ratio: ratio,
                                 length: split_length(inner, true, gap),
+                                // With the master area on the right or at the
+                                // bottom, dragging towards it shrinks it.
+                                reversed: config.position.mirrored(),
                             }
                         })
                     })
@@ -354,20 +360,20 @@ impl Paw2 {
                 } else {
                     master_count..tiled.len()
                 };
-                let row = monitor
-                    .space
-                    .element_geometry(&window)
-                    .and_then(|geometry| {
-                        row_boundary(location.y, geometry, index - range.start, range.len(), 8)
-                    });
-                let y = row.and_then(|(boundary, _)| {
+                let frame_geometry = |window: &Window| {
+                    monitor
+                        .space
+                        .element_geometry(window)
+                        .map(|geometry| frame.to_frame(geometry))
+                };
+                let row = frame_geometry(&window).and_then(|geometry| {
+                    row_boundary(pointer.y, geometry, index - range.start, range.len(), 8)
+                });
+                let rows = row.and_then(|(boundary, _)| {
                     let initial_heights = tiled[range.clone()]
                         .iter()
                         .map(|window| {
-                            monitor
-                                .space
-                                .element_geometry(window)
-                                .map(|geometry| f64::from(geometry.size.h))
+                            frame_geometry(window).map(|geometry| f64::from(geometry.size.h))
                         })
                         .collect::<Option<Vec<_>>>()?;
                     Some(AxisResize::Rows {
@@ -377,6 +383,11 @@ impl Paw2 {
                         initial_heights,
                     })
                 });
+                let (x, y) = if config.position.transposed() {
+                    (rows, split)
+                } else {
+                    (split, rows)
+                };
                 (x.is_some() || y.is_some()).then(|| MouseOperation::ResizeTiled { window, x, y })
             }
             LayoutMode::MasterStack | LayoutMode::Monocle | LayoutMode::Scrolling => None,
@@ -516,7 +527,11 @@ impl Paw2 {
                 target,
                 initial_ratio,
                 length,
-            } => self.drag_layout_split(window, *target, *initial_ratio, delta, *length),
+                reversed,
+            } => {
+                let delta = if *reversed { -delta } else { delta };
+                self.drag_layout_split(window, *target, *initial_ratio, delta, *length)
+            }
         }
     }
 
@@ -860,7 +875,9 @@ impl Paw2 {
             .columns
             .iter()
             .map(|column| {
-                let fraction = column.width.unwrap_or(self.config.layout.column_width);
+                let fraction = column
+                    .width
+                    .unwrap_or(self.config.layout.scrolling.column_width);
                 (f64::from(area.size.w) * fraction).round() as i32
             })
             .min()
@@ -936,7 +953,7 @@ impl Paw2 {
                 let Some(target) = workspace.dwindle_ratios.get_mut(split) else {
                     return;
                 };
-                *target = ratio;
+                *target = Some(ratio);
             }
             _ => return,
         }

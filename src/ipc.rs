@@ -4,8 +4,10 @@
 //! Paw2 is fully usable without this: workspaces are on `ext-workspace-v1`, the
 //! window list on `ext-foreign-toplevel-list-v1`, capture on
 //! `ext-image-copy-capture-v1`. What a panel cannot get from any of those is a
-//! window's workspace, the active tiling layout, or the effective config - so
-//! that, plus the four actions a panel needs, is all this carries.
+//! window's workspace, the active tiling layout, the keyboard layout and lock
+//! keys (which `wl_keyboard` only tells the focused client), or the effective
+//! config - so that, plus the commands in [`Command`], is all this carries.
+//! A snapshot identical to the last one sent is not sent again.
 //!
 //! Configuration deliberately only travels outwards. A shell changes settings
 //! by writing `config.d/`, which the config watcher already picks up; there is
@@ -108,6 +110,19 @@ pub struct OutputState {
     pub modes: Vec<ModeState>,
 }
 
+/// The keyboard: its layout and lock keys, which a bar cannot learn from
+/// `wl_keyboard` without having the focus.
+#[derive(Serialize)]
+pub struct KeyboardState {
+    /// The active layout's name, as xkb gives it, e.g. "English (US)".
+    pub layout: String,
+    /// Every layout in the keymap, in group order.
+    pub layouts: Vec<String>,
+    pub caps_lock: bool,
+    pub num_lock: bool,
+    pub scroll_lock: bool,
+}
+
 #[derive(Serialize)]
 struct Snapshot<'a> {
     #[serde(rename = "type")]
@@ -117,6 +132,7 @@ struct Snapshot<'a> {
     scratchpads: &'a [ScratchpadState],
     /// The layouts `cycle_layout` steps through, in order.
     layouts: &'a [String],
+    keyboard: &'a KeyboardState,
 }
 
 #[derive(Serialize)]
@@ -157,6 +173,12 @@ pub struct IpcState {
     greeting: VecDeque<u64>,
     config: serde_json::Value,
     config_error: Option<String>,
+    /// The last snapshot of each view that went out. Most changes a panel is
+    /// told about - a title set to what it already was, a focus change that
+    /// lands where focus already is - change nothing it draws, and a client
+    /// already greeted is only sent a snapshot that differs.
+    last_full: String,
+    last_reduced: String,
 }
 
 impl IpcState {
@@ -453,6 +475,7 @@ pub fn flush(state: &mut Paw2) {
         window.identifier = state.toplevel_identifier(window.id).unwrap_or_default();
     }
     let scratchpads = state.scratchpad_ipc_state();
+    let keyboard = state.keyboard_ipc_state();
     let layouts = state
         .config
         .layout
@@ -474,6 +497,7 @@ pub fn flush(state: &mut Paw2) {
             windows,
             scratchpads,
             layouts: &layouts,
+            keyboard: &keyboard,
         })
     };
     let full = any_privileged.then(|| snapshot(&windows, &scratchpads));
@@ -492,28 +516,29 @@ pub fn flush(state: &mut Paw2) {
         })
     });
 
+    let full_changed = full
+        .as_ref()
+        .is_some_and(|full| *full != state.ipc.last_full);
+    let reduced_changed = reduced
+        .as_ref()
+        .is_some_and(|reduced| *reduced != state.ipc.last_reduced);
+
     let mut dropped = Vec::new();
     for client in &mut state.ipc.clients {
-        let Some(snapshot) = (if client.privileged {
-            full.as_deref()
+        let (snapshot, changed) = if client.privileged {
+            (full.as_deref(), full_changed)
         } else {
-            reduced.as_deref()
-        }) else {
+            (reduced.as_deref(), reduced_changed)
+        };
+        let Some(snapshot) = snapshot else {
             continue;
         };
-        let owed: &[&str] = match &config {
-            Some(config)
-                if owes_config(
-                    client.privileged,
-                    config_changed,
-                    greeting.contains(&client.id),
-                ) =>
-            {
-                &[config, snapshot]
-            }
-            _ => &[snapshot],
-        };
-        for message in owed {
+        let greeted = greeting.contains(&client.id);
+        let config = config
+            .as_deref()
+            .filter(|_| owes_config(client.privileged, config_changed, greeted));
+        let snapshot = (changed || greeted).then_some(snapshot);
+        for message in config.into_iter().chain(snapshot) {
             if !send(client, message) {
                 dropped.push(client.id);
                 break;
@@ -524,6 +549,12 @@ pub fn flush(state: &mut Paw2) {
         .ipc
         .clients
         .retain(|client| !dropped.contains(&client.id));
+    if let Some(full) = full {
+        state.ipc.last_full = full;
+    }
+    if let Some(reduced) = reduced {
+        state.ipc.last_reduced = reduced;
+    }
 }
 
 /// Whether this peer is owed the `config` message on this flush.

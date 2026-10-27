@@ -111,6 +111,8 @@ pub struct Paw2 {
     pub config: Config,
     pub scroller: Scrollers,
     pub suppressed_keys: Vec<smithay::input::keyboard::Keysym>,
+    /// The keyboard layout panels were last told about; see `note_keyboard_layout`.
+    pub keyboard_layout: smithay::input::keyboard::Layout,
     pub wheel_v120_remainder: f64,
     pub pending_wheel_action: Option<Action>,
     pub workspace_state: WorkspaceState,
@@ -261,6 +263,7 @@ impl Paw2 {
             config,
             scroller: Scrollers::default(),
             suppressed_keys: Vec::new(),
+            keyboard_layout: Default::default(),
             wheel_v120_remainder: 0.0,
             pending_wheel_action: None,
             workspace_state,
@@ -286,6 +289,41 @@ impl Paw2 {
     }
 
     /// The seat's keyboard. See [`Self::pointer`].
+    /// Tell panels when a key switched the keyboard layout (an xkb group
+    /// toggle). Only the focused client hears `wl_keyboard` group changes, and
+    /// a bar almost never has the focus.
+    pub fn note_keyboard_layout(&mut self) {
+        let layout = self.keyboard().with_xkb_state(self, |context| {
+            context.xkb().lock().unwrap().active_layout()
+        });
+        if layout != self.keyboard_layout {
+            self.keyboard_layout = layout;
+            self.ipc.touch();
+        }
+    }
+
+    /// The keyboard as panels see it: the active layout and lock-key LEDs.
+    pub fn keyboard_ipc_state(&mut self) -> crate::ipc::KeyboardState {
+        let keyboard = self.keyboard();
+        let leds = keyboard.led_state();
+        let (layout, layouts) = keyboard.with_xkb_state(self, |context| {
+            let xkb = context.xkb().lock().unwrap();
+            (
+                xkb.layout_name(xkb.active_layout()).to_owned(),
+                xkb.layouts()
+                    .map(|layout| xkb.layout_name(layout).to_owned())
+                    .collect(),
+            )
+        });
+        crate::ipc::KeyboardState {
+            layout,
+            layouts,
+            caps_lock: leds.caps.unwrap_or(false),
+            num_lock: leds.num.unwrap_or(false),
+            scroll_lock: leds.scroll.unwrap_or(false),
+        }
+    }
+
     pub fn keyboard(&self) -> KeyboardHandle<Self> {
         self.seat
             .get_keyboard()

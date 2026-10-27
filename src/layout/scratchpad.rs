@@ -176,6 +176,15 @@ impl Paw2 {
         self.save_scratchpad_geometry();
     }
 
+    /// [`Self::scratchpad_name_for_window`] without cloning the name, for the
+    /// per-frame checks that only need to know.
+    pub(super) fn is_scratchpad_window(&self, window: &Window) -> bool {
+        self.scroller
+            .scratchpads
+            .values()
+            .any(|runtime| runtime.window.as_ref() == Some(window))
+    }
+
     pub(super) fn scratchpad_name_for_window(&self, window: &Window) -> Option<String> {
         self.scroller
             .scratchpads
@@ -232,7 +241,7 @@ impl Paw2 {
     }
 
     pub fn refresh_scratchpad_membership(&mut self, window: &Window) {
-        if self.scratchpad_name_for_window(window).is_some() {
+        if self.is_scratchpad_window(window) {
             return;
         }
         let Some(name) = self.matching_scratchpad(window) else {

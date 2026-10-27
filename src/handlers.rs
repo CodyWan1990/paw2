@@ -691,6 +691,16 @@ impl SeatHandler for Paw2 {
         self.cursor_status = image;
     }
 
+    /// Lock keys light up for panels as well: like the layout, only the focused
+    /// client hears about them over `wl_keyboard`.
+    fn led_state_changed(
+        &mut self,
+        _seat: &Seat<Self>,
+        _led_state: smithay::input::keyboard::LedState,
+    ) {
+        self.ipc.touch();
+    }
+
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocus>) {
         let client = focused
             .and_then(|focus| focus.wl_surface())

@@ -20,7 +20,8 @@ use smithay::{
     wayland::{
         commit_timing::CommitTimerBarrierStateUserData,
         compositor::{
-            CompositorHandler, SurfaceData, TraversalAction, with_states, with_surface_tree_downward,
+            CompositorHandler, SurfaceData, TraversalAction, with_states,
+            with_surface_tree_downward,
         },
         fifo::FifoBarrierCachedState,
         fractional_scale::with_fractional_scale,
@@ -41,8 +42,9 @@ mod scratchpad;
 
 use crate::{
     config::{
-        Action, Config, LayoutMode, NUMBERED_SCRATCHPAD_COUNT, NUMBERED_SCRATCHPAD_PREFIX,
-        ScratchpadConfig, ScratchpadEdge, ScratchpadOverviewPosition,
+        Action, Config, DwindleConfig, DwindleSplit, LayoutConfig, LayoutMode, MasterPosition,
+        MasterStackConfig, NUMBERED_SCRATCHPAD_COUNT, NUMBERED_SCRATCHPAD_PREFIX, ScratchpadConfig,
+        ScratchpadEdge, ScratchpadOverviewPosition,
     },
     handlers::KeyboardFocus,
     state::Paw2,
@@ -65,6 +67,9 @@ enum Direction {
 }
 
 pub const WORKSPACE_COUNT: usize = 9;
+/// How often a surface that is on no screen still gets a frame callback. Just
+/// under a second, so a 1 Hz client timer is never pushed into the next tick.
+const HIDDEN_SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(995);
 const MIN_ROW_HEIGHT: i32 = 48;
 pub(crate) const TAB_BAR_HEIGHT: i32 = 24;
 /// Screen-space distance between workspace cards once the overview is fully
@@ -316,6 +321,8 @@ pub(crate) enum AxisResize {
         target: LayoutResizeTarget,
         initial_ratio: f64,
         length: i32,
+        /// The pointer moving forward on its axis shrinks the first part.
+        reversed: bool,
     },
 }
 
@@ -361,10 +368,18 @@ struct Workspace {
     offset: i32,
     fullscreen: Option<Window>,
     layout: LayoutMode,
-    master_count: usize,
+    /// Picked by a binding or the socket. Until then the workspace follows
+    /// `layout.default`, so changing that applies to it straight away.
+    layout_chosen: bool,
+    /// The rest are this workspace's adjustments; `None` follows the config.
+    master_count: Option<usize>,
     master_ratio: Option<f64>,
     master_weights: Vec<f64>,
-    dwindle_ratios: Vec<f64>,
+    dwindle_ratios: Vec<Option<f64>>,
+    /// Whether each dwindle split cut side by side, as of the last layout pass.
+    /// Keyboard resizing looks a window's split up here: under
+    /// `split = "longest"` the direction depends on the geometry.
+    dwindle_vertical: Vec<bool>,
     /// The newest window and the one that had focus when it opened. Closing the
     /// newest window while it still has focus goes back there, so a window that
     /// flashes open and shut - `wl-copy` grabbing the clipboard, a launcher -
@@ -382,10 +397,12 @@ impl Default for Workspace {
             offset: 0,
             fullscreen: None,
             layout: LayoutMode::Scrolling,
-            master_count: 1,
+            layout_chosen: false,
+            master_count: None,
             master_ratio: None,
             master_weights: Vec::new(),
             dwindle_ratios: Vec::new(),
+            dwindle_vertical: Vec::new(),
             opened_from: None,
         }
     }
@@ -394,10 +411,12 @@ impl Default for Workspace {
 impl Workspace {
     fn adopt_layout_state(&mut self, source: &Self) {
         self.layout = source.layout;
+        self.layout_chosen = source.layout_chosen;
         self.master_count = source.master_count;
         self.master_ratio = source.master_ratio;
         self.master_weights.clone_from(&source.master_weights);
         self.dwindle_ratios.clone_from(&source.dwindle_ratios);
+        self.dwindle_vertical.clone_from(&source.dwindle_vertical);
     }
 
     fn add(&mut self, window: Window, floating: bool) {
@@ -848,15 +867,22 @@ impl Workspace {
     fn sync_layout_sizes(&mut self, tiled: usize) {
         self.master_weights.resize(tiled, 1.0);
         self.master_weights.truncate(tiled);
-        self.dwindle_ratios.resize(tiled.saturating_sub(1), 0.5);
+        self.dwindle_ratios.resize(tiled.saturating_sub(1), None);
         self.dwindle_ratios.truncate(tiled.saturating_sub(1));
     }
 
-    fn effective_master_count(&self, tiled: usize) -> usize {
-        self.master_count.clamp(1, tiled.max(1)).min(tiled)
+    fn effective_master_count(&self, tiled: usize, config: &MasterStackConfig) -> usize {
+        self.master_count
+            .unwrap_or(usize::from(config.master_count))
+            .clamp(1, tiled.max(1))
+            .min(tiled)
     }
 
-    fn adjust_master_count(&mut self, delta: i32) -> bool {
+    fn master_ratio(&self, config: &MasterStackConfig) -> f64 {
+        self.master_ratio.unwrap_or(config.master_ratio)
+    }
+
+    fn adjust_master_count(&mut self, delta: i32, config: &MasterStackConfig) -> bool {
         if self.layout != LayoutMode::MasterStack {
             return false;
         }
@@ -864,12 +890,12 @@ impl Workspace {
         if tiled == 0 {
             return false;
         }
-        let current = self.effective_master_count(tiled);
+        let current = self.effective_master_count(tiled, config);
         let adjusted = (current as i32 + delta).clamp(1, tiled as i32) as usize;
         if adjusted == current {
             return false;
         }
-        self.master_count = adjusted;
+        self.master_count = Some(adjusted);
         true
     }
 
@@ -925,6 +951,7 @@ impl Workspace {
             return false;
         }
         self.layout = layout;
+        self.layout_chosen = true;
         self.offset = 0;
         true
     }
@@ -1030,14 +1057,17 @@ impl Workspace {
         consume_or_expel_columns(&mut self.columns, column_index, delta)
     }
 
-    fn cycle_column_width(&mut self, default: f64, presets: &[f64]) -> bool {
+    fn cycle_column_width(&mut self, config: &LayoutConfig) -> bool {
+        let presets = &config.scrolling.preset_column_widths;
         if self.layout == LayoutMode::MasterStack {
             let tiled = self.tiled_slots().len();
-            if self.effective_master_count(tiled) == tiled || self.focused_tiled_index().is_none() {
+            if self.effective_master_count(tiled, &config.master_stack) == tiled
+                || self.focused_tiled_index().is_none()
+            {
                 return false;
             }
             self.master_ratio = Some(adjusted_split_ratio(
-                next_preset(self.master_ratio.unwrap_or(default), presets),
+                next_preset(self.master_ratio(&config.master_stack), presets),
                 0.0,
             ));
             return true;
@@ -1048,7 +1078,7 @@ impl Workspace {
         let Some(column) = self.focused_column_mut() else {
             return false;
         };
-        cycle_column_width(column, default, presets);
+        cycle_column_width(column, config.scrolling.column_width, presets);
         true
     }
 
@@ -1060,19 +1090,26 @@ impl Workspace {
     /// The dwindle split that owns the focused window on one axis, nudged by
     /// `delta`. Identical for width and height but for which axis the split is
     /// looked up on, which is what `vertical` picks.
-    fn adjust_dwindle_split(&mut self, tiled: usize, vertical: bool, delta: f64) -> bool {
+    fn adjust_dwindle_split(
+        &mut self,
+        tiled: usize,
+        vertical: bool,
+        delta: f64,
+        config: &DwindleConfig,
+    ) -> bool {
         let Some(focused) = self.focused_tiled_index() else {
             return false;
         };
-        let Some(split) = dwindle_split(focused, tiled, vertical) else {
+        let Some(split) = dwindle_split(focused, tiled, vertical, &self.dwindle_vertical) else {
             return false;
         };
         self.sync_layout_sizes(tiled);
         let delta = if focused == split { delta } else { -delta };
-        adjust_split_ratio(&mut self.dwindle_ratios[split], delta)
+        let ratio = self.dwindle_ratios[split].get_or_insert(config.split_ratio);
+        adjust_split_ratio(ratio, delta)
     }
 
-    fn adjust_column_width(&mut self, default: f64, delta: f64) -> bool {
+    fn adjust_column_width(&mut self, config: &LayoutConfig, delta: f64) -> bool {
         let tiled = self.tiled_slots().len();
         let focused = self.focused_tiled_index();
         match self.layout {
@@ -1080,12 +1117,12 @@ impl Workspace {
                 let Some(focused) = focused else {
                     return false;
                 };
-                let master = self.effective_master_count(tiled);
+                let master = self.effective_master_count(tiled, &config.master_stack);
                 if master == tiled {
                     return false;
                 }
                 let delta = if focused < master { delta } else { -delta };
-                let current = self.master_ratio.unwrap_or(default);
+                let current = self.master_ratio(&config.master_stack);
                 let adjusted = adjusted_split_ratio(current, delta);
                 if adjusted == current {
                     return false;
@@ -1093,7 +1130,9 @@ impl Workspace {
                 self.master_ratio = Some(adjusted);
                 return true;
             }
-            LayoutMode::Dwindle => return self.adjust_dwindle_split(tiled, true, delta),
+            LayoutMode::Dwindle => {
+                return self.adjust_dwindle_split(tiled, true, delta, &config.dwindle);
+            }
             LayoutMode::Monocle => return false,
             LayoutMode::Scrolling => {}
             LayoutMode::MasterStack => return false,
@@ -1101,7 +1140,7 @@ impl Workspace {
         let Some(column) = self.focused_column_mut() else {
             return false;
         };
-        let current = column.width.unwrap_or(default);
+        let current = column.width.unwrap_or(config.scrolling.column_width);
         let adjusted = adjusted_column_width(current, delta);
         if adjusted == current {
             return false;
@@ -1110,7 +1149,7 @@ impl Workspace {
         true
     }
 
-    fn adjust_row_height(&mut self, delta: f64) -> bool {
+    fn adjust_row_height(&mut self, config: &LayoutConfig, delta: f64) -> bool {
         let tiled = self.tiled_slots().len();
         let focused = self.focused_tiled_index();
         match self.layout {
@@ -1119,7 +1158,7 @@ impl Workspace {
                     return false;
                 };
                 self.sync_layout_sizes(tiled);
-                let master = self.effective_master_count(tiled);
+                let master = self.effective_master_count(tiled, &config.master_stack);
                 let range = if focused < master {
                     0..master
                 } else {
@@ -1131,7 +1170,9 @@ impl Workspace {
                     delta,
                 );
             }
-            LayoutMode::Dwindle => return self.adjust_dwindle_split(tiled, false, delta),
+            LayoutMode::Dwindle => {
+                return self.adjust_dwindle_split(tiled, false, delta, &config.dwindle);
+            }
             LayoutMode::Monocle => return false,
             LayoutMode::Scrolling => {}
         }
@@ -1200,9 +1241,13 @@ fn adjust_split_ratio(ratio: &mut f64, delta: f64) -> bool {
     true
 }
 
-fn dwindle_split(focused: usize, tiled: usize, vertical: bool) -> Option<usize> {
+/// The split nearest above `focused` that cuts the way `vertical` asks, out of
+/// `cuts` - each split's direction from the last layout pass.
+fn dwindle_split(focused: usize, tiled: usize, vertical: bool, cuts: &[bool]) -> Option<usize> {
     let last = focused.min(tiled.checked_sub(2)?);
-    (0..=last).rev().find(|split| (*split % 2 == 0) == vertical)
+    (0..=last)
+        .rev()
+        .find(|split| cuts.get(*split).copied() == Some(vertical))
 }
 
 fn resized_column(
@@ -2521,26 +2566,22 @@ impl Paw2 {
             Action::SwapRight => self.directional_layout_action(true, 1, true),
             Action::SwapUp => self.directional_layout_action(false, -1, true),
             Action::SwapDown => self.directional_layout_action(false, 1, true),
-            Action::ConsumeOrExpelLeft => self.layout_action(|workspace| {
+            Action::ConsumeOrExpelLeft => self.configured_layout_action(|workspace, config| {
                 if workspace.layout == LayoutMode::MasterStack {
-                    workspace.adjust_master_count(-1)
+                    workspace.adjust_master_count(-1, &config.master_stack)
                 } else {
                     workspace.layout == LayoutMode::Scrolling && workspace.consume_or_expel(-1)
                 }
             }),
-            Action::ConsumeOrExpelRight => self.layout_action(|workspace| {
+            Action::ConsumeOrExpelRight => self.configured_layout_action(|workspace, config| {
                 if workspace.layout == LayoutMode::MasterStack {
-                    workspace.adjust_master_count(1)
+                    workspace.adjust_master_count(1, &config.master_stack)
                 } else {
                     workspace.layout == LayoutMode::Scrolling && workspace.consume_or_expel(1)
                 }
             }),
             Action::CycleColumnWidth => {
-                let default = self.config.layout.column_width;
-                let presets = &self.config.layout.preset_column_widths;
-                self.scroller
-                    .active_workspace()
-                    .is_some_and(|workspace| workspace.cycle_column_width(default, presets))
+                self.configured_layout_action(Workspace::cycle_column_width)
             }
             Action::CycleLayout => {
                 let enabled = &self.config.layout.enabled_layouts;
@@ -2554,20 +2595,18 @@ impl Paw2 {
                     .active_workspace()
                     .is_some_and(|workspace| workspace.switch_layout(layout, enabled))
             }
-            Action::DecreaseColumnWidth => {
-                let default = self.config.layout.column_width;
-                self.layout_action(|workspace| workspace.adjust_column_width(default, -0.05))
-            }
-            Action::IncreaseColumnWidth => {
-                let default = self.config.layout.column_width;
-                self.layout_action(|workspace| workspace.adjust_column_width(default, 0.05))
-            }
-            Action::DecreaseRowHeight => {
-                self.layout_action(|workspace| workspace.adjust_row_height(-0.05))
-            }
-            Action::IncreaseRowHeight => {
-                self.layout_action(|workspace| workspace.adjust_row_height(0.05))
-            }
+            Action::DecreaseColumnWidth => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_column_width(config, -0.05)
+            }),
+            Action::IncreaseColumnWidth => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_column_width(config, 0.05)
+            }),
+            Action::DecreaseRowHeight => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_row_height(config, -0.05)
+            }),
+            Action::IncreaseRowHeight => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_row_height(config, 0.05)
+            }),
             Action::TabGroupLeft => self.tab_group_direction(-1),
             Action::TabGroupRight => self.tab_group_direction(1),
             Action::PreviousTab => self.layout_action(|workspace| workspace.cycle_tab(-1)),
@@ -2706,6 +2745,17 @@ impl Paw2 {
         self.scroller.active_workspace().is_some_and(action)
     }
 
+    /// [`Self::layout_action`] for actions whose defaults come from `[layout]`.
+    fn configured_layout_action(
+        &mut self,
+        action: impl FnOnce(&mut Workspace, &LayoutConfig) -> bool,
+    ) -> bool {
+        let config = &self.config.layout;
+        self.scroller
+            .active_workspace()
+            .is_some_and(|workspace| action(workspace, config))
+    }
+
     fn tab_group_direction(&mut self, delta: i32) -> bool {
         let Some(workspace) = self.scroller.active_workspace() else {
             return false;
@@ -2794,14 +2844,32 @@ impl Paw2 {
             (false, 1) => Direction::Down,
             _ => return false,
         };
+        let master_stack = &self.config.layout.master_stack;
         let Some(target) = geometries.and_then(|geometries| match layout {
-            LayoutMode::MasterStack => master_neighbor(
-                focused,
-                workspace.effective_master_count(tiled.len()),
-                horizontal,
-                delta,
-                &geometries,
-            ),
+            LayoutMode::MasterStack => {
+                // Asked in the frame where the master area is on the left.
+                let frame = MasterFrame::new(
+                    monitor.work_area().unwrap_or_default(),
+                    master_stack.position,
+                );
+                let geometries = geometries
+                    .into_iter()
+                    .map(|geometry| frame.to_frame(geometry))
+                    .collect::<Vec<_>>();
+                let frame_horizontal = horizontal != master_stack.position.transposed();
+                let frame_delta = if frame_horizontal && master_stack.position.mirrored() {
+                    -delta
+                } else {
+                    delta
+                };
+                master_neighbor(
+                    focused,
+                    workspace.effective_master_count(tiled.len(), master_stack),
+                    frame_horizontal,
+                    frame_delta,
+                    &geometries,
+                )
+            }
             LayoutMode::Dwindle => directional_index(focused, direction, &geometries, true),
             _ => None,
         }) else {
@@ -3500,7 +3568,7 @@ impl Paw2 {
                     client,
                     frame,
                     opacity: opacity * fade,
-                    scratchpad: scratchpad || self.scratchpad_name_for_window(window).is_some(),
+                    scratchpad: scratchpad || self.is_scratchpad_window(window),
                     subsurface: false,
                 };
                 let mut surfaces = vec![(element, state)];
@@ -3576,23 +3644,22 @@ impl Paw2 {
 
     pub fn send_frames(&mut self, output: &Output) {
         let time = self.start_time.elapsed();
+        // A surface hears from the output it was last presented on, every
+        // frame. One that was not presented anywhere - a column scrolled off
+        // screen - still hears now and then, so it keeps running, but it can no
+        // longer spin its client at whatever rate this output is redrawn.
+        let throttle = Some(HIDDEN_SURFACE_FRAME_INTERVAL);
         if let Some(space) = self.space_for_output(output) {
             for window in space.elements() {
-                window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
-                });
+                window.send_frame(output, time, throttle, surface_primary_scanout_output);
             }
         }
         for window in self.overview_inactive_windows(output) {
-            window.send_frame(output, time, Some(Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
+            window.send_frame(output, time, throttle, surface_primary_scanout_output);
         }
         let layers = layer_map_for_output(output);
         for layer in layers.layers() {
-            layer.send_frame(output, time, Some(Duration::ZERO), |_, _| {
-                Some(output.clone())
-            });
+            layer.send_frame(output, time, throttle, surface_primary_scanout_output);
         }
         drop(layers);
         self.send_lock_frames(output, time);
@@ -3797,7 +3864,7 @@ impl Paw2 {
             return Some(window);
         }
         if let Some((window, _)) = monitor.space.element_under(position)
-            && self.scratchpad_name_for_window(window).is_some()
+            && self.is_scratchpad_window(window)
         {
             return Some(window.clone());
         }
@@ -3877,7 +3944,7 @@ impl Paw2 {
         let scratchpad = monitor
             .space
             .element_under(position)
-            .filter(|(window, _)| self.scratchpad_name_for_window(window).is_some())
+            .filter(|(window, _)| self.is_scratchpad_window(window))
             .and_then(|(window, location)| {
                 window
                     .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
@@ -3936,6 +4003,7 @@ impl Paw2 {
 
     fn relayout_with_animation(&mut self, reveal_focus: bool, animate: bool) {
         let enabled_layouts = &self.config.layout.enabled_layouts;
+        let default_layout = self.config.layout.default;
         for workspace in self
             .scroller
             .monitors
@@ -3943,6 +4011,10 @@ impl Paw2 {
             .flat_map(|monitor| &mut monitor.workspaces)
             .chain(&mut self.scroller.parked)
         {
+            if !workspace.layout_chosen && workspace.layout != default_layout {
+                workspace.layout = default_layout;
+                workspace.offset = 0;
+            }
             if !enabled_layouts.contains(&workspace.layout) {
                 workspace.layout = enabled_layouts[0];
                 workspace.offset = 0;
@@ -4021,7 +4093,7 @@ impl Paw2 {
                 let (gap, widths) = column_widths(
                     &workspace.columns,
                     geometry.size,
-                    self.config.layout.column_width,
+                    self.config.layout.scrolling.column_width,
                     self.config.appearance.gaps,
                 );
                 workspace.offset = viewport_offset(
@@ -4030,23 +4102,32 @@ impl Paw2 {
                     &widths,
                     geometry.size.w,
                     gap,
-                    self.config.layout.center_focused_column && animate && reveal_output,
+                    self.config.layout.scrolling.center_focused_column && animate && reveal_output,
                     reveal_output,
                 );
                 place_columns(&workspace.columns, geometry, &widths, gap, workspace.offset)
             } else {
                 workspace.offset = 0;
+                if workspace.layout == LayoutMode::Dwindle {
+                    let gap =
+                        effective_gap(self.config.appearance.gaps, geometry.size.w, geometry.size);
+                    workspace.dwindle_vertical = dwindle_cuts(
+                        inset_rectangle(geometry, gap),
+                        tiled.len(),
+                        gap,
+                        &workspace.dwindle_ratios,
+                        &self.config.layout.dwindle,
+                    )
+                    .iter()
+                    .map(|cut| cut.vertical)
+                    .collect();
+                }
                 layout_rectangles(
-                    workspace.layout,
+                    workspace,
                     geometry,
                     tiled.len(),
                     self.config.appearance.gaps,
-                    workspace.effective_master_count(tiled.len()),
-                    workspace
-                        .master_ratio
-                        .unwrap_or(self.config.layout.column_width),
-                    &workspace.master_weights,
-                    &workspace.dwindle_ratios,
+                    &self.config.layout,
                 )
                 .into_iter()
                 .zip(tiled.iter().cloned())
@@ -5032,20 +5113,17 @@ fn overview_window_placements(
         let (gap, widths) = column_widths(
             &workspace.columns,
             area.size,
-            config.layout.column_width,
+            config.layout.scrolling.column_width,
             config.appearance.gaps,
         );
         place_columns(&workspace.columns, area, &widths, gap, offset)
     } else {
         layout_rectangles(
-            workspace.layout,
+            workspace,
             area,
             tiled.len(),
             config.appearance.gaps,
-            workspace.effective_master_count(tiled.len()),
-            workspace.master_ratio.unwrap_or(config.layout.column_width),
-            &workspace.master_weights,
-            &workspace.dwindle_ratios,
+            &config.layout,
         )
         .into_iter()
         .zip(tiled)
@@ -5424,66 +5502,187 @@ fn effective_gap(
         .min(((output_size.h - 1) / 2).max(0))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Where each tiled window of a non-scrolling workspace goes, in order.
 fn layout_rectangles(
-    layout: LayoutMode,
+    workspace: &Workspace,
     area: Rectangle<i32, Logical>,
     count: usize,
     requested_gap: i32,
-    master_count: usize,
-    master_ratio: f64,
-    master_weights: &[f64],
-    dwindle_ratios: &[f64],
+    config: &LayoutConfig,
 ) -> Vec<Rectangle<i32, Logical>> {
     if count == 0 {
         return Vec::new();
     }
     let gap = effective_gap(requested_gap, area.size.w, area.size);
     let inner = inset_rectangle(area, gap);
-    match layout {
+    match workspace.layout {
         LayoutMode::Scrolling => Vec::new(),
-        LayoutMode::Monocle => vec![inner; count],
+        LayoutMode::Monocle if config.monocle.gaps => vec![inner; count],
+        LayoutMode::Monocle => vec![area; count],
         LayoutMode::MasterStack => {
-            let master_count = master_count.clamp(1, count);
-            if master_count == count {
-                return weighted_rows(
-                    inner,
-                    count,
+            let master_count = workspace.effective_master_count(count, &config.master_stack);
+            let weights = &workspace.master_weights;
+            let frame = MasterFrame::new(inner, config.master_stack.position);
+            let inner = frame.area();
+            let rectangles = if master_count == count {
+                weighted_rows(inner, count, gap, &weights[..count.min(weights.len())])
+            } else {
+                let ratio = workspace.master_ratio(&config.master_stack);
+                let (master, stack) = split_rectangle(inner, true, ratio, gap);
+                let mut rectangles = weighted_rows(
+                    master,
+                    master_count,
                     gap,
-                    &master_weights[..count.min(master_weights.len())],
+                    &weights[..master_count.min(weights.len())],
                 );
-            }
-            let (master, stack) = split_rectangle(inner, true, master_ratio, gap);
-            let mut rectangles = weighted_rows(
-                master,
-                master_count,
-                gap,
-                &master_weights[..master_count.min(master_weights.len())],
-            );
-            rectangles.extend(weighted_rows(
-                stack,
-                count - master_count,
-                gap,
-                master_weights.get(master_count..).unwrap_or_default(),
-            ));
+                rectangles.extend(weighted_rows(
+                    stack,
+                    count - master_count,
+                    gap,
+                    weights.get(master_count..).unwrap_or_default(),
+                ));
+                rectangles
+            };
             rectangles
+                .into_iter()
+                .map(|rectangle| frame.to_output(rectangle))
+                .collect()
         }
         LayoutMode::Dwindle => {
-            let mut remaining = inner;
-            let mut rectangles = Vec::with_capacity(count);
-            for index in 0..count {
-                if index + 1 == count {
-                    rectangles.push(remaining);
-                } else {
-                    let ratio = dwindle_ratios.get(index).copied().unwrap_or(0.5);
-                    let (window, rest) = split_rectangle(remaining, index % 2 == 0, ratio, gap);
-                    rectangles.push(window);
-                    remaining = rest;
-                }
-            }
-            rectangles
+            let cuts = dwindle_cuts(
+                inner,
+                count,
+                gap,
+                &workspace.dwindle_ratios,
+                &config.dwindle,
+            );
+            let last = cuts.last().map_or(inner, |cut| cut.rest);
+            cuts.iter()
+                .map(|cut| cut.first)
+                .chain(std::iter::once(last))
+                .collect()
         }
     }
+}
+
+/// master_stack is laid out as if the master area were on the left, then
+/// turned to `layout.master_stack.position`. Placement, drag-resizing and
+/// directional focus all go through this one mapping, so the layout itself
+/// only has to be right once.
+#[derive(Clone, Copy)]
+struct MasterFrame {
+    area: Rectangle<i32, Logical>,
+    position: MasterPosition,
+}
+
+impl MasterFrame {
+    fn new(area: Rectangle<i32, Logical>, position: MasterPosition) -> Self {
+        Self { area, position }
+    }
+
+    /// The area in the frame: the output's, turned on its side when the master
+    /// area is above or below the stack.
+    fn area(self) -> Rectangle<i32, Logical> {
+        Rectangle::new(self.area.loc, self.frame_size(self.area.size))
+    }
+
+    fn frame_size(self, size: Size<i32, Logical>) -> Size<i32, Logical> {
+        if self.position.transposed() {
+            (size.h, size.w).into()
+        } else {
+            size
+        }
+    }
+
+    fn to_output(self, rectangle: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        let frame_width = self.area().size.w;
+        let mut x = rectangle.loc.x - self.area.loc.x;
+        let mut y = rectangle.loc.y - self.area.loc.y;
+        if self.position.mirrored() {
+            x = frame_width - x - rectangle.size.w;
+        }
+        if self.position.transposed() {
+            std::mem::swap(&mut x, &mut y);
+        }
+        Rectangle::new(
+            (self.area.loc.x + x, self.area.loc.y + y).into(),
+            self.frame_size(rectangle.size),
+        )
+    }
+
+    fn to_frame(self, rectangle: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        let mut x = rectangle.loc.x - self.area.loc.x;
+        let mut y = rectangle.loc.y - self.area.loc.y;
+        let size = self.frame_size(rectangle.size);
+        if self.position.transposed() {
+            std::mem::swap(&mut x, &mut y);
+        }
+        if self.position.mirrored() {
+            x = self.area().size.w - x - size.w;
+        }
+        Rectangle::new((self.area.loc.x + x, self.area.loc.y + y).into(), size)
+    }
+
+    fn point_to_frame(self, point: Point<f64, Logical>) -> Point<f64, Logical> {
+        let mut x = point.x - f64::from(self.area.loc.x);
+        let mut y = point.y - f64::from(self.area.loc.y);
+        if self.position.transposed() {
+            std::mem::swap(&mut x, &mut y);
+        }
+        if self.position.mirrored() {
+            x = f64::from(self.area().size.w) - x;
+        }
+        (
+            f64::from(self.area.loc.x) + x,
+            f64::from(self.area.loc.y) + y,
+        )
+            .into()
+    }
+}
+
+/// One dwindle split: the window it makes room for, and what is left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DwindleCut {
+    first: Rectangle<i32, Logical>,
+    rest: Rectangle<i32, Logical>,
+    /// Side by side rather than one above the other.
+    vertical: bool,
+    /// The length the split divides, for turning a drag into a ratio.
+    length: i32,
+}
+
+/// Every split of a dwindle layout of `count` windows, in order. The one place
+/// that decides which way a split cuts, for laying out, dragging and keyboard
+/// resizing alike.
+fn dwindle_cuts(
+    inner: Rectangle<i32, Logical>,
+    count: usize,
+    gap: i32,
+    ratios: &[Option<f64>],
+    config: &DwindleConfig,
+) -> Vec<DwindleCut> {
+    let mut remaining = inner;
+    let mut cuts = Vec::with_capacity(count.saturating_sub(1));
+    for index in 0..count.saturating_sub(1) {
+        let vertical = match config.split {
+            DwindleSplit::Alternate => index % 2 == 0,
+            DwindleSplit::Longest => remaining.size.w >= remaining.size.h,
+        };
+        let ratio = ratios
+            .get(index)
+            .copied()
+            .flatten()
+            .unwrap_or(config.split_ratio);
+        let (first, rest) = split_rectangle(remaining, vertical, ratio, gap);
+        cuts.push(DwindleCut {
+            first,
+            rest,
+            vertical,
+            length: split_length(remaining, vertical, gap),
+        });
+        remaining = rest;
+    }
+    cuts
 }
 
 fn inset_rectangle(rectangle: Rectangle<i32, Logical>, amount: i32) -> Rectangle<i32, Logical> {
@@ -5550,11 +5749,12 @@ fn dwindle_divider_at(
     inner: Rectangle<i32, Logical>,
     count: usize,
     gap: i32,
-    ratios: &[f64],
+    ratios: &[Option<f64>],
     pointer: Point<f64, Logical>,
     margin: i32,
 ) -> Option<DividerHit> {
-    let (vertical, horizontal) = dwindle_dividers_at(inner, count, gap, ratios, pointer, margin);
+    let cuts = dwindle_cuts(inner, count, gap, ratios, &DwindleConfig::default());
+    let (vertical, horizontal) = dwindle_dividers_at(&cuts, pointer, margin);
     [vertical, horizontal]
         .into_iter()
         .flatten()
@@ -5562,25 +5762,19 @@ fn dwindle_divider_at(
 }
 
 fn dwindle_dividers_at(
-    inner: Rectangle<i32, Logical>,
-    count: usize,
-    gap: i32,
-    ratios: &[f64],
+    cuts: &[DwindleCut],
     pointer: Point<f64, Logical>,
     margin: i32,
 ) -> (Option<DividerHit>, Option<DividerHit>) {
-    let mut remaining = inner;
     let mut vertical_hit = None::<DividerHit>;
     let mut horizontal_hit = None::<DividerHit>;
-    for split in 0..count.saturating_sub(1) {
-        let vertical = split % 2 == 0;
-        let ratio = ratios.get(split).copied().unwrap_or(0.5);
-        let (first, rest) = split_rectangle(remaining, vertical, ratio, gap);
-        if let Some(distance) = divider_distance(pointer, first, rest, vertical, margin) {
+    for (split, cut) in cuts.iter().enumerate() {
+        let vertical = cut.vertical;
+        if let Some(distance) = divider_distance(pointer, cut.first, cut.rest, vertical, margin) {
             let hit = DividerHit {
                 split,
                 vertical,
-                length: split_length(remaining, vertical, gap),
+                length: cut.length,
                 distance,
             };
             let closest = if vertical {
@@ -5592,7 +5786,6 @@ fn dwindle_dividers_at(
                 *closest = Some(hit);
             }
         }
-        remaining = rest;
     }
     (vertical_hit, horizontal_hit)
 }
@@ -6188,16 +6381,39 @@ mod tests {
         assert_eq!(first.layout, LayoutMode::Scrolling);
     }
 
+    /// `layout_rectangles` for a workspace with these adjustments, under the
+    /// default `[layout]`.
+    fn tiled_rectangles(
+        layout: LayoutMode,
+        area: Rectangle<i32, Logical>,
+        count: usize,
+        gap: i32,
+        master_count: usize,
+        master_ratio: f64,
+        master_weights: &[f64],
+        dwindle_ratios: &[f64],
+    ) -> Vec<Rectangle<i32, Logical>> {
+        let workspace = Workspace {
+            layout,
+            master_count: Some(master_count),
+            master_ratio: Some(master_ratio),
+            master_weights: master_weights.to_vec(),
+            dwindle_ratios: dwindle_ratios.iter().copied().map(Some).collect(),
+            ..Workspace::default()
+        };
+        layout_rectangles(&workspace, area, count, gap, &LayoutConfig::default())
+    }
+
     #[test]
     fn alternate_layout_rectangles_are_stable_and_positive() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
-        let monocle = layout_rectangles(LayoutMode::Monocle, area, 3, 10, 1, 0.6, &[], &[]);
+        let monocle = tiled_rectangles(LayoutMode::Monocle, area, 3, 10, 1, 0.6, &[], &[]);
         assert_eq!(
             monocle,
             vec![Rectangle::new((10, 10).into(), (980, 780).into()); 3]
         );
 
-        let master = layout_rectangles(LayoutMode::MasterStack, area, 3, 10, 1, 0.6, &[], &[]);
+        let master = tiled_rectangles(LayoutMode::MasterStack, area, 3, 10, 1, 0.6, &[], &[]);
         assert_eq!(
             master[0],
             Rectangle::new((10, 10).into(), (582, 780).into())
@@ -6211,7 +6427,7 @@ mod tests {
             Rectangle::new((602, 405).into(), (388, 385).into())
         );
 
-        let dwindle = layout_rectangles(LayoutMode::Dwindle, area, 4, 10, 1, 0.6, &[], &[]);
+        let dwindle = tiled_rectangles(LayoutMode::Dwindle, area, 4, 10, 1, 0.6, &[], &[]);
         assert_eq!(
             dwindle[0],
             Rectangle::new((10, 10).into(), (485, 780).into())
@@ -6229,7 +6445,7 @@ mod tests {
             Rectangle::new((753, 405).into(), (237, 385).into())
         );
 
-        let tiny = layout_rectangles(
+        let tiny = tiled_rectangles(
             LayoutMode::Dwindle,
             Rectangle::new((0, 0).into(), (2, 2).into()),
             8,
@@ -6247,7 +6463,7 @@ mod tests {
 
     #[test]
     fn dwindle_navigation_follows_geometry() {
-        let geometries = layout_rectangles(
+        let geometries = tiled_rectangles(
             LayoutMode::Dwindle,
             Rectangle::new((0, 0).into(), (1000, 800).into()),
             4,
@@ -6307,7 +6523,7 @@ mod tests {
     #[test]
     fn alternate_layout_ratios_resize_expected_splits() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
-        let master = layout_rectangles(
+        let master = tiled_rectangles(
             LayoutMode::MasterStack,
             area,
             3,
@@ -6326,7 +6542,7 @@ mod tests {
             Rectangle::new((602, 574).into(), (388, 216).into())
         );
 
-        let dwindle = layout_rectangles(
+        let dwindle = tiled_rectangles(
             LayoutMode::Dwindle,
             area,
             4,
@@ -6355,16 +6571,17 @@ mod tests {
 
         assert_eq!(adjusted_split_ratio(0.5, 1.0), 0.9);
         assert_eq!(adjusted_split_ratio(0.5, -1.0), 0.1);
-        assert_eq!(dwindle_split(0, 4, true), Some(0));
-        assert_eq!(dwindle_split(0, 4, false), None);
-        assert_eq!(dwindle_split(3, 4, true), Some(2));
-        assert_eq!(dwindle_split(3, 4, false), Some(1));
+        let alternate = [true, false, true];
+        assert_eq!(dwindle_split(0, 4, true, &alternate), Some(0));
+        assert_eq!(dwindle_split(0, 4, false, &alternate), None);
+        assert_eq!(dwindle_split(3, 4, true, &alternate), Some(2));
+        assert_eq!(dwindle_split(3, 4, false, &alternate), Some(1));
     }
 
     #[test]
     fn mouse_hits_only_internal_layout_dividers() {
         let inner = Rectangle::new((10, 10).into(), (980, 780).into());
-        let ratios = [0.7, 0.25, 0.6];
+        let ratios = [Some(0.7), Some(0.25), Some(0.6)];
         assert_eq!(
             dwindle_divider_at(inner, 4, 10, &ratios, (689.0, 100.0).into(), 8),
             Some(DividerHit {
@@ -6383,8 +6600,8 @@ mod tests {
             dwindle_divider_at(inner, 4, 10, &ratios, (10.0, 100.0).into(), 8),
             None
         );
-        let (vertical, horizontal) =
-            dwindle_dividers_at(inner, 4, 10, &[0.5; 3], (505.0, 405.0).into(), 8);
+        let cuts = dwindle_cuts(inner, 4, 10, &[], &DwindleConfig::default());
+        let (vertical, horizontal) = dwindle_dividers_at(&cuts, (505.0, 405.0).into(), 8);
         assert!(vertical.is_some() && horizontal.is_some());
         let (master, stack) = split_rectangle(inner, true, 0.6, 10);
         assert_eq!(
@@ -6401,28 +6618,29 @@ mod tests {
     fn layout_resize_state_is_per_workspace_and_tracks_tile_count() {
         let mut first = Workspace::default();
         let second = Workspace::default();
-        first.master_count = 2;
+        first.master_count = Some(2);
         first.master_ratio = Some(0.7);
-        first.dwindle_ratios = vec![0.6, 0.4];
+        first.dwindle_ratios = vec![Some(0.6), Some(0.4)];
         first.sync_layout_sizes(4);
         assert_eq!(first.master_ratio, Some(0.7));
-        assert_eq!(first.dwindle_ratios, [0.6, 0.4, 0.5]);
+        // A new split follows `layout.dwindle.split_ratio` until it is resized.
+        assert_eq!(first.dwindle_ratios, [Some(0.6), Some(0.4), None]);
         assert_eq!(first.master_weights, [1.0, 1.0, 1.0, 1.0]);
         first.sync_layout_sizes(2);
-        assert_eq!(first.dwindle_ratios, [0.6]);
+        assert_eq!(first.dwindle_ratios, [Some(0.6)]);
         assert_eq!(second.master_ratio, None);
         assert!(second.dwindle_ratios.is_empty());
         let mut restored = Workspace::default();
         restored.adopt_layout_state(&first);
-        assert_eq!(restored.master_count, 2);
+        assert_eq!(restored.master_count, Some(2));
         assert_eq!(restored.master_ratio, Some(0.7));
-        assert_eq!(restored.dwindle_ratios, [0.6]);
+        assert_eq!(restored.dwindle_ratios, [Some(0.6)]);
     }
 
     #[test]
     fn master_count_and_spatial_neighbors_are_bounded() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
-        let split = layout_rectangles(LayoutMode::MasterStack, area, 4, 10, 2, 0.6, &[], &[]);
+        let split = tiled_rectangles(LayoutMode::MasterStack, area, 4, 10, 2, 0.6, &[], &[]);
         assert_eq!(split[0], Rectangle::new((10, 10).into(), (582, 385).into()));
         assert_eq!(
             split[1],
@@ -6433,7 +6651,7 @@ mod tests {
             Rectangle::new((602, 10).into(), (388, 385).into())
         );
 
-        let all_master = layout_rectangles(LayoutMode::MasterStack, area, 4, 10, 4, 0.6, &[], &[]);
+        let all_master = tiled_rectangles(LayoutMode::MasterStack, area, 4, 10, 4, 0.6, &[], &[]);
         assert!(all_master.iter().all(|rectangle| rectangle.loc.x == 10));
         assert!(all_master.iter().all(|rectangle| rectangle.size.w == 980));
 
@@ -6449,6 +6667,75 @@ mod tests {
         assert_eq!(master_neighbor(0, 2, true, -1, &geometries), None);
         assert_eq!(master_neighbor(2, 2, true, 1, &geometries), None);
         assert_eq!(master_neighbor(2, 2, false, 1, &geometries), Some(3));
+    }
+
+    #[test]
+    fn layout_options_shape_each_layout() {
+        let area = Rectangle::new((0, 0).into(), (1000, 800).into());
+        let workspace = |layout| Workspace {
+            layout,
+            ..Workspace::default()
+        };
+
+        // master_stack: the config's ratio and count, on the configured side.
+        let mut config = LayoutConfig::default();
+        config.master_stack.master_ratio = 0.5;
+        config.master_stack.master_count = 2;
+        let left = layout_rectangles(&workspace(LayoutMode::MasterStack), area, 3, 10, &config);
+        assert_eq!(left[0], Rectangle::new((10, 10).into(), (485, 385).into()));
+        assert_eq!(left[1], Rectangle::new((10, 405).into(), (485, 385).into()));
+        assert_eq!(left[2], Rectangle::new((505, 10).into(), (485, 780).into()));
+        config.master_stack.position = MasterPosition::Right;
+        let right = layout_rectangles(&workspace(LayoutMode::MasterStack), area, 3, 10, &config);
+        assert_eq!(
+            right[0],
+            Rectangle::new((505, 10).into(), (485, 385).into())
+        );
+        assert_eq!(right[2], Rectangle::new((10, 10).into(), (485, 780).into()));
+        config.master_stack.position = MasterPosition::Top;
+        let top = layout_rectangles(&workspace(LayoutMode::MasterStack), area, 3, 10, &config);
+        assert_eq!(top[0], Rectangle::new((10, 10).into(), (485, 385).into()));
+        assert_eq!(top[1], Rectangle::new((505, 10).into(), (485, 385).into()));
+        assert_eq!(top[2], Rectangle::new((10, 405).into(), (980, 385).into()));
+        config.master_stack.position = MasterPosition::Bottom;
+        let bottom = layout_rectangles(&workspace(LayoutMode::MasterStack), area, 3, 10, &config);
+        assert_eq!(bottom[0].loc.y, 405);
+        assert_eq!(
+            bottom[2],
+            Rectangle::new((10, 10).into(), (980, 385).into())
+        );
+
+        // The frame round-trips, so a drag lands where it was aimed.
+        let frame = MasterFrame::new(
+            Rectangle::new((10, 10).into(), (980, 780).into()),
+            MasterPosition::Bottom,
+        );
+        assert_eq!(frame.to_frame(frame.to_output(left[1])), left[1]);
+
+        // A workspace's own adjustment still beats the config.
+        let adjusted = Workspace {
+            master_count: Some(1),
+            ..workspace(LayoutMode::MasterStack)
+        };
+        config.master_stack.position = MasterPosition::Left;
+        let one = layout_rectangles(&adjusted, area, 3, 10, &config);
+        assert_eq!(one[0].size.h, 780);
+
+        // dwindle: a "longest" split cuts across whichever side is longer.
+        let mut config = LayoutConfig::default();
+        config.dwindle.split = DwindleSplit::Longest;
+        let tall = Rectangle::new((0, 0).into(), (800, 1000).into());
+        let dwindle = layout_rectangles(&workspace(LayoutMode::Dwindle), tall, 2, 0, &config);
+        assert_eq!(dwindle[0], Rectangle::new((0, 0).into(), (800, 500).into()));
+        config.dwindle.split_ratio = 0.25;
+        let dwindle = layout_rectangles(&workspace(LayoutMode::Dwindle), area, 2, 0, &config);
+        assert_eq!(dwindle[0].size.w, 250);
+
+        // monocle: gaps can be turned off.
+        let mut config = LayoutConfig::default();
+        config.monocle.gaps = false;
+        let monocle = layout_rectangles(&workspace(LayoutMode::Monocle), area, 2, 10, &config);
+        assert_eq!(monocle, vec![area; 2]);
     }
 
     #[test]

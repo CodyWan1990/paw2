@@ -24,7 +24,7 @@ impl Paw2 {
     /// and a window on no monitor has nowhere to come back to, so both are
     /// left alone.
     pub(crate) fn minimize_window(&mut self, window: &Window) {
-        if self.scratchpad_name_for_window(window).is_some() {
+        if self.is_scratchpad_window(window) {
             return;
         }
         let Some((monitor, workspace)) = self.scroller.monitors.iter_mut().find_map(|monitor| {

@@ -1451,6 +1451,7 @@ impl Effects {
                 Uniform::new("corner_radius", radius as f32),
                 Uniform::new("opacity", opacity),
             ],
+            opacity,
             opaque_inset: (opacity >= 1.0).then_some((window, radius.ceil() as i32)),
         }))
     }
@@ -1697,6 +1698,8 @@ pub struct WindowShaderElement {
     inner: SpaceElements,
     program: GlesTexProgram,
     uniforms: Vec<Uniform<'static>>,
+    /// The `opacity` uniform, kept for [`Element::alpha`].
+    opacity: f32,
     /// Window rectangle and corner inset, while the window is still opaque.
     opaque_inset: Option<(Rectangle<i32, Physical>, i32)>,
 }
@@ -1734,8 +1737,11 @@ impl Element for WindowShaderElement {
         self.inner.damage_since(scale, commit)
     }
 
+    /// Includes the shader's opacity, though the shader is what applies it:
+    /// the damage tracker redraws an element whose alpha changed, and without
+    /// this a fade would only advance when the client happened to commit.
     fn alpha(&self) -> f32 {
-        self.inner.alpha()
+        self.inner.alpha() * self.opacity
     }
 
     fn kind(&self) -> Kind {

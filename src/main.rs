@@ -19,14 +19,19 @@ mod workspace;
 mod xwayland;
 
 use std::{
+    cell::{Cell, RefCell},
     ffi::{OsStr, OsString},
     io,
+    rc::Rc,
     sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
 use smithay::reexports::{
-    calloop::{EventLoop, LoopSignal, timer::TimeoutAction, timer::Timer},
+    calloop::{
+        self, EventLoop, Interest, LoopHandle, LoopSignal, PostAction, generic::Generic,
+        timer::TimeoutAction, timer::Timer,
+    },
     rustix::process::{Pid, Signal, kill_process},
     wayland_server::Display,
 };
@@ -48,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let cursor_defaults = cursor::CursorSettings::environment();
-    let (config, mut config_watcher, config_error) = config::load()?;
+    let (config, config_watcher, config_error) = config::load()?;
     phase(&clock, "config loaded");
     // Only the environment half runs here: it costs nothing and has to precede
     // every spawned client. The `gsettings` half is one cold process per key, so
@@ -65,65 +70,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ipc::init(&event_loop.handle(), &mut state);
     install_signal_handlers(event_loop.get_signal());
 
+    let config_watcher = Rc::new(RefCell::new(config_watcher));
+    watch_config(&event_loop.handle(), &config_watcher);
+    // The fallback for what inotify cannot see - a config.toml symlinked
+    // elsewhere, a network home - and the reaper for exited children.
+    let fallback_watcher = config_watcher.clone();
     event_loop.handle().insert_source(
-        Timer::from_duration(Duration::from_millis(500)),
+        Timer::from_duration(CONFIG_FALLBACK_POLL),
         move |_, _, state| {
-            match config_watcher.reload() {
-                Ok(Some(config)) => {
-                    let mut errors = drm::apply_monitor_changes(state, &config.monitors);
-                    let desktop_theme_changes =
-                        changed_desktop_gsettings(&state.config.theme, &config.theme);
-                    let cursor_changes =
-                        changed_cursor_gsettings(&state.config.theme, &config.theme);
-                    let cursor_changed = state.config.theme.cursor_theme
-                        != config.theme.cursor_theme
-                        || state.config.theme.cursor_size != config.theme.cursor_size;
-                    if cursor_changed {
-                        match drm::reload_cursor(state, &config.theme) {
-                            Ok(()) => {
-                                apply_gsettings_updates(cursor_changes);
-                                let settings = state.cursor_defaults.configured(
-                                    config.theme.cursor_theme.as_deref(),
-                                    config.theme.cursor_size,
-                                );
-                                if state.direct.is_some() {
-                                    update_cursor_activation_environment(&settings);
-                                }
-                            }
-                            Err(error) => errors.push(error),
-                        }
-                    }
-                    apply_gsettings_updates(desktop_theme_changes);
-                    let restart_required = state.config.apply_runtime(config);
-                    state.set_middle_click_paste(state.config.input.middle_click_paste);
-                    state.reconcile_scratchpads();
-                    state.reconcile_tab_grouping();
-                    state.reconcile_decorations();
-                    state.relayout(true);
-                    drm::redraw(state);
-                    state.ipc.publish_config(
-                        config_watcher.document(),
-                        (!errors.is_empty()).then(|| errors.join("; ")),
-                    );
-                    tracing::info!("reloaded configuration");
-                    if restart_required {
-                        tracing::warn!(
-                            "backend, monitor order, VRR, startup focus, autostart, clipboard clients, Qt style, and font changes require restarting Paw2"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "could not reload configuration");
-                    // The document is still the config Paw2 is running; a shell
-                    // needs both that and the reason its edit did not take.
-                    state
-                        .ipc
-                        .publish_config(config_watcher.document(), Some(error.to_string()));
-                }
-            }
+            reload_config(state, &mut fallback_watcher.borrow_mut());
             reap_children();
-            TimeoutAction::ToDuration(Duration::from_millis(500))
+            TimeoutAction::ToDuration(CONFIG_FALLBACK_POLL)
         },
     )?;
 
@@ -262,6 +219,120 @@ fn activation_environment() -> Vec<&'static str> {
     variables
 }
 
+/// How often the config is re-read even without an inotify event.
+const CONFIG_FALLBACK_POLL: Duration = Duration::from_secs(5);
+/// How long after the last inotify event the config is re-read, so a tool
+/// writing two files in a row is read once, after both.
+const CONFIG_SETTLE: Duration = Duration::from_millis(100);
+
+/// Re-read the config shortly after any file in its directories changes.
+///
+/// Logs and carries on without it: the fallback poll still catches every edit,
+/// only later.
+fn watch_config(
+    handle: &LoopHandle<'static, Paw2>,
+    config_watcher: &Rc<RefCell<config::ConfigWatcher>>,
+) {
+    use smithay::reexports::rustix::fs::inotify;
+    let fd = match inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK) {
+        Ok(fd) => fd,
+        Err(error) => {
+            tracing::warn!(?error, "could not watch the config; polling it instead");
+            return;
+        }
+    };
+    config_watcher.borrow().watch(&fd);
+    let config_watcher = config_watcher.clone();
+    let settle_pending = Rc::new(Cell::new(false));
+    let registered = handle.insert_source(
+        Generic::new(fd, Interest::READ, calloop::Mode::Level),
+        move |_, fd, state| {
+            // Drain the queue; which file changed does not matter, every layer
+            // is re-read as a set.
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = smithay::reexports::rustix::io::read(&*fd, &mut buffer)
+                && read > 0
+            {}
+            config_watcher.borrow().watch(&*fd);
+            if !settle_pending.replace(true) {
+                let config_watcher = config_watcher.clone();
+                let pending = settle_pending.clone();
+                let scheduled = state.loop_handle.insert_source(
+                    Timer::from_duration(CONFIG_SETTLE),
+                    move |_, _, state| {
+                        pending.set(false);
+                        reload_config(state, &mut config_watcher.borrow_mut());
+                        TimeoutAction::Drop
+                    },
+                );
+                if let Err(error) = scheduled {
+                    settle_pending.set(false);
+                    tracing::warn!(?error, "could not schedule a config reload");
+                }
+            }
+            Ok(PostAction::Continue)
+        },
+    );
+    if let Err(error) = registered {
+        tracing::warn!(?error, "could not watch the config; polling it instead");
+    }
+}
+
+fn reload_config(state: &mut Paw2, config_watcher: &mut config::ConfigWatcher) {
+    match config_watcher.reload() {
+        Ok(Some(config)) => {
+            let mut errors = drm::apply_monitor_changes(state, &config.monitors);
+            let desktop_theme_changes =
+                changed_desktop_gsettings(&state.config.theme, &config.theme);
+            let cursor_changes = changed_cursor_gsettings(&state.config.theme, &config.theme);
+            let cursor_changed = state.config.theme.cursor_theme != config.theme.cursor_theme
+                || state.config.theme.cursor_size != config.theme.cursor_size;
+            if cursor_changed {
+                match drm::reload_cursor(state, &config.theme) {
+                    Ok(()) => {
+                        apply_gsettings_updates_in_background(cursor_changes);
+                        let settings = state.cursor_defaults.configured(
+                            config.theme.cursor_theme.as_deref(),
+                            config.theme.cursor_size,
+                        );
+                        if state.direct.is_some() {
+                            update_cursor_activation_environment(&settings);
+                        }
+                    }
+                    Err(error) => errors.push(error),
+                }
+            }
+            apply_gsettings_updates_in_background(desktop_theme_changes);
+            let restart_required = state.config.apply_runtime(config);
+            state.set_middle_click_paste(state.config.input.middle_click_paste);
+            state.reconcile_scratchpads();
+            state.reconcile_tab_grouping();
+            state.reconcile_decorations();
+            state.relayout(true);
+            drm::redraw(state);
+            state.ipc.publish_config(
+                config_watcher.document(),
+                (!errors.is_empty()).then(|| errors.join("; ")),
+            );
+            tracing::info!("reloaded configuration");
+            if restart_required {
+                tracing::warn!(
+                    "backend, monitor order, VRR, startup focus, autostart, clipboard clients, Qt style, and font changes require restarting Paw2"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not reload configuration");
+            // The document is still the config Paw2 is running; a shell
+            // needs both that and the reason its edit did not take.
+            state
+                .ipc
+                .publish_config(config_watcher.document(), Some(error.to_string()));
+        }
+    }
+}
+
 /// Run a session-integration helper to completion, logging rather than
 /// failing. None of these is worth the session: a desktop without a portal
 /// environment is degraded, a desktop that refused to start is not.
@@ -295,13 +366,20 @@ fn import_activation_environment() {
     );
 }
 
+/// Runs on a config reload, so it is not waited for; the fallback poll reaps it.
 fn update_cursor_activation_environment(settings: &cursor::CursorSettings) {
-    update_activation_environment(
-        settings
-            .environment_values()
-            .map(|(name, value)| format!("{name}={value}")),
-        "update the cursor launch environment",
-    );
+    let spawned = std::process::Command::new("dbus-update-activation-environment")
+        .arg("--systemd")
+        .args(
+            settings
+                .environment_values()
+                .map(|(name, value)| format!("{name}={value}")),
+        )
+        .spawn();
+    match spawned {
+        Ok(child) => children().push(child),
+        Err(error) => tracing::warn!(?error, "could not update the cursor launch environment"),
+    }
 }
 
 /// Finish initializing the login daemon that `pam_gnome_keyring` unlocked.
@@ -391,7 +469,32 @@ fn apply_gsettings(settings: Vec<(&'static str, String)>) {
 /// Every `gsettings` here is a cold process that loads glib and D-Bus-activates
 /// `dconf`, and that latency is the same whether one runs or four do. Spawning
 /// the whole set before waiting on any of it pays for it once.
+///
+/// Waits, for startup: clients launched next must read the new values.
 fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
+    for (key, mut child) in spawn_gsettings(settings) {
+        match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
+            Err(error) => tracing::warn!(?error, key, "could not wait for gsettings"),
+        }
+    }
+}
+
+/// [`apply_gsettings_updates`] without the wait, for a config reload: a second
+/// of `gsettings` start-up there would be a second of frozen desktop. The
+/// fallback poll reaps them.
+fn apply_gsettings_updates_in_background(settings: Vec<(&'static str, Option<String>)>) {
+    children().extend(
+        spawn_gsettings(settings)
+            .into_iter()
+            .map(|(_, child)| child),
+    );
+}
+
+fn spawn_gsettings(
+    settings: Vec<(&'static str, Option<String>)>,
+) -> Vec<(&'static str, std::process::Child)> {
     let mut running = Vec::with_capacity(settings.len());
     for (key, value) in settings {
         let mut command = std::process::Command::new("gsettings");
@@ -411,13 +514,7 @@ fn apply_gsettings_updates(settings: Vec<(&'static str, Option<String>)>) {
             }
         }
     }
-    for (key, mut child) in running {
-        match child.wait() {
-            Ok(status) if status.success() => {}
-            Ok(status) => tracing::warn!(%status, key, "could not apply desktop theme setting"),
-            Err(error) => tracing::warn!(?error, key, "could not wait for gsettings"),
-        }
-    }
+    running
 }
 
 fn theme_environment(theme: &config::ThemeConfig) -> Vec<(&'static str, String)> {
