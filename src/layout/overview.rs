@@ -204,7 +204,8 @@ impl Paw2 {
                 .and_then(|window| workspace.column_of(window)),
             selection.pan,
             self.config.layout.scrolling.column_width,
-            self.config.appearance.gaps,
+            workspace_gap(workspace, &self.config),
+            lone_full_width(&self.config),
             self.config.layout.scrolling.center_focused_column,
         )
     }

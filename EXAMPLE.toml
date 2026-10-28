@@ -53,6 +53,9 @@ column_width = 0.6
 preset_column_widths = [0.33333, 0.5, 0.66667]
 # When false, the viewport moves only enough to reveal the focused column.
 center_focused_column = false
+# A workspace's only tiled window takes the full width until a second one
+# opens. appearance.smart_gaps turns this on as well.
+lone_window_full_width = false
 
 [layout.master_stack]
 # The master area's share of the output, from 0.1 to 0.9. Default: 0.6.
@@ -84,6 +87,10 @@ gaps = true
 # Logical pixels between windows and output edges.
 # At most 256. Default: 0.
 gaps = 15
+# A workspace's only tiled window fills it: no gaps around it and no focus
+# ring. Floating windows do not count. In scrolling the window also takes the
+# full width, as layout.scrolling.lone_window_full_width does. Default: false.
+smart_gaps = false
 # The ring cannot be wider than the gap it sits in. Default: 0, so a ring
 # needs gaps to sit in as well as a width.
 focus_ring_width = 1

@@ -212,13 +212,17 @@ impl Paw2 {
         let row = column.windows.iter().position(|item| item == &window)?;
         let column_edge = column_edge(location.x, geometry, 8);
         let row_edge = row_boundary(location.y, geometry, row, column.windows.len(), 8);
-        let x = column_edge.map(|(edge, _)| AxisResize::Column {
-            edge,
-            initial_width: column
-                .width
-                .unwrap_or(self.config.layout.scrolling.column_width),
-            initial_offset: workspace.offset,
-        });
+        // A lone window held at full width has no column edge to drag.
+        let full_width = lone_full_width(&self.config) && is_lone_window(&workspace.columns);
+        let x = column_edge
+            .filter(|_| !full_width)
+            .map(|(edge, _)| AxisResize::Column {
+                edge,
+                initial_width: column
+                    .width
+                    .unwrap_or(self.config.layout.scrolling.column_width),
+                initial_offset: workspace.offset,
+            });
         let y = row_edge.and_then(|(boundary, _)| {
             let initial_heights = column
                 .windows
@@ -307,7 +311,11 @@ impl Paw2 {
             .flat_map(|column| column.windows.iter())
             .collect::<Vec<_>>();
         let index = tiled.iter().position(|candidate| *candidate == &window)?;
-        let gap = effective_gap(self.config.appearance.gaps, area.size.w, area.size);
+        let gap = effective_gap(
+            workspace_gap(workspace, &self.config),
+            area.size.w,
+            area.size,
+        );
         let inner = inset_rectangle(area, gap);
         match workspace.layout {
             LayoutMode::Dwindle => {
@@ -882,7 +890,11 @@ impl Paw2 {
             })
             .min()
             .unwrap_or(area.size.w);
-        let gap = effective_gap(self.config.appearance.gaps, requested_width, area.size);
+        let gap = effective_gap(
+            workspace_gap(monitor.active(), &self.config),
+            requested_width,
+            area.size,
+        );
         let (width, offset) =
             resized_column(initial_width, initial_offset, edge, delta, area.size.w, gap);
         let workspace = monitor.active_mut();

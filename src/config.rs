@@ -241,6 +241,9 @@ pub struct ScrollingConfig {
     /// Widths `cycle_column_width` steps through.
     pub preset_column_widths: Vec<f64>,
     pub center_focused_column: bool,
+    /// A workspace's only tiled window spans the whole output, whatever its
+    /// column width. `appearance.smart_gaps` implies it.
+    pub lone_window_full_width: bool,
 }
 
 impl Default for ScrollingConfig {
@@ -249,6 +252,7 @@ impl Default for ScrollingConfig {
             column_width: 0.6,
             preset_column_widths: default_preset_column_widths(),
             center_focused_column: false,
+            lone_window_full_width: false,
         }
     }
 }
@@ -341,6 +345,9 @@ impl Default for MonocleConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AppearanceConfig {
     pub gaps: i32,
+    /// A workspace's only tiled window takes its whole area: no gaps around
+    /// it and no focus ring.
+    pub smart_gaps: bool,
     pub focus_ring_width: i32,
     pub focus_ring_color: [f32; 4],
     pub corner_radius: i32,
@@ -1047,6 +1054,7 @@ struct RawScrolling {
     column_width: Option<f64>,
     preset_column_widths: Option<Vec<f64>>,
     center_focused_column: Option<bool>,
+    lone_window_full_width: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1108,6 +1116,7 @@ impl Default for RawScratchpad {
 #[serde(default, deny_unknown_fields)]
 struct RawAppearance {
     gaps: u16,
+    smart_gaps: bool,
     focus_ring_width: u16,
     focus_ring_color: String,
     corner_radius: u16,
@@ -1129,6 +1138,7 @@ impl Default for RawAppearance {
     fn default() -> Self {
         Self {
             gaps: 0,
+            smart_gaps: false,
             focus_ring_width: 0,
             focus_ring_color: "#0b3d91".into(),
             corner_radius: 0,
@@ -1501,6 +1511,7 @@ fn parse_layout(raw: RawLayout) -> Result<LayoutConfig, String> {
         column_width: raw.column_width,
         preset_column_widths: raw.preset_column_widths,
         center_focused_column: raw.center_focused_column,
+        lone_window_full_width: None,
     };
     if legacy.column_width.is_some()
         || legacy.preset_column_widths.is_some()
@@ -1525,6 +1536,9 @@ fn parse_layout(raw: RawLayout) -> Result<LayoutConfig, String> {
             .center_focused_column
             .or(legacy.center_focused_column)
             .unwrap_or(defaults.center_focused_column),
+        lone_window_full_width: current
+            .lone_window_full_width
+            .unwrap_or(defaults.lone_window_full_width),
     };
     finite_in(
         "layout.scrolling.column_width",
@@ -1920,6 +1934,7 @@ fn parse_value(document: toml::Value) -> Result<Config, String> {
         layout,
         appearance: AppearanceConfig {
             gaps: raw.appearance.gaps.into(),
+            smart_gaps: raw.appearance.smart_gaps,
             focus_ring_width: raw.appearance.focus_ring_width.into(),
             focus_ring_color,
             corner_radius: raw.appearance.corner_radius.into(),

@@ -1530,7 +1530,10 @@ impl Effects {
     fn focus_ring(&mut self, state: &Paw2, output: &Output) -> Option<(PixelShaderElement, Id)> {
         let appearance = self.appearance;
         let width = appearance.focus_ring_width;
-        if width <= 0 || state.has_exclusive_keyboard_layer() {
+        if width <= 0
+            || state.has_exclusive_keyboard_layer()
+            || state.focused_window_is_lone(output)
+        {
             return None;
         }
         let program = self.ring_program.clone()?;
@@ -2206,6 +2209,7 @@ mod tests {
     fn appearance() -> AppearanceConfig {
         AppearanceConfig {
             gaps: 15,
+            smart_gaps: false,
             focus_ring_width: 1,
             focus_ring_color: [0.0, 0.0, 0.0, 1.0],
             corner_radius: 0,

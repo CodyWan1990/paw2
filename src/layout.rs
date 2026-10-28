@@ -838,6 +838,11 @@ impl Workspace {
         true
     }
 
+    /// How many windows the tiled layout places.
+    fn tiled_count(&self) -> usize {
+        self.columns.iter().map(|column| column.windows.len()).sum()
+    }
+
     fn tiled_slots(&self) -> Vec<Slot> {
         self.columns
             .iter()
@@ -3271,6 +3276,31 @@ impl Paw2 {
         Some(ScratchpadStrip { panel, previews })
     }
 
+    /// Whether `output`'s focused window is its workspace's only tiled window
+    /// under `appearance.smart_gaps`, and so wears no focus ring.
+    pub fn focused_window_is_lone(&self, output: &Output) -> bool {
+        if !self.config.appearance.smart_gaps {
+            return false;
+        }
+        let Some(monitor) = self.scroller.monitor_for(output) else {
+            return false;
+        };
+        let workspace = monitor.active();
+        // A visible scratchpad holds the focus over the workspace beneath it.
+        let scratchpad_focused = self
+            .scroller
+            .focused_scratchpad
+            .as_ref()
+            .and_then(|name| self.scroller.scratchpads.get(name))
+            .is_some_and(|runtime| runtime.visible);
+        !scratchpad_focused
+            && workspace.tiled_count() == 1
+            && workspace
+                .focused
+                .and_then(|index| workspace.windows.get(index))
+                .is_some_and(|window| !workspace.is_floating(window))
+    }
+
     pub fn focused_window_render_state(
         &self,
         output: &Output,
@@ -4094,7 +4124,8 @@ impl Paw2 {
                     &workspace.columns,
                     geometry.size,
                     self.config.layout.scrolling.column_width,
-                    self.config.appearance.gaps,
+                    workspace_gap(workspace, &self.config),
+                    lone_full_width(&self.config),
                 );
                 workspace.offset = viewport_offset(
                     workspace.offset,
@@ -4109,8 +4140,11 @@ impl Paw2 {
             } else {
                 workspace.offset = 0;
                 if workspace.layout == LayoutMode::Dwindle {
-                    let gap =
-                        effective_gap(self.config.appearance.gaps, geometry.size.w, geometry.size);
+                    let gap = effective_gap(
+                        workspace_gap(workspace, &self.config),
+                        geometry.size.w,
+                        geometry.size,
+                    );
                     workspace.dwindle_vertical = dwindle_cuts(
                         inset_rectangle(geometry, gap),
                         tiled.len(),
@@ -4126,7 +4160,7 @@ impl Paw2 {
                     workspace,
                     geometry,
                     tiled.len(),
-                    self.config.appearance.gaps,
+                    workspace_gap(workspace, &self.config),
                     &self.config.layout,
                 )
                 .into_iter()
@@ -5114,7 +5148,8 @@ fn overview_window_placements(
             &workspace.columns,
             area.size,
             config.layout.scrolling.column_width,
-            config.appearance.gaps,
+            workspace_gap(workspace, config),
+            lone_full_width(config),
         );
         place_columns(&workspace.columns, area, &widths, gap, offset)
     } else {
@@ -5122,7 +5157,7 @@ fn overview_window_placements(
             workspace,
             area,
             tiled.len(),
-            config.appearance.gaps,
+            workspace_gap(workspace, config),
             &config.layout,
         )
         .into_iter()
@@ -5386,16 +5421,25 @@ fn viewport_offset(
 
 /// The width of every column of a scrolling workspace, and the gap that fits
 /// between them. Shared by the real layout and the overview preview so the two
-/// cannot drift apart.
+/// cannot drift apart. With `lone_full_width`, a workspace holding a single
+/// window gives it the whole width.
 fn column_widths<T>(
     columns: &[Column<T>],
     area: Size<i32, Logical>,
     default_width: f64,
     requested_gap: i32,
+    lone_full_width: bool,
 ) -> (i32, Vec<i32>) {
+    let lone = lone_full_width && is_lone_window(columns);
     let fractions = columns
         .iter()
-        .map(|column| column.width.unwrap_or(default_width))
+        .map(|column| {
+            if lone {
+                1.0
+            } else {
+                column.width.unwrap_or(default_width)
+            }
+        })
         .collect::<Vec<_>>();
     let requested_width = fractions
         .iter()
@@ -5418,6 +5462,7 @@ fn column_widths<T>(
 /// `viewport_offset`, so panning in the overview and focusing on the desktop can
 /// never disagree. A strip that already fits clamps to `0`, which is what keeps
 /// the preview equal to reality in the common case.
+#[allow(clippy::too_many_arguments)]
 fn overview_pan_target<T>(
     columns: &[Column<T>],
     area: Size<i32, Logical>,
@@ -5425,6 +5470,7 @@ fn overview_pan_target<T>(
     current: i32,
     default_width: f64,
     requested_gap: i32,
+    lone_full_width: bool,
     center: bool,
 ) -> i32 {
     // No column means a floating window is selected. Those do not scroll with
@@ -5433,7 +5479,7 @@ fn overview_pan_target<T>(
     let Some(column) = column else {
         return current;
     };
-    let (gap, widths) = column_widths(columns, area, default_width, requested_gap);
+    let (gap, widths) = column_widths(columns, area, default_width, requested_gap, lone_full_width);
     viewport_offset(current, Some(column), &widths, area.w, gap, center, true)
 }
 
@@ -5489,6 +5535,29 @@ fn floating_rectangle(
             |location| constrain_window(area, size, location),
         );
     Rectangle::new(location, size)
+}
+
+/// The gap a workspace's tiled windows keep: `appearance.gaps`, or none
+/// around a lone tiled window under `appearance.smart_gaps`.
+fn workspace_gap(workspace: &Workspace, config: &Config) -> i32 {
+    tiled_gap(
+        workspace.tiled_count(),
+        config.appearance.gaps,
+        config.appearance.smart_gaps,
+    )
+}
+
+/// Whether a scrolling workspace's only window should span the whole width.
+fn lone_full_width(config: &Config) -> bool {
+    config.appearance.smart_gaps || config.layout.scrolling.lone_window_full_width
+}
+
+fn is_lone_window<T>(columns: &[Column<T>]) -> bool {
+    matches!(columns, [column] if column.windows.len() == 1)
+}
+
+fn tiled_gap(tiled: usize, gaps: i32, smart_gaps: bool) -> i32 {
+    if smart_gaps && tiled == 1 { 0 } else { gaps }
 }
 
 fn effective_gap(
@@ -6059,7 +6128,7 @@ mod tests {
             },
         ];
         let area = Rectangle::new((0, 0).into(), (1000, 600).into());
-        let (gap, widths) = column_widths(&columns, area.size, 0.6, 15);
+        let (gap, widths) = column_widths(&columns, area.size, 0.6, 15, false);
         assert_eq!(gap, 15);
         assert_eq!(widths, vec![493, 493]);
 
@@ -6170,7 +6239,7 @@ mod tests {
             .collect::<Vec<_>>();
         let area: Size<i32, Logical> = (1000, 600).into();
         let pan = |column: Option<usize>, current: i32| {
-            overview_pan_target(&columns, area, column, current, 0.5, 15, false)
+            overview_pan_target(&columns, area, column, current, 0.5, 15, false, false)
         };
 
         // The first column is already on the card, so the view does not move.
@@ -6189,7 +6258,7 @@ mod tests {
         assert_eq!(pan(None, far), far);
         // `center_focused_column` is honoured.
         assert_eq!(
-            overview_pan_target(&columns, area, Some(3), 0, 0.5, 15, true),
+            overview_pan_target(&columns, area, Some(3), 0, 0.5, 15, false, true),
             493 * 3 - (970 - 478) / 2
         );
 
@@ -6205,7 +6274,7 @@ mod tests {
             .collect::<Vec<_>>();
         for column in 0..3 {
             assert_eq!(
-                overview_pan_target(&fitting, area, Some(column), 0, 0.3, 15, false),
+                overview_pan_target(&fitting, area, Some(column), 0, 0.3, 15, false, false),
                 0
             );
         }
@@ -6667,6 +6736,38 @@ mod tests {
         assert_eq!(master_neighbor(0, 2, true, -1, &geometries), None);
         assert_eq!(master_neighbor(2, 2, true, 1, &geometries), None);
         assert_eq!(master_neighbor(2, 2, false, 1, &geometries), Some(3));
+    }
+
+    #[test]
+    fn smart_gaps_drop_only_a_lone_windows_gaps() {
+        assert_eq!(tiled_gap(1, 15, false), 15);
+        assert_eq!(tiled_gap(1, 15, true), 0);
+        assert_eq!(tiled_gap(2, 15, true), 15);
+        assert_eq!(tiled_gap(0, 15, true), 15);
+    }
+
+    #[test]
+    fn a_lone_window_can_take_the_full_width() {
+        let column = |windows: Vec<u32>| Column {
+            row_weights: vec![1.0; windows.len()],
+            windows,
+            focused: 0,
+            width: Some(0.5),
+        };
+        let area = Size::from((1000, 600));
+
+        let lone = [column(vec![1])];
+        assert_eq!(column_widths(&lone, area, 0.6, 0, false).1, vec![500]);
+        assert_eq!(column_widths(&lone, area, 0.6, 0, true).1, vec![1000]);
+
+        // A second window, in its own column or the same one, ends it.
+        let two_columns = [column(vec![1]), column(vec![2])];
+        assert_eq!(
+            column_widths(&two_columns, area, 0.6, 0, true).1,
+            vec![500, 500]
+        );
+        let stacked = [column(vec![1, 2])];
+        assert_eq!(column_widths(&stacked, area, 0.6, 0, true).1, vec![500]);
     }
 
     #[test]
