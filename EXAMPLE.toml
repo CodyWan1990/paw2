@@ -194,7 +194,9 @@ copy_on_select = false
 # connector stay yours for fixing a machine that will not start.
 [backend]
 # Automatically scan out compatible fullscreen buffers on the DRM primary
-# plane. Default: true - this one is a gaming path, not decoration.
+# plane. Outside fullscreen only the cursor gets its own plane, and false
+# composites the cursor too. Default: true - this one is a gaming path, not
+# decoration.
 direct_scanout = true
 # Pin the GPU or the single output to drive. An absolute path is required
 # for the device, and a pinned connector cannot be combined with the

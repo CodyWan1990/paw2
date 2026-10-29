@@ -1555,7 +1555,10 @@ fn frame_flags(fullscreen: bool, direct_scanout: bool) -> FrameFlags {
     } else if fullscreen {
         FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
     } else {
-        FrameFlags::DEFAULT
+        // Windows stay composited. Promoted to overlay planes, a window flips
+        // between plane and composition as its damage and the layers above it
+        // change, and each flip flickers.
+        FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
     }
 }
 
@@ -1764,7 +1767,10 @@ mod tests {
             frame_flags(true, true),
             FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
         );
-        assert_eq!(frame_flags(false, true), FrameFlags::DEFAULT);
+        assert_eq!(
+            frame_flags(false, true),
+            FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT
+        );
         assert_eq!(frame_flags(true, false), FrameFlags::empty());
         assert_eq!(frame_flags(false, false), FrameFlags::empty());
     }
