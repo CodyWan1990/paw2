@@ -315,6 +315,10 @@ decrease_column_width = ["Super+Ctrl+h", "Super+Ctrl+Left"]
 increase_column_width = ["Super+Ctrl+l", "Super+Ctrl+Right"]
 decrease_row_height = ["Super+Ctrl+k", "Super+Ctrl+Up"]
 increase_row_height = ["Super+Ctrl+j", "Super+Ctrl+Down"]
+# One fewer or one more window in the master area. Master-stack only; other
+# layouts ignore these.
+decrease_master_count = ["Super+minus"]
+increase_master_count = ["Super+equal"]
 toggle_floating = ["Super+Shift+space"]
 # Minimized windows come back from the shell's taskbar or dock, or with
 # restore_minimized, newest first.

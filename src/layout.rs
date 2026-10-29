@@ -2585,6 +2585,12 @@ impl Paw2 {
                     workspace.layout == LayoutMode::Scrolling && workspace.consume_or_expel(1)
                 }
             }),
+            Action::DecreaseMasterCount => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_master_count(-1, &config.master_stack)
+            }),
+            Action::IncreaseMasterCount => self.configured_layout_action(|workspace, config| {
+                workspace.adjust_master_count(1, &config.master_stack)
+            }),
             Action::CycleColumnWidth => {
                 self.configured_layout_action(Workspace::cycle_column_width)
             }
@@ -6450,39 +6456,34 @@ mod tests {
         assert_eq!(first.layout, LayoutMode::Scrolling);
     }
 
-    /// `layout_rectangles` for a workspace with these adjustments, under the
-    /// default `[layout]`.
+    /// A workspace in `layout` with no per-workspace adjustments.
+    fn workspace_in(layout: LayoutMode) -> Workspace {
+        Workspace {
+            layout,
+            ..Workspace::default()
+        }
+    }
+
+    /// `layout_rectangles` for `workspace` under the default `[layout]`.
     fn tiled_rectangles(
-        layout: LayoutMode,
+        workspace: &Workspace,
         area: Rectangle<i32, Logical>,
         count: usize,
         gap: i32,
-        master_count: usize,
-        master_ratio: f64,
-        master_weights: &[f64],
-        dwindle_ratios: &[f64],
     ) -> Vec<Rectangle<i32, Logical>> {
-        let workspace = Workspace {
-            layout,
-            master_count: Some(master_count),
-            master_ratio: Some(master_ratio),
-            master_weights: master_weights.to_vec(),
-            dwindle_ratios: dwindle_ratios.iter().copied().map(Some).collect(),
-            ..Workspace::default()
-        };
-        layout_rectangles(&workspace, area, count, gap, &LayoutConfig::default())
+        layout_rectangles(workspace, area, count, gap, &LayoutConfig::default())
     }
 
     #[test]
     fn alternate_layout_rectangles_are_stable_and_positive() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
-        let monocle = tiled_rectangles(LayoutMode::Monocle, area, 3, 10, 1, 0.6, &[], &[]);
+        let monocle = tiled_rectangles(&workspace_in(LayoutMode::Monocle), area, 3, 10);
         assert_eq!(
             monocle,
             vec![Rectangle::new((10, 10).into(), (980, 780).into()); 3]
         );
 
-        let master = tiled_rectangles(LayoutMode::MasterStack, area, 3, 10, 1, 0.6, &[], &[]);
+        let master = tiled_rectangles(&workspace_in(LayoutMode::MasterStack), area, 3, 10);
         assert_eq!(
             master[0],
             Rectangle::new((10, 10).into(), (582, 780).into())
@@ -6496,7 +6497,7 @@ mod tests {
             Rectangle::new((602, 405).into(), (388, 385).into())
         );
 
-        let dwindle = tiled_rectangles(LayoutMode::Dwindle, area, 4, 10, 1, 0.6, &[], &[]);
+        let dwindle = tiled_rectangles(&workspace_in(LayoutMode::Dwindle), area, 4, 10);
         assert_eq!(
             dwindle[0],
             Rectangle::new((10, 10).into(), (485, 780).into())
@@ -6515,14 +6516,10 @@ mod tests {
         );
 
         let tiny = tiled_rectangles(
-            LayoutMode::Dwindle,
+            &workspace_in(LayoutMode::Dwindle),
             Rectangle::new((0, 0).into(), (2, 2).into()),
             8,
             15,
-            1,
-            0.6,
-            &[],
-            &[],
         );
         assert!(
             tiny.iter()
@@ -6533,14 +6530,10 @@ mod tests {
     #[test]
     fn dwindle_navigation_follows_geometry() {
         let geometries = tiled_rectangles(
-            LayoutMode::Dwindle,
+            &workspace_in(LayoutMode::Dwindle),
             Rectangle::new((0, 0).into(), (1000, 800).into()),
             4,
             10,
-            1,
-            0.6,
-            &[],
-            &[],
         );
         assert_eq!(
             directional_index(0, Direction::Left, &geometries, true),
@@ -6593,14 +6586,13 @@ mod tests {
     fn alternate_layout_ratios_resize_expected_splits() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
         let master = tiled_rectangles(
-            LayoutMode::MasterStack,
+            &Workspace {
+                master_weights: vec![1.0, 3.0, 1.0],
+                ..workspace_in(LayoutMode::MasterStack)
+            },
             area,
             3,
             10,
-            1,
-            0.6,
-            &[1.0, 3.0, 1.0],
-            &[],
         );
         assert_eq!(
             master[1],
@@ -6612,14 +6604,13 @@ mod tests {
         );
 
         let dwindle = tiled_rectangles(
-            LayoutMode::Dwindle,
+            &Workspace {
+                dwindle_ratios: vec![Some(0.7), Some(0.25), Some(0.6)],
+                ..workspace_in(LayoutMode::Dwindle)
+            },
             area,
             4,
             10,
-            1,
-            0.6,
-            &[],
-            &[0.7, 0.25, 0.6],
         );
         assert_eq!(
             dwindle[0],
@@ -6709,7 +6700,15 @@ mod tests {
     #[test]
     fn master_count_and_spatial_neighbors_are_bounded() {
         let area = Rectangle::new((0, 0).into(), (1000, 800).into());
-        let split = tiled_rectangles(LayoutMode::MasterStack, area, 4, 10, 2, 0.6, &[], &[]);
+        let split = tiled_rectangles(
+            &Workspace {
+                master_count: Some(2),
+                ..workspace_in(LayoutMode::MasterStack)
+            },
+            area,
+            4,
+            10,
+        );
         assert_eq!(split[0], Rectangle::new((10, 10).into(), (582, 385).into()));
         assert_eq!(
             split[1],
@@ -6720,7 +6719,15 @@ mod tests {
             Rectangle::new((602, 10).into(), (388, 385).into())
         );
 
-        let all_master = tiled_rectangles(LayoutMode::MasterStack, area, 4, 10, 4, 0.6, &[], &[]);
+        let all_master = tiled_rectangles(
+            &Workspace {
+                master_count: Some(4),
+                ..workspace_in(LayoutMode::MasterStack)
+            },
+            area,
+            4,
+            10,
+        );
         assert!(all_master.iter().all(|rectangle| rectangle.loc.x == 10));
         assert!(all_master.iter().all(|rectangle| rectangle.size.w == 980));
 

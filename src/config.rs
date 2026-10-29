@@ -113,6 +113,8 @@ pub enum Action {
     IncreaseColumnWidth,
     DecreaseRowHeight,
     IncreaseRowHeight,
+    DecreaseMasterCount,
+    IncreaseMasterCount,
     ToggleFloating,
     MinimizeWindow,
     RestoreMinimized,
@@ -1288,6 +1290,8 @@ const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("increase_column_width",  Action::IncreaseColumnWidth,  ""),
     ("decrease_row_height",    Action::DecreaseRowHeight,    ""),
     ("increase_row_height",    Action::IncreaseRowHeight,    ""),
+    ("decrease_master_count",  Action::DecreaseMasterCount,  ""),
+    ("increase_master_count",  Action::IncreaseMasterCount,  ""),
     ("toggle_floating",        Action::ToggleFloating,       ""),
     ("minimize_window",        Action::MinimizeWindow,       ""),
     ("restore_minimized",      Action::RestoreMinimized,     ""),
@@ -2226,7 +2230,15 @@ mod tests {
     #[test]
     fn the_reference_config_parses_to_its_documented_values() {
         let config = parse(EXAMPLE_CONFIG).unwrap();
-        assert_eq!(config.bindings.len(), 89);
+        assert_eq!(config.bindings.len(), 91);
+        assert_eq!(
+            pressed(&config, "Super+minus"),
+            Some(Action::DecreaseMasterCount)
+        );
+        assert_eq!(
+            pressed(&config, "Super+equal"),
+            Some(Action::IncreaseMasterCount)
+        );
         assert_eq!(
             pressed(&config, "Super+Alt+1"),
             Some(Action::ToggleNumberedScratchpad(0))
@@ -2677,8 +2689,8 @@ mod tests {
         let legacy = parse(&legacy).unwrap();
         // `close_window` and `quit` are in the fallback set, so dropping them
         // hands them back. `toggle_fullscreen` and `focus_monitor_left` are
-        // not, so dropping them leaves them unbound: 89 - 2.
-        assert_eq!(legacy.bindings.len(), 87);
+        // not, so dropping them leaves them unbound: 91 - 2.
+        assert_eq!(legacy.bindings.len(), 89);
         // Whole-struct comparison: the built-in defaults and FALLBACK_CONFIG
         // must not drift apart.
         let fallback = parse(FALLBACK_CONFIG).unwrap();
