@@ -1544,6 +1544,8 @@ pub struct Scrollers {
     parked: [Workspace; WORKSPACE_COUNT],
     animations: HashMap<usize, WindowAnimation>,
     manual_floating: HashMap<usize, ManualFloating>,
+    /// The window under a mouse move, tiled preview or floating. While held
+    /// it is drawn on every monitor it reaches, not just the one that owns it.
     drag_preview: Option<usize>,
     /// The last press on a titlebar - window and time in ms - so a second
     /// one on the same window soon after counts as a double-click.
@@ -3362,7 +3364,7 @@ impl Paw2 {
             let (title, app_id) = crate::screencopy::window_metadata(window);
             if title.is_empty() { app_id } else { title }
         };
-        let bar = |key: BarKey, windows: Vec<Window>, active: usize| {
+        let bar = |workspace: &Workspace, key: BarKey, windows: Vec<Window>, active: usize| {
             let shown = windows.get(active)?;
             if !has_bar(workspace, shown, &self.config) {
                 return None;
@@ -3389,6 +3391,7 @@ impl Paw2 {
 
         let grouped = workspace.tab_groups.iter().filter_map(|group| {
             bar(
+                workspace,
                 BarKey::TabGroup(group.id),
                 group.windows.clone(),
                 group.active,
@@ -3398,8 +3401,41 @@ impl Paw2 {
             .windows
             .iter()
             .filter(|window| workspace.tab_group_index(window).is_none())
-            .filter_map(|window| bar(BarKey::Window(window.id()), vec![window.clone()], 0));
-        grouped.chain(single).collect()
+            .filter_map(|window| {
+                bar(workspace, BarKey::Window(window.id()), vec![window.clone()], 0)
+            });
+        // A window dragged in from another monitor brings its bar along.
+        let dragged = self
+            .dragged_from_elsewhere(monitor)
+            .and_then(|(window, home)| match home.tab_group_index(window) {
+                Some(index) => {
+                    let group = &home.tab_groups[index];
+                    bar(home, BarKey::TabGroup(group.id), group.windows.clone(), group.active)
+                }
+                None => bar(home, BarKey::Window(window.id()), vec![window.clone()], 0),
+            });
+        grouped.chain(single).chain(dragged).collect()
+    }
+
+    /// The window being dragged, when `monitor` shows it but another monitor's
+    /// workspace holds it, paired with that workspace. Its bar and frame
+    /// follow the workspace it belongs to.
+    fn dragged_from_elsewhere<'a>(
+        &'a self,
+        monitor: &'a Scroller,
+    ) -> Option<(&'a Window, &'a Workspace)> {
+        let id = self.scroller.drag_preview?;
+        let window = monitor.space.elements().find(|window| window.id() == id)?;
+        if monitor.active().windows.contains(window) {
+            return None;
+        }
+        let home = self
+            .scroller
+            .monitors
+            .iter()
+            .map(Scroller::active)
+            .find(|workspace| workspace.windows.contains(window))?;
+        Some((window, home))
     }
 
     /// The window and part of the bar under `position`, if a bar is there and
@@ -3574,23 +3610,20 @@ impl Paw2 {
                 runtime.visible && runtime.output.as_deref() == Some(monitor.name.as_str())
             })
             .filter_map(|runtime| runtime.window.as_ref());
-        let dragged = self
-            .scroller
-            .drag_preview
-            .and_then(|id| self.find_window(|window| window.id() == id));
+        let dragged = self.dragged_from_elsewhere(monitor);
 
         workspace
             .windows
             .iter()
-            .map(|window| (window, false))
-            .chain(scratchpads.map(|window| (window, true)))
-            .chain(dragged.map(|window| (window, false)))
-            .filter_map(|(window, scratchpad)| {
+            .map(|window| (window, workspace, false))
+            .chain(scratchpads.map(|window| (window, workspace, true)))
+            .chain(dragged.map(|(window, home)| (window, home, false)))
+            .filter_map(|(window, home, scratchpad)| {
                 let root = window_surface(window)?;
                 let element = Id::from_wayland_resource(&root);
                 let mut client = monitor.space.element_geometry(window)?;
                 client.loc -= output_location;
-                let frame = if has_bar(workspace, window, &self.config) {
+                let frame = if has_bar(home, window, &self.config) {
                     bar_outer_rectangle(client, bar_height(&self.config))
                 } else {
                     client
@@ -3783,6 +3816,31 @@ impl Paw2 {
                 surface_primary_scanout_output,
                 |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
             );
+        }
+        // A window dragged to another monitor leaves this space, so the loops
+        // above never see it again and it keeps naming this output as its
+        // primary. The new monitor then loses the refresh-rate tie-break to
+        // the stale claim whenever it is the slower one, and the window gets
+        // only the hidden-surface trickle of frame callbacks. Drop the claim
+        // here so the monitor that shows it now can take it.
+        for monitor in &self.scroller.monitors {
+            if monitor.output == *output {
+                continue;
+            }
+            for window in monitor.space.elements() {
+                window.with_surfaces(|surface, data| {
+                    if surface_primary_scanout_output(surface, data).as_ref() == Some(output) {
+                        update_surface_primary_scanout_output(
+                            surface,
+                            output,
+                            data,
+                            None,
+                            states,
+                            default_primary_scanout_output_compare,
+                        );
+                    }
+                });
+            }
         }
         feedback
     }

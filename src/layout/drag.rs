@@ -582,17 +582,54 @@ impl Paw2 {
                 .add(window, true);
             self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
         }
-        let monitor = &mut self.scroller.monitors[target];
-        let Some(area) = monitor.work_area() else {
-            return;
-        };
-        let location = constrain_window(area, size, desired.to_i32_round());
-        monitor.space.map_element(window.clone(), location, true);
+        // Held, the window follows the pointer exactly, even across a monitor
+        // edge; it is pulled back inside its monitor when it is let go.
+        let location = desired.to_i32_round();
+        self.scroller.drag_preview = Some(window.id());
+        self.map_dragged_window(window, target, Rectangle::new(location, size));
         self.scroller.animations.remove(&window.id());
         if let Some(override_) = self.scroller.manual_floating.get_mut(&window.id()) {
             override_.location = Some(location);
         }
         self.sync_focus();
+    }
+
+    /// Shows a dragged window at `rectangle` on `owner` and on every other
+    /// monitor its frame reaches, so it straddles a monitor edge instead of
+    /// jumping across when the pointer does.
+    fn map_dragged_window(
+        &mut self,
+        window: &Window,
+        owner: usize,
+        rectangle: Rectangle<i32, Logical>,
+    ) {
+        let frame = bar_outer_rectangle(rectangle, bar_height(&self.config));
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            let reaches = monitor
+                .space
+                .output_geometry(&monitor.output)
+                .is_some_and(|geometry| geometry.overlaps(frame));
+            // A fullscreen game keeps its screen to itself.
+            let shown = index == owner || (reaches && monitor.active().fullscreen.is_none());
+            if shown {
+                monitor
+                    .space
+                    .map_element(window.clone(), rectangle.loc, true);
+                monitor.space.raise_element(window, false);
+            } else {
+                monitor.space.unmap_elem(window);
+            }
+        }
+    }
+
+    /// Takes a dragged window off every monitor but `owner`.
+    fn unmap_dragged_window(&mut self, window: &Window, owner: usize) {
+        self.scroller.drag_preview = None;
+        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
+            if index != owner {
+                monitor.space.unmap_elem(window);
+            }
+        }
     }
 
     fn drag_floating_resize(
@@ -653,18 +690,8 @@ impl Paw2 {
         if self.scroller.monitors[target].active().fullscreen.is_some() {
             return;
         }
-        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
-            if index != target {
-                monitor.space.unmap_elem(window);
-            }
-        }
-        let monitor = &mut self.scroller.monitors[target];
-        let Some(area) = monitor.work_area() else {
-            return;
-        };
-        let location = constrain_window(area, size, (pointer - grab_offset).to_i32_round());
-        monitor.space.map_element(window.clone(), location, true);
-        monitor.space.raise_element(window, false);
+        let location = (pointer - grab_offset).to_i32_round();
+        self.map_dragged_window(window, target, Rectangle::new(location, size));
     }
 
     pub(crate) fn finish_mouse_operation(
@@ -676,6 +703,10 @@ impl Paw2 {
             MouseOperation::MoveScratchpad { name, .. }
             | MouseOperation::ResizeScratchpad { name, .. } => {
                 self.remember_scratchpad_geometry(name);
+                return;
+            }
+            MouseOperation::MoveFloating { window, .. } => {
+                self.finish_floating_move(window);
                 return;
             }
             _ => {}
@@ -768,12 +799,7 @@ impl Paw2 {
                 self.scroller.focused_output = Some(self.scroller.monitors[target].name.clone());
             }
         }
-        self.scroller.drag_preview = None;
-        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
-            if index != target {
-                monitor.space.unmap_elem(window);
-            }
-        }
+        self.unmap_dragged_window(window, target);
         self.relayout(true);
         self.sync_focus();
     }
@@ -838,23 +864,25 @@ impl Paw2 {
             return;
         }
         self.scroller.focused_output = Some(self.scroller.monitors[target_monitor].name.clone());
-        self.scroller.drag_preview = None;
-        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
-            if index != target_monitor {
-                monitor.space.unmap_elem(window);
-            }
-        }
+        self.unmap_dragged_window(window, target_monitor);
         self.relayout(true);
         self.sync_focus();
     }
 
+    /// A floating window let go: it settles inside the monitor it was
+    /// dropped on, gliding there if it hangs over an edge.
+    fn finish_floating_move(&mut self, window: &Window) {
+        let Some(owner) = self.scroller.monitor_index_holding(window) else {
+            self.scroller.drag_preview = None;
+            return;
+        };
+        self.unmap_dragged_window(window, owner);
+        // The layout keeps floating windows inside their monitor's work area.
+        self.relayout(true);
+    }
+
     fn restore_tiled_drag(&mut self, window: &Window, source: usize) {
-        self.scroller.drag_preview = None;
-        for (index, monitor) in self.scroller.monitors.iter_mut().enumerate() {
-            if index != source {
-                monitor.space.unmap_elem(window);
-            }
-        }
+        self.unmap_dragged_window(window, source);
         self.relayout(true);
         self.sync_focus();
     }
