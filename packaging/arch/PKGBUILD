@@ -4,7 +4,7 @@
 #   makepkg -si
 
 pkgname=paw2-git
-pkgver=1.1.0
+pkgver=1.1.0.r78.g76f75d6
 pkgrel=1
 epoch=1
 pkgdesc='Gaming-focused Wayland compositor'
