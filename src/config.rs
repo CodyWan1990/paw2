@@ -1532,6 +1532,9 @@ fn parse_layout(raw: RawLayout) -> Result<LayoutConfig, String> {
         ));
     }
 
+    // The scrolling keys moved to [layout.scrolling] on 2026-10-27. Reading
+    // them from [layout] is only for configs written before that, and can go
+    // once a release or two has shipped the warning.
     let legacy = RawScrolling {
         column_width: raw.column_width,
         preset_column_widths: raw.preset_column_widths,
