@@ -143,6 +143,15 @@ struct ConfigMessage<'a> {
     values: &'a serde_json::Value,
     ok: bool,
     errors: Vec<&'a str>,
+    /// Every bindable action in order, with its keys when the config leaves it
+    /// out, so a shell's shortcut editor never carries its own copy.
+    default_bindings: Vec<DefaultBinding>,
+}
+
+#[derive(Serialize)]
+struct DefaultBinding {
+    name: String,
+    keys: Vec<String>,
 }
 
 /// A connected shell.
@@ -521,6 +530,10 @@ pub fn flush(state: &mut Paw2) {
             values: &state.ipc.config,
             ok: state.ipc.config_error.is_none(),
             errors: state.ipc.config_error.as_deref().into_iter().collect(),
+            default_bindings: crate::config::default_bindings()
+                .into_iter()
+                .map(|(name, keys)| DefaultBinding { name, keys })
+                .collect(),
         })
     });
 

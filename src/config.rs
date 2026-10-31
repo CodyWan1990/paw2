@@ -1263,6 +1263,27 @@ impl Default for RawBindings {
 /// These have to stay in step with `FALLBACK_CONFIG`: that text is what a
 /// `config.toml` merges over, and this column is what a `config.d/` drop-in
 /// that owns `[bindings]` whole falls back to.
+/// Every bindable action's config key and the keys it has when the config
+/// does not mention it, for a settings UI to list. `workspace.*` covers the
+/// unnumbered `[bindings.workspace]` actions; the numbered ones are lists of
+/// nine and not single actions.
+pub fn default_bindings() -> Vec<(String, Vec<String>)> {
+    let workspace = RawWorkspaceBindings::default();
+    DEFAULT_BINDINGS
+        .iter()
+        .map(|(name, _, keys)| {
+            let keys = keys.split_whitespace().map(str::to_owned).collect();
+            ((*name).to_owned(), keys)
+        })
+        .chain([
+            ("workspace.previous".to_owned(), workspace.previous),
+            ("workspace.next".to_owned(), workspace.next),
+            ("workspace.move_previous".to_owned(), workspace.move_previous),
+            ("workspace.move_next".to_owned(), workspace.move_next),
+        ])
+        .collect()
+}
+
 #[rustfmt::skip]
 const DEFAULT_BINDINGS: &[(&str, Action, &str)] = &[
     ("focus_left",             Action::FocusLeft,            "Super+h Super+Left"),
@@ -2799,6 +2820,26 @@ swap_right = ["Super+Shift+l"]
     /// What a session that lost its config is left holding: move around, open a
     /// terminal, close a window, log out. Nothing decorative, and nothing that
     /// needs a second keypress to explain itself.
+    /// What a shell lists must be what the config accepts, with the keys an
+    /// unmentioned action really gets.
+    #[test]
+    fn default_bindings_name_every_configurable_action() {
+        let defaults = default_bindings();
+        assert_eq!(defaults.len(), DEFAULT_BINDINGS.len() + 4);
+        for (name, _) in &defaults {
+            let source = match name.strip_prefix("workspace.") {
+                Some(key) => format!("[bindings.workspace]\n{key} = []\n"),
+                None => format!("[bindings]\n{name} = []\n"),
+            };
+            assert!(parse(&source).is_ok(), "{name} is not a binding key");
+        }
+        let close = defaults.iter().find(|(name, _)| name == "close_window");
+        assert_eq!(
+            close.map(|(_, keys)| keys.as_slice()),
+            Some(["Super+q".to_owned(), "Super+BackSpace".to_owned()].as_slice())
+        );
+    }
+
     #[test]
     fn the_fallback_is_navigation_and_a_terminal() {
         let fallback = parse(FALLBACK_CONFIG).unwrap();
