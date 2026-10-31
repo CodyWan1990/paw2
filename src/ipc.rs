@@ -395,6 +395,9 @@ enum Command {
     },
     ToggleScratchpadOverview,
     ToggleOverview,
+    /// A bar or lock screen has no other way to switch layouts: it rarely holds
+    /// the keyboard focus, and the keymap is the compositor's.
+    CycleKeyboardLayout,
     Quit,
     // No set-config: settings are changed by writing config.d/, which the
     // config watcher picks up within half a second.
@@ -450,6 +453,11 @@ fn run(state: &mut Paw2, line: &str, privileged: bool) {
         Command::ResetScratchpad { name } => state.reset_scratchpad(&name),
         Command::ToggleScratchpadOverview => state.toggle_scratchpad_overview(),
         Command::ToggleOverview => state.run_action(Action::ToggleOverview),
+        Command::CycleKeyboardLayout => {
+            let keyboard = state.keyboard();
+            keyboard.with_xkb_state(state, |mut context| context.cycle_next_layout());
+            state.note_keyboard_layout();
+        }
         Command::Quit => state.run_action(Action::Quit),
     }
 }
@@ -643,6 +651,19 @@ fn send(client: &mut Client, message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_are_spelled_in_kebab_case() {
+        assert!(matches!(
+            serde_json::from_str(r#"{"cmd":"cycle-keyboard-layout"}"#),
+            Ok(Command::CycleKeyboardLayout)
+        ));
+        assert!(matches!(
+            serde_json::from_str(r#"{"cmd":"toggle-overview"}"#),
+            Ok(Command::ToggleOverview)
+        ));
+        assert!(serde_json::from_str::<Command>(r#"{"cmd":"cycle_keyboard_layout"}"#).is_err());
+    }
 
     #[test]
     fn only_a_privileged_peer_is_ever_owed_the_config() {
